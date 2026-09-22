@@ -862,6 +862,32 @@ function functionFiles() {
     .map((f) => relative(repoRoot, f))
 }
 
+/** The two `_headers` files this audit reads (and the only ones it may read). */
+const AUDITED_HEADERS_FILES = ['website/_headers', 'website/apps/dashboard/public/_headers']
+
+/**
+ * Every `_headers` file under `website/` — DERIVED, so the audited set can be
+ * asserted EQUAL to it. The `functions/` roots are derived for the same reason: a
+ * new Pages project carries its own `_headers`, and one that omits the beacon
+ * re-introduces the #4638 regression on whatever surface it governs. A new file
+ * must fail here and be audited deliberately, not ship unread.
+ */
+function headersFiles() {
+  const out = []
+  const visit = (abs) => {
+    for (const entry of readdirSync(abs, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) continue
+        visit(join(abs, entry.name))
+      } else if (entry.isFile() && entry.name === '_headers') {
+        out.push(relative(repoRoot, join(abs, entry.name)))
+      }
+    }
+  }
+  visit(join(repoRoot, 'website'))
+  return out.sort()
+}
+
 /**
  * Every `functions/` tree under `website/` — DERIVED, not a literal list, so a new
  * Pages project's tree is scanned rather than invisible to every check. A tree in
@@ -1217,7 +1243,7 @@ test('_headers values are byte-identical to the stamped constants', () => {
   // discarded by every scan above — while the edge JOINS matching rules and
   // repeated header lines, so the served header would carry the beacon-less value
   // and block the beacon with the whole suite green. Duplicates must not exist.
-  for (const rel of ['website/_headers', 'website/apps/dashboard/public/_headers']) {
+  for (const rel of AUDITED_HEADERS_FILES) {
     assert.deepEqual(
       headerDuplicates(rel),
       [],
@@ -1225,6 +1251,14 @@ test('_headers values are byte-identical to the stamped constants', () => {
         `the edge (and dropped by this scan), so it is never a no-op`,
     )
   }
+  // ...and the audited SET is derived, not assumed: a `_headers` file this test does
+  // not read is a surface whose policy nothing checks, which is the #4638 shape.
+  assert.deepEqual(
+    headersFiles(),
+    [...AUDITED_HEADERS_FILES].sort(),
+    'a `_headers` file exists that this audit does not read — audit it (beacon origins in ' +
+      'script-src/connect-src, and a byte-identity check against its constant), or remove it',
+  )
 })
 
 // ── 4b. every policy admits the PLATFORM-INJECTED beacon ──────────────────
