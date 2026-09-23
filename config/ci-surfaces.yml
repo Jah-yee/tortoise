@@ -2122,6 +2122,20 @@ durations:
   eval/retrieval/test_oracle.py: 5.7
   longmem_eval/test_context_assembly_leakage.py: 5.2
   test_ep_directional.py: 5.7
+  # #2944: new file, and the SAME class as the #3039 block directly above — the
+  # entry is required because leaving it out drops durations coverage from
+  # 90.05% (passing) to 89.92% (544/605 fast files), one file below the 90%
+  # floor, reddening the gated `--integrity` step. Note this file is registered
+  # by the branch's own `core` addition, so the failure appears ONLY at the
+  # merge: the branch parent and the main parent each PASS the same check. That
+  # is what made it worth a review cycle rather than being caught by either side.
+  #
+  # The value is a LOCAL measurement (30 tests, 66.7s at fleet load), not a CI
+  # junit artifact — chosen over the flat 2.0s default for the reason the #3039
+  # block gives: a 33x under-weight would skew the LPT pack for a ~67s file
+  # (the map median is 0.8s, so this is ~80x the median). Refresh from the first
+  # post-merge main junit run that includes it.
+  test_destructive_wipe_guard.py: 66.7
   test_extractor_reliability.py: 5.5
   test_acl_graph_users.py: 9.8
   test_battery_exposure_liveness.py: 5.9
