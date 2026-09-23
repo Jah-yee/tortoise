@@ -2122,13 +2122,54 @@ durations:
   eval/retrieval/test_oracle.py: 5.7
   longmem_eval/test_context_assembly_leakage.py: 5.2
   test_ep_directional.py: 5.7
-  # #2944: new file, and the SAME class as the #3039 block directly above — the
-  # entry is required because leaving it out drops durations coverage from
-  # 90.05% (passing) to 89.92% (544/605 fast files), one file below the 90%
-  # floor, reddening the gated `--integrity` step. Note this file is registered
-  # by the branch's own `core` addition, so the failure appears ONLY at the
-  # merge: the branch parent and the main parent each PASS the same check. That
-  # is what made it worth a review cycle rather than being caught by either side.
+  eval/write_path/test_write_path_benchmark.py: 112.3
+  test_tortoise_client.py: 110.7
+  eval/retrieval/test_run.py: 109.3
+  # #4314: the inert-hooks guard. Measured locally in the carve-out lane
+  # (`uv run pytest tests/test_4314_inert_hooks.py -q`, 169.8s — the round-2
+  # fix adds real-hook guards for the install-inert marker and the CWE-427
+  # pre-path vector); refresh from a CI junit run once it has one.
+  test_4314_inert_hooks.py: 170.0
+  test_platform_seams.py: 73.3
+  test_2952_degraded_read.py: 70.0   # #2952 (B)+(C): docker-lane warm-up/degraded-read suite
+  test_quota.py: 65.3
+  # #3501: the migration-backlog gate. A pure static scan of website/ (no
+  # wrangler, no server), so it runs in the python-ci matrix like any other
+  # static guard. Measured 53s-90s standalone across runs — a SINGLE SAMPLE of a
+  # high-variance quantity dominated by the repo's heavy conftest import path,
+  # not a precise cost. Re-measure rather than trusting it if the import graph
+  # changes.
+  test_no_legacy_token_path.py: 60.0
+  # #3895: 21 docker-lane dump/restore + graph-rebuild tests (~40 graph
+  # round-trips). HIGH-VARIANCE: measured 68-106s warm across runs (the
+  # session-hygiene sweep and the shared container's load dominate the tail),
+  # 126-183s on the embedded lane. Loose middle so the LPT packer does not
+  # under-weight it against default_weight=2.0 — the file is NOT slow-listed,
+  # it stays in the derived fast halves.
+  test_dump_edge_asymmetry_3895.py: 90.0
+  test_divergence_conformance.py: 57.8
+  # #3039: new file. No CI junit measurement exists yet, so the value below is
+  # a LOCAL measurement (54 tests, 55.6s docker-lane). Entry — rather than the
+  # flat 2.0s default — is required because leaving it out drops durations
+  # coverage from 90.02% (541/601) on main to 89.87% (541/602), one file below
+  # the 90% floor exactly as #4348 (--register cannot emit a `durations` row)
+  # describes; and a 27x under-weight would skew the LPT pack for a ~55s file.
+  # Refresh from the first post-merge junit artifact.
+  test_from_uri_userinfo.py: 55.6
+  # #2944: new file. The row is required, and the same-tree pair at the merge
+  # commit is 89.92% (544/605 fast files) WITHOUT it vs 90.08% (545/605) WITH it
+  # — one file below the 90% floor either way you look at it, reddening the
+  # gated `--integrity` step.
+  #
+  # Do not read this as the #3039 block's shape. That block's pair (541/601 ->
+  # 541/602) is one tree, one file apart. Here the two PARENTS each pass
+  # separately (branch parent 525/583 = 90.05%, main parent 544/604 = 90.07%)
+  # and the failure exists only in the merge: main's added fast files moved the
+  # pool 583 -> 605, which is what drops the ratio, and this branch's `core`
+  # registration is the file that lands unweighed. So the red is produced by the
+  # COMBINATION, not by either side, which is why a review cycle caught it and
+  # neither parent could have. The 90.05% figure belongs to the branch parent's
+  # pool and must not be quoted as this tree's with-row state.
   #
   # The value is a LOCAL measurement (30 tests, 66.7s at fleet load), not a CI
   # junit artifact — chosen over the flat 2.0s default for the reason the #3039
