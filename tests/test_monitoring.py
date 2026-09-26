@@ -847,9 +847,18 @@ class TestProbeDbBoundedAcquisition:
         hand-maintained list, so on its own it proves only that the declaration
         and the recording agree — a phase whose author forgot to record it
         would stay invisible. Counting the bounded waits that actually reach
-        ``_probe_worker`` cannot be fooled that way: any fourth phase that
-        bounds its wait there raises the count, whether or not anyone
-        remembered to name it.
+        ``_probe_worker`` cannot be fooled that way.
+
+        SCOPE of that count, stated because it is narrower than "any fourth
+        phase": it is taken on a NON-RETRYING successful call, which enters
+        each declared phase exactly once. A fourth phase that bounds its wait
+        on the shared probe worker on THIS path raises the count to 4, whether
+        or not anyone named it. A phase reachable only on another branch — the
+        transient-retry path, or a branch gated on ``setup_timeout`` — would
+        submit more waits without being counted here, so it must still be added
+        to the derivation by hand. (The retry path re-enters the SAME three
+        phases, so it does not change the SET — which is why the set, not a
+        global submission total, is what the derivation sums.)
 
         LOAD-BEARING (mutation: insert a new bounded phase in ``probe_db`` —
         e.g. ``_acquire_on_probe_worker(lambda: None, 0.5)`` right before

@@ -39,13 +39,17 @@ _sdk = None  # set by register()
 # within a sub-second-to-1.5s window, never hang the handler. This bounds ONE
 # attempt. The #1565 retry does NOT take a SECOND bound of this size — it
 # rides the REMAINDER of the caller's one deadline (see ``probe_db``), so the
-# platform liveness shape's real total is ~``PROBE_TIMEOUT``, and the #3143
-# explicit-allowance shape's total is ``PROBE_SETUP_TIMEOUT + PROBE_TIMEOUT``.
-# ``PROBE_DB_TOTAL_TIMEOUT`` (2 x this + the retry delay) survives ONLY as the
-# loose outer-alignment figure for the platform plane — an over-estimate of
-# this shape, not its exact total. Quoting the per-attempt figure as the total
-# is the trap that produced an inverted coordinator ordering in the
-# #2850/#2988 merge.
+# platform liveness shape's real total is ~``PROBE_TIMEOUT``. The #3143
+# explicit-allowance shape's total depends on WHO acquires the SDK: an
+# ``acquire=`` caller (selfhost's refresher) pays
+# ``PROBE_SDK_ACQUISITION_BUDGET + setup_timeout + PROBE_TIMEOUT`` (23.5s at
+# the shipped defaults), while an ``sdk=`` caller (the MCP ``tortoise_health``
+# tool) pays only ``setup_timeout + PROBE_TIMEOUT`` (21.5s). NEITHER is bounded
+# by ``PROBE_HARD_TIMEOUT``. ``PROBE_DB_TOTAL_TIMEOUT`` (2 x this + the retry
+# delay) survives ONLY as the loose outer-alignment figure for the platform
+# plane — an over-estimate of this shape, not its exact total. Quoting the
+# per-attempt figure as the total is the trap that produced an inverted
+# coordinator ordering in the #2850/#2988 merge.
 PROBE_TIMEOUT = 1.5
 
 # #3143: the probe has TWO phases and only the second is a reachability signal.
@@ -238,19 +242,24 @@ PROBE_STALE_AFTER = 30.0
 #
 # ⛔ ``PROBE_HARD_TIMEOUT`` does NOT cover the #3143 EXPLICIT-ALLOWANCE shape
 # (``setup_timeout`` given). That shape's enforced total is
-# ``PROBE_SDK_ACQUISITION_BUDGET + setup_timeout + PROBE_TIMEOUT`` — 23.5s at
-# the shipped defaults, several times this constant. A coordinator over that
-# shape must derive its OWN bound that way (``selfhost._liveness_probe_hard_timeout``
-# does, and the MCP tool is the outermost caller so it has none); sizing one by
-# the platform default would sit ~18s BELOW its probe's total, which is exactly
-# the inverted-ordering defect of the #2850/#2988 merge. Do not read the
+# ``setup_timeout + PROBE_TIMEOUT`` (21.5s at the shipped defaults) for an
+# ``sdk=`` caller such as the MCP ``tortoise_health`` tool, and
+# ``PROBE_SDK_ACQUISITION_BUDGET +`` that (23.5s) for an ``acquire=`` caller
+# such as ``selfhost._probe_db`` — several times this constant either way. A
+# coordinator over the ``acquire=`` form must derive its OWN bound that way
+# (``selfhost._liveness_probe_hard_timeout`` does); sizing one by the platform
+# default would sit ~18s BELOW its probe's total, which is exactly the
+# inverted-ordering defect of the #2850/#2988 merge. Do not read the
 # derivation below as covering "each caller's shape".
 #
 # ...and it does not cover the phase SET: the sum is over the acquisition, the
-# projection setup and the reachability query. That set is recorded in code
-# (``_PROBE_ENFORCED_PHASES``) and a test asserts ``probe_db`` enters exactly
-# it, so a FOURTH bounded phase reddens a test instead of silently turning this
-# derivation into an under-estimate.
+# projection setup and the reachability query. That set is declared in
+# ``_PROBE_ENFORCED_PHASES``, and a test COUNTS the bounded waits ``probe_db``
+# submits to ``_probe_worker`` on its non-retrying path — so a FOURTH phase
+# that bounds its wait there is caught instead of silently turning this
+# derivation into an under-estimate. A phase bounded somewhere ELSE, or
+# reachable only on a branch that test does not exercise, is still invisible:
+# add it to this derivation by hand.
 #
 # WHAT IS STILL NOT PROVABLE — stated here so nobody re-derives a "proof" from
 # the paragraph above:
@@ -414,10 +423,14 @@ PROBE_SDK_ACQUISITION_BUDGET = 2.0
 #: that lives only in a comment cannot make a fourth phase fail anything.
 #: ``probe_db`` records what it actually entered in ``_PROBE_LAST_PHASES``, AND
 #: ``tests/test_monitoring.py`` counts the bounded waits it submits to
-#: ``_probe_worker`` and asserts that count equals ``len()`` of this tuple. The
-#: COUNT is the load-bearing half: a fourth phase that bounds its wait on the
-#: shared probe worker raises the submission count and REDS that test, whether
-#: or not anyone remembered to append its name here.
+#: ``_probe_worker`` on ONE non-retrying successful call, asserting that count
+#: equals ``len()`` of this tuple. The COUNT is the load-bearing half: a fourth
+#: phase that bounds its wait on the shared probe worker ON THAT PATH raises the
+#: submission count and REDS that test, whether or not anyone remembered to
+#: append its name here. SCOPE, stated so this is not read as a blanket
+#: guarantee: a fourth phase bounded on the shared worker but reachable ONLY on
+#: another branch (the retry, or a ``setup_timeout``-gated path) does not move
+#: that count, so it must still be added to the derivation by hand.
 _PROBE_ENFORCED_PHASES = ("sdk_acquisition", "projection_setup",
                           "reachability_query")
 
@@ -1819,11 +1832,13 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
     projection setup, and the reachability query — the set declared in
     ``_PROBE_ENFORCED_PHASES`` and recorded per call in
     ``_PROBE_LAST_PHASES``. A FOURTH bounded phase that bounds its wait on the
-    shared probe worker raises the submission count a test asserts, so it
-    cannot be added silently; a phase bounded anywhere ELSE would still raise
-    the real inner total without moving ``PROBE_HARD_TIMEOUT``, and no
-    constant-vs-constant test can see that — extend the outer bound's
-    derivation deliberately when adding one.
+    shared probe worker ON THE NON-RETRYING PATH a test exercises raises the
+    submission count that test asserts, so it cannot be added silently. A
+    phase bounded anywhere ELSE — or bounded on the shared worker but
+    reachable only on another branch (the retry, or a ``setup_timeout``-gated
+    path) — would still raise the real inner total without moving
+    ``PROBE_HARD_TIMEOUT``, and no constant-vs-constant test can see that:
+    extend the outer bound's derivation deliberately when adding one.
 
     That says nothing about the acquisition's INTERIOR (an unbounded
     cross-process probe plus real queries on the embedded lane — see
