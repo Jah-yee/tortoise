@@ -683,19 +683,15 @@ class TestHealthEndpoints:
         calls = {"all": 0, "own": 0, "probe_lane": 0}
 
         def _factory(*, namespace=None, graph_name=None):
-            # Only builds made by THIS test's two ``_probe_db()`` calls count.
-            # Leftover ``tortoise-health-probe`` threads from earlier tests
-            # share the process-global cache (and cannot be joined —
-            # ``HealthProbe.reset()`` drops its ``_worker`` handle), so
-            # counting them is what made the old assertion flaky.
-            #
-            # #3446: ``hosted_api._probe_db`` no longer acquires inline on the
-            # CALLER's thread — it hands the acquisition to ``probe_db`` via
-            # ``acquire=``, so ``_make_sdk`` now runs on the shared probe
-            # worker. Counting only ``own_thread`` therefore became VACUOUS
-            # (structurally 0), silently disabling the anti-rebuild guard. Count
-            # the lane the build actually happens on, and pin the caller's own
-            # lane stays untouched.
+            # Count builds by the LANE they run on. Leftover
+            # ``tortoise-health-probe`` threads from earlier tests share the
+            # process-global cache (and cannot be joined — ``HealthProbe.reset()``
+            # drops its ``_worker`` handle), so the original test deliberately
+            # counted only its OWN thread's builds. #3446 moved the build off
+            # that thread and onto the shared probe worker, which made
+            # ``calls["own"] <= 1`` structurally 0 — a VACUOUS guard. The
+            # rewritten test asserts the thread move directly (``own == 0``)
+            # and lets ``first_sdk is second_sdk`` carry the anti-rebuild check.
             calls["all"] += 1
             name = threading.current_thread().name
             if name == own_thread:
@@ -726,15 +722,20 @@ class TestHealthEndpoints:
         assert first["ok"] is True and second["ok"] is True
         assert first_sdk is second_sdk, (
             "the probe rebuilt its connection between two consecutive checks")
-        # Our TWO checks may build at most ONE SDK (a per-call rebuild needs 2).
-        # Zero is possible when a still-running probe from an earlier test won
-        # the race and warmed the cache first — that does not weaken the point.
-        assert calls["probe_lane"] <= 1, (
-            f"the two checks built the SDK {calls['probe_lane']}x on the probe "
-            "worker lane — not reused")
-        # #3446: and it must be built THERE, not on this test's thread. This is
-        # the assertion that stops the count above from going vacuous again if
-        # the acquisition ever moves back inline.
+        # #3446: the build must happen on the PROBE WORKER lane, not on this
+        # test's thread. ``own == 0`` is the assertion that carries the weight:
+        # it reds the moment the acquisition moves back inline. (It replaces
+        # the old ``calls["own"] <= 1``, which became structurally 0 — and
+        # therefore VACUOUS — as soon as the acquisition left this thread.)
+        #
+        # Deliberately NOT asserted here: an upper bound on ``probe_lane``. Every
+        # leftover in-flight probe from an earlier test in this file builds on
+        # that same shared lane, so a count is the flaky half — and it is also
+        # redundant: a per-call rebuild is caught by ``first_sdk is
+        # second_sdk`` above. ``>= 1`` is monotone, so it cannot flake.
+        assert calls["probe_lane"] >= 1, (
+            "no SDK build reached the probe worker lane — the acquisition did "
+            "not run there")
         assert calls["own"] == 0, (
             "#3446: the SDK acquisition ran on the CALLER's thread — it must be "
             "handed to probe_db as acquire= and bounded on the probe worker")

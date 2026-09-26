@@ -1127,11 +1127,12 @@ def test_every_plane_probe_is_hard_bounded_and_fail_closed():
     # (2) ORDERING PROPERTY. The default must clear the DB probes' loose
     # outer-alignment bound (``PROBE_DB_TOTAL_TIMEOUT`` — deliberately an
     # OVER-ESTIMATE of probe_db's real total, NOT the exact inner total — plus
-    # the ENFORCED SDK-acquisition phase). Sufficient for THIS shape since
-    # #3446: the acquisition is a bounded phase of ``probe_db``, so the sum is
-    # over deadlines the code imposes — but the residual is still STRANDING (a
-    # phase that overruns its deadline is abandoned, not cancelled), not an
-    # unenforced phase (see monitoring.PROBE_MAX_SUPERSEDES).
+    # the ENFORCED SDK-acquisition phase). Since #3446 no term of this sum is an
+    # unbounded phase: one is a deadline ``probe_db`` ENFORCES and the other is
+    # a deliberate over-estimate of a term that is itself enforced. The residual
+    # is still STRANDING (a phase that overruns its deadline is abandoned, not
+    # cancelled), not an unenforced phase — see
+    # monitoring.PROBE_MAX_SUPERSEDES.
     inner_total = PROBE_DB_TOTAL_TIMEOUT + PROBE_SDK_ACQUISITION_BUDGET
     assert default > inner_total, (
         f"HealthProbe's default wall bound ({default}s) does not clear the DB "
@@ -1180,12 +1181,14 @@ def test_each_plane_bound_sits_above_its_own_client_timeout(monkeypatch):
     its socket read. The defence is ordering: keep the outer bound ABOVE the
     probe's loose inner figure (``PROBE_DB_TOTAL_TIMEOUT`` — deliberately an
     OVER-ESTIMATE, not the exact inner total), so the inner bound normally fires
-    first and the thread returns by itself. For the DB plane this ordering is
-    now PROVABLE as an inequality between ENFORCED deadlines (#3446 — the
-    acquisition is a bounded phase of ``probe_db``), though the residual is
-    still stranding: a phase that overruns its own deadline is abandoned, not
-    cancelled. For the CONTROL plane it remains a best-effort ALIGNMENT: httpx's
-    ``read`` is per-read, so that inner request has no enforceable total.
+    first and the thread returns by itself. For the DB plane the acquisition
+    phase is now ENFORCED (#3446 — a bounded phase of ``probe_db``) and the
+    remaining inner figure is a deliberate over-estimate of an enforced term,
+    so nothing in the sum is an unbounded phase; the residual is still
+    stranding: a phase that overruns its own deadline is abandoned, not
+    cancelled. For the CONTROL plane it remains a best-effort ALIGNMENT:
+    httpx's ``read`` is per-read, so that inner request has no enforceable
+    total.
 
     #2850 initially INVERTED this (2s outer vs a 5s inner on the control plane)
     and leaned on ``PROBE_MAX_SUPERSEDES`` instead. That rationale was

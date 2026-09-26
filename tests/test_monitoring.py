@@ -676,32 +676,46 @@ class TestProbeDbBoundedAcquisition:
             monitoring.probe_db()
 
     def test_slow_but_in_budget_acquisition_does_not_eat_the_retry_window(
-            self):
+            self, monkeypatch):
         """The acquisition's OWN deadline must not be charged to the probe's.
 
         #3446 review (reproduced): ``start`` was taken BEFORE the acquisition,
         so ``remaining = total_budget - elapsed - PROBE_RETRY_DELAY`` subtracted
         the acquisition's duration from a budget that does not include it. For
         the platform shape ``total_budget`` is ``PROBE_TIMEOUT`` (1.5s) while
-        the acquisition's budget is 2.0s, so an acquisition slower than ~1.35s
-        SUPPRESSED the #1565 transient retry and reported a reachable graph
-        degraded — a false-degrade, and the exact cold-embedded-acquisition
-        scenario the retry exists for.
+        the acquisition's budget is 2.0s, so an acquisition slower than
+        ``PROBE_TIMEOUT - PROBE_RETRY_DELAY`` (1.4s) SUPPRESSED the #1565
+        transient retry and reported a reachable graph degraded — a
+        false-degrade, and the exact cold-embedded-acquisition scenario the
+        retry exists for.
+
+        The acquisition budget is PATCHED UP to 4.0 so the 1.45s sleep keeps
+        >=2s of overshoot headroom. The test needs only ``slow >
+        PROBE_TIMEOUT - PROBE_RETRY_DELAY`` (proven by the assertion below,
+        not assumed), and racing a 2.0s deadline with a 1.45s sleep on a box
+        running a dozen agent lanes is how a guard becomes a flake.
 
         LOAD-BEARING (mutation: measure ``remaining`` from ``start`` again
         instead of ``probe_start``): the retry never happens, ``ok`` is False
         and this reds.
         """
         calls = {"acquire": 0, "probe": 0}
-        # 1.45s is inside the 2.0s acquisition budget but larger than
-        # PROBE_TIMEOUT (1.5s) minus PROBE_RETRY_DELAY (0.15s) — i.e. exactly
-        # the window the bug conflated.
         slow = 1.45
-        assert slow > monitoring.PROBE_TIMEOUT - monitoring.PROBE_RETRY_DELAY, (
-            "this test only means something if the slow acquisition exceeds "
-            "the probe's own remaining window"
+        # Derived from the constants, not hand-typed: this is the window the
+        # bug conflated.
+        conflated = monitoring.PROBE_TIMEOUT - monitoring.PROBE_RETRY_DELAY
+        assert slow > conflated, (
+            f"this test only means something if the slow acquisition ({slow}s) "
+            f"exceeds the probe's own remaining window ({conflated}s)"
         )
-        assert slow < monitoring.PROBE_SDK_ACQUISITION_BUDGET
+        monkeypatch.setattr(monitoring, "PROBE_SDK_ACQUISITION_BUDGET", 4.0)
+        assert slow < monitoring.PROBE_SDK_ACQUISITION_BUDGET - 2.0, (
+            "keep >=2s of overshoot headroom against the acquisition deadline, "
+            "or sleep jitter on a loaded box reds this test spuriously"
+        )
+        # A leftover abandoned acquisition from an earlier test in this class
+        # must not share the single slot with ours.
+        monitoring._reset_probe_worker()
 
         def slow_acquire():
             calls["acquire"] += 1
@@ -771,11 +785,10 @@ class TestProbeDbBoundedAcquisition:
         the message becomes the acquisition-timeout spelling and this reds.
         """
         worker = monitoring._probe_worker()
-        occupier = concurrent.futures.Future()
-        occupier.set_running_or_notify_cancel()
         try:
             # Occupy the SINGLE slot for longer than the acquisition budget, so
-            # the acquisition below is submitted but never picked up.
+            # the acquisition below is submitted but never picked up. THIS
+            # submit is the occupier — its future is deliberately unread.
             worker.submit(lambda: time.sleep(0.6))
             ran = {"n": 0}
 
@@ -801,7 +814,6 @@ class TestProbeDbBoundedAcquisition:
             # occupier's sleep (the documented escape hatch; the old thread is
             # a daemon and is abandoned, never joined).
             monitoring._reset_probe_worker()
-            occupier.set_result(None)
 
     def test_malformed_acquire_is_a_call_error_not_a_db_failure(self):
         """A non-callable or null-returning ``acquire`` is a CALL error.
@@ -820,37 +832,69 @@ class TestProbeDbBoundedAcquisition:
         with pytest.raises(ValueError, match="returned no SDK handle"):
             monitoring.probe_db(acquire=lambda: None)
 
-    def test_probe_db_enters_exactly_the_declared_enforced_phases(self):
+    def test_probe_db_enters_exactly_the_declared_enforced_phases(
+            self, monkeypatch):
         """The derivation is a sum over a phase SET — pin the set in code.
 
-        A bound that is a sum over four constants is only a bound if the
-        function can enter no other phase. Every other test in this file (and
-        the derivation lock in ``test_health_ready_nonblocking``) recomputes
-        CONSTANTS and therefore cannot see a phase added to ``probe_db`` — the
-        one premise of the proof that prose alone was holding up.
+        A bound that is a sum over three constants is only a bound if
+        ``probe_db`` can enter no other phase. Every other test in this file
+        (and the derivation lock in ``test_health_ready_nonblocking``)
+        recomputes CONSTANTS and therefore cannot see a phase added to
+        ``probe_db`` — the one premise of the proof that prose alone held up.
 
-        LOAD-BEARING (mutation: append any extra phase to ``phases_entered``
-        inside ``probe_db``): the recorded tuple no longer equals the declared
-        one and this reds.
+        The load-bearing half is the SUBMISSION COUNT, not the recorded tuple:
+        ``_PROBE_LAST_PHASES`` is self-reported by ``probe_db`` from a
+        hand-maintained list, so on its own it proves only that the declaration
+        and the recording agree — a phase whose author forgot to record it
+        would stay invisible. Counting the bounded waits that actually reach
+        ``_probe_worker`` cannot be fooled that way: any fourth phase that
+        bounds its wait there raises the count, whether or not anyone
+        remembered to name it.
+
+        LOAD-BEARING (mutation: insert a new bounded phase in ``probe_db`` —
+        e.g. ``_acquire_on_probe_worker(lambda: None, 0.5)`` right before
+        ``_probe_once`` — WITHOUT appending its name): ``submits`` becomes 4
+        and this reds. The record assertions alone would NOT have caught that
+        — which is why the count is here.
         """
         declared = monitoring._PROBE_ENFORCED_PHASES
         assert declared == ("sdk_acquisition", "projection_setup",
                             "reachability_query"), declared
 
+        real_worker = monitoring._probe_worker
+        submits = {"n": 0}
+
+        class _CountingWorker:
+            def submit(self, fn):
+                submits["n"] += 1
+                return real_worker().submit(fn)
+
+        monkeypatch.setattr(monitoring, "_probe_worker", _CountingWorker)
+
         acquired = monitoring.probe_db(acquire=lambda: FakeSDK(db_ok=True))
         assert acquired["ok"] is True, acquired
         assert declared == monitoring._PROBE_LAST_PHASES, (
             f"probe_db entered {monitoring._PROBE_LAST_PHASES!r} but the "
-            f"derivation declares {declared!r} — a phase the outer bound does "
-            "not account for makes it an under-estimate (#3446)"
+            f"derivation declares {declared!r}"
+        )
+        assert submits["n"] == len(declared), (
+            f"probe_db submitted {submits['n']} bounded waits to the shared "
+            f"probe worker but the derivation sums {len(declared)} phases "
+            f"({declared!r}) — a phase the outer bound does not account for "
+            "makes it an under-estimate (#3446)"
         )
 
+        before = submits["n"]
         supplied = monitoring.probe_db(FakeSDK(db_ok=True))
         assert supplied["ok"] is True, supplied
         assert declared[1:] == monitoring._PROBE_LAST_PHASES, (
             f"the ``sdk=`` shape entered {monitoring._PROBE_LAST_PHASES!r} — "
             "it must not run the acquisition phase, because that cost belongs "
             "to whichever caller acquired the handle"
+        )
+        assert submits["n"] - before == len(declared) - 1, (
+            "the ``sdk=`` shape must submit one bounded wait FEWER (there is "
+            "no acquisition phase — the caller acquired the handle)"
         )
 
 

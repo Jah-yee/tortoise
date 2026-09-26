@@ -412,17 +412,21 @@ PROBE_SDK_ACQUISITION_BUDGET = 2.0
 #: (#3446). This exists so the derivation above is checked against CODE rather
 #: than against prose: the outer bound is a sum over a phase SET, and a set
 #: that lives only in a comment cannot make a fourth phase fail anything.
-#: ``probe_db`` records what it actually entered in ``_PROBE_LAST_PHASES`` and
-#: ``tests/test_health_ready_nonblocking.py`` asserts the record equals this
-#: declaration, so adding a phase to ``probe_db`` without extending the
-#: derivation REDS a test.
+#: ``probe_db`` records what it actually entered in ``_PROBE_LAST_PHASES``, AND
+#: ``tests/test_monitoring.py`` counts the bounded waits it submits to
+#: ``_probe_worker`` and asserts that count equals ``len()`` of this tuple. The
+#: COUNT is the load-bearing half: a fourth phase that bounds its wait on the
+#: shared probe worker raises the submission count and REDS that test, whether
+#: or not anyone remembered to append its name here.
 _PROBE_ENFORCED_PHASES = ("sdk_acquisition", "projection_setup",
                           "reachability_query")
 
 #: Phases entered by the most recent ``probe_db`` call IN THIS PROCESS — read
-#: only by tests, to prove the entered set matches ``_PROBE_ENFORCED_PHASES``.
-#: Written once per call, never read by production code, so it cannot affect a
-#: verdict; it is a tuple so a reader cannot mutate it in place.
+#: only by tests. NOTE this is SELF-REPORTED: on its own it cannot catch a
+#: phase whose author forgot to record it here — the submission COUNT in
+#: ``tests/test_monitoring.py`` is what does that. Written once per call, never
+#: read by production code, so it cannot affect a verdict; a tuple so a reader
+#: cannot mutate it in place.
 _PROBE_LAST_PHASES: tuple[str, ...] = ()
 
 #: Safety margin so a DB coordinator's outer bound sits STRICTLY above the
@@ -1762,11 +1766,14 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
       total is ~``PROBE_TIMEOUT``. ``PROBE_DB_TOTAL_TIMEOUT`` (2 x
       ``PROBE_TIMEOUT`` + the retry delay) survives only as the loose
       outer-alignment figure a coordinator is sized above.
-    * explicit ``setup_timeout`` (the MCP ``tortoise_health`` tool): one
-      deadline of ``setup_timeout + PROBE_TIMEOUT`` — the cold-start allowance
-      plus one reachability budget; the retry rides the remainder of THAT.
-      ⛔ ``PROBE_HARD_TIMEOUT`` does NOT sit above this shape (~23.5s with the
-      shipped defaults); a coordinator over it must derive its own bound.
+    * explicit ``setup_timeout`` (the MCP ``tortoise_health`` tool, which
+      passes ``sdk=``): one deadline of ``setup_timeout + PROBE_TIMEOUT``
+      (21.5s at the shipped defaults) — the cold-start allowance plus one
+      reachability budget; the retry rides the remainder of THAT.
+      ⛔ ``PROBE_HARD_TIMEOUT`` does NOT sit above this shape, nor above the
+      ``acquire=`` + ``setup_timeout`` form ``selfhost._probe_db`` uses
+      (``PROBE_SDK_ACQUISITION_BUDGET + setup_timeout + PROBE_TIMEOUT`` =
+      23.5s). A coordinator over either must derive its own bound.
 
     The retry clock starts AFTER the acquisition (#3446 review): the
     acquisition has its OWN deadline, so charging its elapsed time to the
@@ -1811,10 +1818,12 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
     ⚠️ THE DERIVATION IS A SUM OVER A KNOWN PHASE SET: the acquisition, the
     projection setup, and the reachability query — the set declared in
     ``_PROBE_ENFORCED_PHASES`` and recorded per call in
-    ``_PROBE_LAST_PHASES``. A FOURTH bounded phase added
-    inside this function would raise the real inner total without moving
-    ``PROBE_HARD_TIMEOUT``, and no constant-vs-constant test can see that —
-    extend the outer bound's derivation deliberately when adding one.
+    ``_PROBE_LAST_PHASES``. A FOURTH bounded phase that bounds its wait on the
+    shared probe worker raises the submission count a test asserts, so it
+    cannot be added silently; a phase bounded anywhere ELSE would still raise
+    the real inner total without moving ``PROBE_HARD_TIMEOUT``, and no
+    constant-vs-constant test can see that — extend the outer bound's
+    derivation deliberately when adding one.
 
     That says nothing about the acquisition's INTERIOR (an unbounded
     cross-process probe plus real queries on the embedded lane — see
