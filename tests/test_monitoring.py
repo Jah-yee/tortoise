@@ -837,10 +837,15 @@ class TestProbeDbBoundedAcquisition:
         """The derivation is a sum over a phase SET — pin the set in code.
 
         A bound that is a sum over three constants is only a bound if
-        ``probe_db`` can enter no other phase. Every other test in this file
-        (and the derivation lock in ``test_health_ready_nonblocking``)
-        recomputes CONSTANTS and therefore cannot see a phase added to
-        ``probe_db`` — the one premise of the proof that prose alone held up.
+        ``probe_db`` can enter no other phase. The tests that pin the
+        derivation recompute CONSTANTS, so they cannot see a phase added to
+        ``probe_db``. One test in this file counts submissions
+        (``test_combined_budget_exhausted_in_setup_never_submits_the_query``),
+        but on the SETUP early-return path, which never reaches the call below.
+        The path this test takes — a non-retrying successful call, entering
+        each declared phase exactly once, which is the tight case for a
+        per-phase sum — was the one premise of the proof that prose alone held
+        up.
 
         The load-bearing half is the SUBMISSION COUNT, not the recorded tuple:
         ``_PROBE_LAST_PHASES`` is self-reported by ``probe_db`` from a
@@ -856,9 +861,13 @@ class TestProbeDbBoundedAcquisition:
         or not anyone named it. A phase reachable only on another branch — the
         transient-retry path, or a branch gated on ``setup_timeout`` — would
         submit more waits without being counted here, so it must still be added
-        to the derivation by hand. (The retry path re-enters the SAME three
-        phases, so it does not change the SET — which is why the set, not a
-        global submission total, is what the derivation sums.)
+        to the derivation by hand. (The retry re-enters only the two probe
+        phases — the acquisition is one-shot, taken once at the top of
+        ``probe_db`` and never re-entered by the retry branch, which
+        ``test_acquisition_is_one_phase_even_when_the_probe_retries`` pins —
+        so retrying adds submissions without changing the SET. That is why the
+        derivation sums the SET and not a global submission total: a total
+        would double-count the retry, and the retry is not a phase.)
 
         LOAD-BEARING (mutation: insert a new bounded phase in ``probe_db`` —
         e.g. ``_acquire_on_probe_worker(lambda: None, 0.5)`` right before
