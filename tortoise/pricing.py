@@ -71,6 +71,16 @@ def tier_limits(tier: str) -> dict:
         "max_api_keys": t.get("max_api_keys"),
         "included_write_ops_per_month": t.get("included_write_ops_per_month"),
         "max_graph_nodes": t.get("max_graph_nodes"),
+        # #5331 (owner ruling 2026-09-26): the byte-based storage allowance —
+        # "count storage in MB/GB, not nodes". OPTIONAL, and deliberately NOT
+        # in _REQUIRED_LIMIT_KEYS: an absent key (or an explicit null) means NO
+        # byte allowance is configured for the tier, which means the node cap
+        # stays the enforced one (#5331 "absent = not enforced"). The owner
+        # sets it per tier by adding the key to pricing.json — no code change.
+        # Unit-agnostic: the gate compares a count against this allowance in
+        # ONE unit and never converts; which unit the UI presents is a
+        # presentation decision made once the ranges are known.
+        "max_storage_bytes": t.get("max_storage_bytes"),
         "overage": bool(t.get("overage", False)),
     }
 

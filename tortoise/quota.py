@@ -62,7 +62,10 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -238,12 +241,17 @@ class QuotaExceededError(Exception):
     def __init__(self, message: str, *, resource: str | None = None,
                  used: int | None = None, limit: int | None = None,
                  estimate: int | None = None,
+                 estimated: bool | None = None,
                  code: str = QUOTA_REFUSAL_CODE) -> None:
         super().__init__(message)
         self.resource = resource
         self.used = used
         self.limit = limit
         self.estimate = estimate
+        # #5331: True when the `used` figure that produced a STORAGE refusal
+        # is itself an estimate (the graph byte meter samples). `None` when the
+        # raise site makes no claim — never a fabricated precision.
+        self.estimated = estimated
         self.code = code
 
 
@@ -270,11 +278,94 @@ def quota_refusal_payload(exc: QuotaExceededError) -> dict:
         "code": getattr(exc, "code", None) or QUOTA_REFUSAL_CODE,
         "message": str(exc),
     })
-    for key in ("resource", "used", "limit", "estimate"):
+    for key in ("resource", "used", "limit", "estimate", "estimated"):
         value = getattr(exc, key, None)
         if value is not None:
             payload[key] = value
     return payload
+
+
+# ── #5331: byte-based storage dimension (owner ruling 2026-09-26) ──────────
+# The owner ruled: "we have to migrate away from counting nodes and start
+# counting in mb/gb for storage". This is the MECHANISM ONLY. No byte
+# allowance is set here — the VALUES are the owner's. The dimension is
+# resolved through the SAME precedence as the node cap (per-org override
+# first, pricing tier second), and ABSENT = NOT ENFORCED: with no allowance
+# configured anywhere the node cap stays the enforced one, byte-for-byte as
+# before. That absent-by-default property is what makes the migration
+# off-by-default and reversible.
+#
+# The byte reading is supplied by the CALLER through a callable seam
+# (``storage_reading``) so this module never imports the graph byte meter
+# (``tortoise/graph_storage.py``, #5331 sibling) and the two land
+# independently. The caller adapts its instrument to :class:`StorageBytes`,
+# carrying the instrument's honesty (``estimated``/``note``) with the number.
+
+
+def resolve_storage_allowance(per_org: Any, tier_value: Any) -> int | None:
+    """Byte allowance precedence: per-org override FIRST, tier value SECOND.
+
+    ``None`` when neither is configured — ABSENT = NOT ENFORCED (#5331).
+    """
+    if per_org is not None:
+        return int(per_org)
+    return tier_value
+
+
+def storage_allowance(limits: dict) -> int | None:
+    """The effective byte allowance for a resolved limits dict (#5331).
+
+    A limits dict built by ``resolve_org_limits`` carries the already-resolved
+    ``max_storage_bytes`` (per-org first, tier second). Any OTHER builder
+    (hosted_api's several org-dict sites) may omit the key entirely; the tier
+    fallback keeps a TIER-level allowance effective on that lane rather than
+    silently disabling the dimension. A PER-ORG override is only recoverable
+    from the org row, so a builder that drops it falls back to the tier value —
+    every points-gating builder carries it explicitly for that reason. Absent
+    everywhere → ``None`` → the node cap stays the enforced one. A malformed
+    configured value fails CLOSED (QuotaCheckError), never as a raw ValueError.
+    """
+    per_org = limits.get("max_storage_bytes")
+    if per_org is not None:
+        try:
+            return int(per_org)
+        except (TypeError, ValueError):
+            raise QuotaCheckError(
+                f"team max_storage_bytes invalid for points resource "
+                f"({per_org!r})") from None
+    tier = limits.get("tier")
+    if not tier:
+        return None
+    from tortoise.pricing import tier_limits  # function-level: avoid cycles
+    tier_value = tier_limits(tier).get("max_storage_bytes")
+    if tier_value is None:
+        return None
+    try:
+        return int(tier_value)
+    except (TypeError, ValueError):
+        raise QuotaCheckError(
+            f"tier {tier!r} max_storage_bytes invalid for points resource "
+            f"({tier_value!r})") from None
+
+
+@dataclass(frozen=True)
+class StorageBytes:
+    """A caller-supplied byte reading for the storage cap (#5331).
+
+    The cap does NOT measure storage itself; the caller adapts whatever
+    instrument it has (the graph byte meter reports MB, with caveats) to this
+    shape and passes it as the ``storage_reading`` callable to
+    ``enforce_org_limit``. ``used`` is a plain count in the SAME unit as the
+    configured allowance — this module never converts and never names a unit
+    (bytes/MB/GB are one quantity; which one the UI shows is a presentation
+    decision made elsewhere). ``estimated``/``note`` carry the instrument's
+    honesty: a cap built on a sampling estimate is defensible, a refusal that
+    presents an estimate as exact is not. When ``note`` is set it travels into
+    the refusal's human message.
+    """
+    used: int
+    estimated: bool = False
+    note: str | None = None
 
 
 def derived_tier(org_row: dict) -> str:
@@ -407,6 +498,16 @@ def resolve_org_limits(org_id: str) -> dict:
         mp = row.get("max_points")
         if mp is None:
             mp = row.get("graph_size_cap")
+        # #5331: byte-storage allowance — SAME precedence as max_points
+        # (per-org override first, pricing tier second); ABSENT = NOT ENFORCED
+        # (the node cap stays the enforced one). The anon tier forces the
+        # reduced tier value, exactly as it does for max_points. NOTE: the
+        # Supabase orgs row has no max_storage_bytes column yet, so `row.get`
+        # is inert and the tier value applies — which is the required
+        # fail-open-to-tier behaviour. Adding the column (and registering it
+        # in _QUOTA_SELECT + an additive tier) is a follow-up schema change,
+        # deliberately NOT made here (#5331 boundary: no hosted-resource edits).
+        msb = row.get("max_storage_bytes")
         return {
             "org_id": org_id, "tier": tier,
             "max_users": (lim["max_users_per_team"] if anon_override
@@ -417,17 +518,22 @@ def resolve_org_limits(org_id: str) -> dict:
                             else (int(mp) if mp is not None else lim["max_graph_nodes"])),
             "max_api_keys": lim["max_api_keys"],
             "max_sessions": None,
+            "max_storage_bytes": resolve_storage_allowance(
+                None if anon_override else msb, lim.get("max_storage_bytes")),
         }
     reg = _make_sdk(namespace="registry")
     rows = reg._get_registry().query(
         "MATCH (t:Team {id:$id}) "
         "RETURN t.tier, t.max_users, t.max_graphs, "
-        "t.max_points, t.max_api_keys, t.max_sessions",
+        "t.max_points, t.max_storage_bytes, t.max_api_keys, t.max_sessions",
         params={"id": org_id},
     ).result_set
     if not rows:
         raise QuotaCheckError(f"Team {org_id!r} not found in registry")
-    tier, mu, mg, mp, mak, _ms = rows[0]
+    # #5331: t.max_storage_bytes is a Cypher property read — absent on every
+    # existing Team node (null), so this stays inert until an operator sets a
+    # per-org byte allowance. No migration is required on the registry lane.
+    tier, mu, mg, mp, msb, mak, _ms = rows[0]
     tier = tier or "free"
     from tortoise.pricing import tier_limits
     lim = tier_limits(tier)
@@ -439,6 +545,9 @@ def resolve_org_limits(org_id: str) -> dict:
         "max_graphs": int(mg) if mg is not None else None,
         "max_points": int(mp) if mp is not None else lim["max_graph_nodes"],
         "max_api_keys": int(mak) if mak is not None else lim["max_api_keys"],
+        # #5331: per-org byte allowance first, pricing tier second, absent = None.
+        "max_storage_bytes": resolve_storage_allowance(
+            msb, lim.get("max_storage_bytes")),
         # #4010: sessions are unlimited for every tier — the flat 1000 was
         # an inherited code fallback, never a ratified cap (see the module
         # comment above). `_ms` (the stored t.max_sessions) is read so the
@@ -715,8 +824,63 @@ def _count_resource(org_id: str, resource: str, sdk=None) -> int:
         raise QuotaCheckError(f"quota count failed for {resource}: {redacted}") from e
 
 
+def _enforce_storage_allowance(limits: dict, allowance: int,
+                               storage_reading: Callable[[], StorageBytes | None] | None) -> None:
+    """Enforce the byte allowance for the `points` resource (#5331).
+
+    Called ONLY when a byte allowance is configured (see `enforce_org_limit`).
+    The reading is supplied by the caller through `storage_reading` — this
+    module never measures and never imports the graph byte meter.
+
+    FAIL-CLOSED on a configured-but-unmeasurable allowance: a cap that cannot
+    be measured must not silently pass (the #686 posture). This is reachable
+    only by explicit configuration — no existing org has a byte allowance, so
+    no existing path changes.
+    """
+    org_id = limits.get("org_id")
+    try:
+        allowance = int(allowance)
+    except (TypeError, ValueError):
+        raise QuotaCheckError(
+            f"team max_storage_bytes invalid for points resource "
+            f"({allowance!r})") from None
+    if storage_reading is None:
+        raise QuotaCheckError(
+            f"byte storage allowance ({allowance}) configured for team "
+            f"{org_id!r} but no storage reading was supplied — refusing to "
+            "fail open (#5331). Wire the graph byte meter into the gate "
+            "before setting an allowance.")
+    try:
+        reading = storage_reading()
+    except Exception as e:
+        raise QuotaCheckError(
+            f"storage reading failed for team {org_id!r}: {e!r}") from e
+    if reading is None:
+        raise QuotaCheckError(
+            f"storage reading unavailable for team {org_id!r} — refusing to "
+            "fail open (#5331)")
+    try:
+        used = int(reading.used)
+    except (TypeError, ValueError):
+        raise QuotaCheckError(
+            f"storage reading invalid for team {org_id!r}: "
+            f"{getattr(reading, 'used', None)!r}") from None
+    if used >= allowance:
+        # #5331: carry the instrument's honesty — a cap built on a sampling
+        # estimate is defensible; a refusal that presents the estimate as
+        # exact is not.
+        note = f" {reading.note}" if reading.note else ""
+        raise QuotaExceededError(
+            f"Team storage limit reached ({allowance}). Upgrade your "
+            f"plan to increase it.{note}",
+            resource="storage", used=used, limit=allowance,
+            estimated=bool(reading.estimated),
+        )
+
+
 def enforce_org_limit(limits: dict | None, resource: str, sdk=None, *,
-                      slot_credit: int = 0) -> None:
+                      slot_credit: int = 0,
+                      storage_reading: Callable[[], StorageBytes | None] | None = None) -> None:
     """Reject a write when the org is at/over its resource limit.
 
     Args:
@@ -735,6 +899,14 @@ def enforce_org_limit(limits: dict | None, resource: str, sdk=None, *,
             (``api_key_occupies_slot``) that the displaced row is counted once.
             MUST be 0 everywhere else, and MUST never become reachable from a
             client-supplied value — an unproven credit is a free slot.
+        storage_reading: #5331 — a zero-argument callable returning a
+            :class:`StorageBytes` for this org (or None when the reading is
+            unavailable). It is invoked ONLY when a byte storage allowance is
+            configured for the tier/org, so wiring it costs nothing — and
+            measures nothing — while the migration is off. When it is absent
+            and an allowance IS configured, the gate fails closed rather than
+            silently passing. The caller adapts the graph byte meter to
+            ``StorageBytes``, so this module never imports the meter.
 
     Raises:
         QuotaExceededError: org at/over limit (402-equivalent).
@@ -745,6 +917,17 @@ def enforce_org_limit(limits: dict | None, resource: str, sdk=None, *,
     org_id = limits.get("org_id")
     if not org_id:
         return
+    # ── #5331: the byte-capable storage dimension — entered ONLY when a byte
+    # allowance is configured (per-org override first, pricing tier second;
+    # see storage_allowance). ABSENT = NOT ENFORCED: with no allowance
+    # configured anywhere, control falls through to the node cap below,
+    # byte-for-byte as before. When configured, the byte cap REPLACES the node
+    # cap for `points` — that replacement is the migration the owner ruled for.
+    if resource == "points":
+        allowance = storage_allowance(limits)
+        if allowance is not None:
+            _enforce_storage_allowance(limits, allowance, storage_reading)
+            return
     # ── documents: DERIVED-CONSTANT cap (T2-P2a, #1726) — handled BEFORE the
     # pricing-keyed generic path. Deliberately NOT in _RESOURCE_LIMIT_KEYS: a
     # pricing.json max_documents field would ripple through tier_limits /

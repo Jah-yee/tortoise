@@ -29,7 +29,7 @@ import re
 import threading
 import time
 from collections import Counter, OrderedDict, defaultdict
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
@@ -3771,17 +3771,19 @@ async def get_current_org(request: Request) -> dict:
             # store, #310) ride the same round-trip so the dashboard Billing
             # page can render plan state.
             "MATCH (t:Team {id: $id}) RETURN t.tier, t.max_users, t.max_graphs, "
-            "t.max_points, t.max_api_keys, t.max_sessions, t.suspended_at, "
+            "t.max_points, t.max_storage_bytes, t.max_api_keys, t.max_sessions, "
+            "t.suspended_at, "
             "t.flagged_at, t.email, t.subscription_status, t.customer_email, "
             "t.graph_name",
             params={"id": org_id},
         )
         row = org.result_set[0] if org.result_set else None
         if row:
-            (tier, mu, mg, mp, mak, _ms, t_suspended, t_flagged, t_email,
+            (tier, mu, mg, mp, msb, mak, _ms, t_suspended, t_flagged, t_email,
              t_sub_status, t_customer_email, t_graph_name) = row
         else:
-            tier, mu, mg, mp, mak, _ms = ("free", None, None, None, None, None)
+            tier, mu, mg, mp, msb, mak, _ms = (
+                "free", None, None, None, None, None, None)
             t_suspended = t_flagged = t_email = None
             t_sub_status = t_customer_email = None
             t_graph_name = None
@@ -3818,6 +3820,13 @@ async def get_current_org(request: Request) -> dict:
                 "max_graphs": mg if mg is not None else lim["max_graphs_per_team"],
                 # points counter counts graph nodes → max_graph_nodes (#310 GAP-B)
                 "max_points": int(mp) if mp is not None else lim["max_graph_nodes"],
+                # #5331: per-org byte allowance first, pricing tier second;
+                # absent (both None) = NOT ENFORCED (the node cap stays the
+                # enforced one). t.max_storage_bytes is a Cypher property read
+                # — null on every existing Team node, so this is inert until an
+                # operator sets a per-org allowance; no migration required.
+                "max_storage_bytes": (int(msb) if msb is not None
+                                      else lim.get("max_storage_bytes")),
                 "max_api_keys": int(mak) if mak is not None else lim["max_api_keys"],
                 # #4010: sessions are UNLIMITED for every tier — the flat
                 # 1000 was an inherited code fallback, never a ratified cap
@@ -4155,6 +4164,13 @@ async def _session_user_org(request: Request, user: dict) -> dict:
         "max_api_keys": (_gate_limits["max_api_keys"]
                          if _gate_limits.get("max_api_keys") is not None
                          else lim["max_api_keys"]),
+        # #5331: the byte dimension must not be silently disabled on the
+        # session lane — resolve it through the SAME node-sync resolver the
+        # mint gate uses (per-org override first), then the pricing tier.
+        # Absent everywhere → None → the node cap stays the enforced one.
+        "max_storage_bytes": (_gate_limits.get("max_storage_bytes")
+                              if _gate_limits.get("max_storage_bytes") is not None
+                              else lim.get("max_storage_bytes")),
         # #4010: sessions are unlimited for every tier — no cap of any kind,
         # so the resolved value is always the explicit None (the pre-#4010
         # `DEFAULT_MAX_SESSIONS` fallback is deleted, not relocated).
@@ -4694,7 +4710,8 @@ def _key_limit_refusal(message: str = "Key limit reached — revoke an existing 
 
 
 def _check_org_limit(org: dict, resource: str, *,
-                     slot_credit: int = 0) -> None:
+                     slot_credit: int = 0,
+                     storage_reading: Callable[[], object] | None = None) -> None:
     """Enforce per-org limits. Raises 402 (payment required) when at capacity.
 
     resource: 'points' | 'api_keys' | 'sessions' | 'users' | 'graphs'
@@ -4702,6 +4719,12 @@ def _check_org_limit(org: dict, resource: str, *,
     primitive passes 1 so the admission check is evaluated post-release. Only
     the rotate path may pass a non-zero credit, and only after
     ``quota.api_key_occupies_slot`` proved the displaced row is counted.
+    storage_reading (#5331): the byte-reading seam for the storage cap — a
+    zero-argument callable returning a ``quota.StorageBytes`` (or None when
+    unavailable). It is consulted ONLY when a byte storage allowance is
+    configured, so passing it changes nothing today. The graph byte meter
+    (``tortoise/graph_storage.py``) lands independently; the caller adapts it
+    to ``StorageBytes`` here or at the route, never inside quota.
 
     Fail-closed decision (#686)
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4730,7 +4753,8 @@ def _check_org_limit(org: dict, resource: str, *,
         quota_refusal_payload,
     )
     try:
-        enforce_org_limit(org, resource, slot_credit=slot_credit)
+        enforce_org_limit(org, resource, slot_credit=slot_credit,
+                          storage_reading=storage_reading)
     except QuotaExceededError as e:
         # #4614: the refusal is a STRUCTURED, distinguishable state — a `code`
         # plus the resource/used/limit the gate actually compared — not the
@@ -12961,6 +12985,7 @@ def _org_limits_from_node(org_node: dict) -> dict:
     mu = org_node.get("max_users")
     mg = org_node.get("max_graphs")
     mp = org_node.get("max_points")
+    msb = org_node.get("max_storage_bytes")
     mak = org_node.get("max_api_keys")
     return {
         "org_id": org_node["id"],
@@ -12971,6 +12996,10 @@ def _org_limits_from_node(org_node: dict) -> dict:
         "max_graphs": mg if mg is not None else lim["max_graphs_per_team"],
         # points counter counts graph nodes → max_graph_nodes (#310 GAP-B)
         "max_points": mp if mp is not None else lim["max_graph_nodes"],
+        # #5331: per-org byte allowance first, pricing tier second; absent
+        # (both None) = NOT ENFORCED — the node cap stays the enforced one.
+        "max_storage_bytes": (int(msb) if msb is not None
+                              else lim.get("max_storage_bytes")),
         "max_api_keys": mak if mak is not None else lim["max_api_keys"],
         # #4010: sessions are unlimited for every tier — the stored value is
         # deliberately NOT honoured as a cap (see quota.resolve_org_limits).

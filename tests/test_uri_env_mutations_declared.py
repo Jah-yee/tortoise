@@ -137,6 +137,9 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     "test_onboarding_integration.py": [r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
     "test_pack_state.py": [r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
     "test_quota.py": [r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
+    # #5331: the byte-cap mechanism tests force the embedded lane, same as
+    # test_quota.py (the delenv IS the point — monkeypatch auto-undo).
+    "test_quota_5331_storage_cap.py": [r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
     "test_selfhost.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI",\s*""'],
     "test_selfhost_rest.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI",\s*""'],
     "test_selfhost_volunteer_context.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI",\s*""'],  # #2103 (W4C) — selfhost volunteer forces the embedded lane (the selfhost_rest pattern)

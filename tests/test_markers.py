@@ -127,6 +127,7 @@ ROUTED_NAMESPACES: dict[str, dict[str, str]] = {
         "mcp-team": "team-identity", "t-bf-1": "team-identity",
     },
     "test_quota.py": {"registry": "prod-coupled"},
+    "test_quota_5331_storage_cap.py": {"registry": "prod-coupled"},  # #5331 — registry-lane resolve_org_limits/precedence reads (same lane as test_quota.py)
     "test_sdk_legacy_coverage.py": {"team-beta": "assertion"},
     "test_writer_inventory.py": {"registry": "prod-coupled"},
     "test_ask_sdk.py": {
