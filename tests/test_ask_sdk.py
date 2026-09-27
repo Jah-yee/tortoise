@@ -800,8 +800,21 @@ def test_annotate_d8_rides_through_decorated_hits():
 
 def test_annotate_dedup_key_order_pinning():
     """P2-20: hits LACKING sessionId but sharing an Event join group by the
-    ANNOTATED session identifier — the per-session dedup cap applies."""
-    from tortoise.retrieval import dedup_pool
+    ANNOTATED session identifier — the per-session dedup cap applies.
+
+    Value that makes this fail: the kept-id list. The fixture carries five
+    chunks over TWO annotated dates (four on 2026-08-01, one on 2026-08-02)
+    with a cap of three, so a key that grouped on anything else — or that fell
+    through to one shared bucket — would keep the first three and drop ``e``
+    as well.
+
+    The key is ``ask_session_key``, the one the ask lane actually passes
+    (#4155): a hand-rolled extractor here would be a second, free-to-drift
+    copy of the bucket key, which is the defect class this change removes.
+    These hits reach its ``session_date`` branch, which is the branch this
+    test is about — they carry no ``session_id`` and no camel ``sessionId``.
+    """
+    from tortoise.retrieval import ask_session_key, dedup_pool
     hits = [
         {"id": "a", "content": "chunk 1", "point_kind": "session-transcript",
          "session_date": "2026-08-01"},
@@ -814,8 +827,8 @@ def test_annotate_dedup_key_order_pinning():
         {"id": "e", "content": "other", "point_kind": "session-transcript",
          "session_date": "2026-08-02"},
     ]
-    key = lambda h: h.get("session_date") or h.get("session_id") or f"idx:{h.get('lme_session_index', -1)}"  # noqa: E731
-    deduped = dedup_pool(hits, max_chunks_per_session=3, session_key=key)
+    deduped = dedup_pool(hits, max_chunks_per_session=3,
+                         session_key=ask_session_key)
     assert [h["id"] for h in deduped] == ["a", "b", "c", "e"]
 
 

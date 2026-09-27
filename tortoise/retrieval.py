@@ -669,11 +669,16 @@ def dedup_pool(annotated: list[dict], *,
 
     ``session_key`` (#1987 Task 4, P2-20): optional per-hit key extractor.
     Default None = the historical bucket key (session_id / lme index). The
-    ASK lane passes a key extractor preferring the UNIQUE session identifier
-    (``session_id`` from the Event join, falling back to the annotated
-    ``session_date``) — distinct same-day sessions never collapse into one
-    bucket; hits LACKING ``sessionId`` but sharing an Event-derived session
-    date still cap together (pre-annotation dedup could not group them).
+    ASK lane passes :func:`ask_session_key` — the UNIQUE session identifier
+    (``session_id``, else the camel ``sessionId`` the point fetch populates,
+    else the annotated ``session_date``) — so distinct IDENTIFIED sessions
+    never share a bucket. Hits carrying NEITHER id spelling but sharing an
+    annotated ``session_date`` still cap together: the date is a COARSER,
+    day-granularity fallback, never a substitute for the name. Requiring the
+    camel key is the #4155 fix — the snake ``session_id`` is usually ABSENT on
+    these hits, so before it the extractor fell through to that date (and to
+    ``idx:-1`` when the date was absent too), collapsing nearly the whole pool
+    into one bucket and applying the per-session cap to everything at once.
     """
     if max_chunks_per_session < 1:
         raise ValueError("max_chunks_per_session must be >= 1, got "
