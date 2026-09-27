@@ -525,8 +525,9 @@ def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
     The bound is on the EMISSION only — every record is still
     attempted by the same gates below. The per-record guarantees recorded
     earlier (#2242's "exactly one warn" on a lost concurrent fold, #2164's
-    "unresolved refs warn loudly") hold verbatim for any call emitting at
-    most ``_MAX_SUPERSESSION_WARNS`` warnings; a call above the budget has
+    "unresolved refs warn loudly") hold verbatim for any call raising at
+    most ``_MAX_SUPERSESSION_WARNS`` per-record warnings; a call above the
+    budget has
     its withheld warnings counted, sized and reported in the summary but not
     named individually — whatever their cause (a legitimate batch can exceed
     the budget, e.g. many concurrent-race losses, so exceeding it is not by
