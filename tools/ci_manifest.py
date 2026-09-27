@@ -130,9 +130,9 @@ def _ci_selection():
     if str(REPO / "tools") not in sys.path:
         sys.path.insert(0, str(REPO / "tools"))
     try:
-        from tools import ci_selection as mod  # noqa: PLC0415
+        from tools import ci_selection as mod
     except ImportError:  # pragma: no cover - direct `tools/` runtime
-        import ci_selection as mod  # noqa: PLC0415
+        import ci_selection as mod
     return mod
 
 

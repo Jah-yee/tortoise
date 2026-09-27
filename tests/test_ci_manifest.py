@@ -25,8 +25,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools import ci_manifest as cm  # noqa: E402
-from tools import ci_selection as cs  # noqa: E402
+from tools import ci_manifest as cm  # noqa: I001
+from tools import ci_selection as cs
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────
@@ -421,7 +421,7 @@ def test_partition_allows_an_unclassified_push_extra(monkeypatch):
     m = cs.load_manifest()
     real = cs.push_legs(m)
     broken = dict(real)
-    broken["half_a"] = list(real["half_a"]) + ["bench/test_extra_5050"]
+    broken["half_a"] = [*list(real["half_a"]), "bench/test_extra_5050"]
     m["push_extra"] = ["bench/test_extra_5050"]
     monkeypatch.setattr(cs, "push_legs", lambda manifest: broken)
     assert cm.partition_issues(m) == []
@@ -449,8 +449,7 @@ def test_guard_reachability_flags_a_dead_source_pattern(monkeypatch):
     m = cs.load_manifest()
     monkeypatch.setitem(
         cs.SOURCE_PATTERNS, "onboarding",
-        tuple(cs.SOURCE_PATTERNS["onboarding"])
-        + ("tools/__does_not_exist_5050__.py",))
+        (*cs.SOURCE_PATTERNS["onboarding"], "tools/__does_not_exist_5050__.py"))
     issues = cm.guard_reachability_issues(m)
     assert any("__does_not_exist_5050__" in i for i in issues), issues
 
