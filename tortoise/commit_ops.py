@@ -466,8 +466,9 @@ def _supersession_fold_order(proj, records):
 #: #2243 proposes a Layer-1 cap on ``len(payload.supersessions)`` (PR #5648,
 #: still OPEN at #5654's base). Until it lands the ``supersessions`` LIST is
 #: Layer-1-ungated on every path — capture, hosted commit §6b and eval ingest
-#: all hand this helper the raw list (the hosted endpoint does run
-#: ``validate_layer1``, but it caps points/entities/operators only) — so this
+#: all hand this helper the uncapped records (the hosted endpoint does run
+#: ``validate_layer1``, but it caps points/entities/operators only; eval splits
+#: a payload into two kind-bucketed calls, so its budget is per call) — so this
 #: emission bound is the only limit on the storm. It bounds the EMISSION,
 #: never the writes: every record is still attempted, and the withheld count
 #: is reported in ONE summary warn. 20 keeps every realistic batch (a handful
