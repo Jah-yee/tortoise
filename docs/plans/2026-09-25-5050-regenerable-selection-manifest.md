@@ -89,7 +89,7 @@ Children disposition for the full substrate: #4766 (regeneration path) = T2/T3; 
 ### Task 3: Regenerate the map from the five documented source runs
 
 **Intent:** Fill the unweighted fast-pool files by measurement, not by hand (#3463).
-**Acceptance:** `--integrity`'s strict presence check passes with zero unweighted fast files; the generator reproduces 600/646 committed values exactly from the four header runs alone (the 2 exceptions are the pinned and retained rows), and fills the 15 measurable unweighted files from the base-commit run.
+**Acceptance:** `--integrity`'s strict presence check passes with zero unweighted fast files; a dry `sweep` over the five documented source runs reproduces the committed record exactly (zero drift). The five runs are a UNIFORM basis — every listed run contributes to the per-file max, so the map is a pure function of the record's `sources` and the base-commit run is not fill-only. Rule evidence: the four header runs alone already reproduce ~610 of the pre-existing 687 rows (the residue is ±0.1 rounding on rows whose prior was `# unmeasured`), which pins the carrying-leg/max rule; the base-commit run then raises 176 rows, the direction-safe consequence of adding a legitimate sample of the same manifest (the map is a watchdog bound, so the larger value is the safe side). Committing to a five-run uniform basis rather than a four-run-plus-fill rule keeps ONE aggregation semantics — a fill-only role for one run would be a second, special-case basis.
 **Files:** `config/ci-surfaces.yml`, `config/ci-durations-source.json`
 
 ### Task 4: Value validation — wrong value, dead key
@@ -139,5 +139,5 @@ The drift-gate test must actually execute the clause its docstring names.
 
 ## Learnings
 
-- The four header runs reproduce 600/646 committed fast rows exactly; the only two non-reproducing rows are the deliberately retained `test_selfhost_health_probe_executor.py` (28.1) and the test-enforced pinned `test_mcp_rename_table.py`. That is strong evidence the sweep rule is faithfully encoded.
+- The four header runs alone reproduce ~610/687 of the pre-existing committed rows (the residue is ±0.1 rounding on rows whose prior was `# unmeasured`), which is strong evidence the carrying-leg/max rule is faithfully encoded. The committed map itself uses the UNIFORM five-run basis (the base-commit run raises 176 rows); that is the documented max aggregation, not a fill-only fill — see Task 3's acceptance above.
 - The `pytest-log-test-slow` artifact name collides across the two slow legs, so a full-pool slow sweep is impossible from these artifacts — the record must carry a retained marker for slow rows the sweep cannot see (`eval/retrieval/test_integration.py` et al.).

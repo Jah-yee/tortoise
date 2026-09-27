@@ -1118,12 +1118,12 @@ def _register_provisional(names: list[str]) -> list[str]:
     """Give newly registered files their explicit `unmeasured` duration row.
 
     Delegated to ``tools/ci_manifest.py`` (the record is the single author of a
-    weight); returns the files that got a provisional row.
+    weight); returns the files that got a provisional row. An ImportError here
+    PROPAGATES: silently skipping the row would leave the next ``--integrity``
+    to red on a strict-presence failure with no explanation of why the atomic
+    registration did not happen (#5050).
     """
-    try:
-        return _ci_manifest_module().register_provisional(names)
-    except ImportError:  # pragma: no cover - module shipped with the repo
-        return []
+    return _ci_manifest_module().register_provisional(names)
 
 
 # #1472: files excluded from the fast push legs by construction (they cannot
@@ -2281,12 +2281,19 @@ def _manifest_contract_issues(manifest: dict) -> list[str]:
     """#5050: the generated-manifest contract (value + partition + reachability).
 
     Delegated to ``tools/ci_manifest.py`` so there is ONE contract and no
-    parallel gate: ``--integrity`` is the only entry point.
+    parallel gate: ``--integrity`` is the only entry point. An ImportError is
+    reported as an issue, never swallowed: returning ``[]`` would leave
+    ``--integrity`` GREEN with none of the #5050 checks having run — the exact
+    "silent omission with every gate green" class this contract exists to kill.
     """
     try:
         return _ci_manifest_module().check(manifest)
-    except ImportError:  # pragma: no cover - module shipped with the repo
-        return []
+    except ImportError as exc:  # pragma: no cover - module shipped with the repo
+        return [
+            "the #5050 manifest contract module (tools/ci_manifest.py) could "
+            f"not be imported — value/partition/reachability checks DID NOT "
+            f"RUN: {exc}"
+        ]
 
 
 def main() -> int:

@@ -37,8 +37,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
+import subprocess
 import sys
+import textwrap
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -61,7 +64,14 @@ SCHEMA_VERSION = 1
 LEG_ARTIFACTS = {
     "fast": ("pytest-log-test-a", "pytest-log-test-b"),
     "carve_out": ("pytest-log-test-carve-out",),
-    "slow": ("pytest-log-test-slow",),
+    # #5050: the two slow matrix legs used to upload under ONE name
+    # (`pytest-log-${{ github.job }}`, no half suffix — unlike the fast job), so
+    # `gh run download -n` resolved the collision non-deterministically and a
+    # full slow sweep was impossible. The workflow now names them per half; the
+    # bare name is kept so a re-sweep over the pre-fix 2026-09 runs still reads
+    # whatever `gh run download` extracted for them.
+    "slow": ("pytest-log-test-slow-a", "pytest-log-test-slow-b",
+             "pytest-log-test-slow"),
 }
 EXCLUDED_ARTIFACTS = (
     "pytest-log-test-track-b",
@@ -78,19 +88,29 @@ VALUE_DECIMALS = 1
 # paragraph). Each entry is the note rendered next to the row.
 RETAINED = {
     "test_selfhost_health_probe_executor.py":
-        "#4602 local embedded-lane timing, retained deliberately (no source "
-        "leg measured it; its own note asks for a re-measurement)",
+        "#4602 embedded-lane timing retained deliberately: the CI fast legs "
+        "measure 2.5-9.5s, below the 28.1s embedded-lane bound the split is "
+        "sized against, so the larger value is kept",
 }
 # Test-enforced equality (tests/test_mcp_rename_table.py); the sweep must not
 # break it.
 PINS = {"test_mcp_rename_table.py": "test_bridge_table.py"}
+# The explanation rendered ABOVE a pinned row. It states the condition the
+# equality models (the shared import cost and a load-varied run), because a bare
+# "equal to X" reads as a measurement — and the test that enforces the pair also
+# asserts the rendered comment states that condition. Data, like RETAINED.
+PIN_NOTES = {
+    "test_mcp_rename_table.py":
+        "pinned equal to test_bridge_table.py (test-enforced): the two generator "
+        "suites pay the same shared-conftest + generator import cost, so one weight "
+        "for the pair keeps the split independent of which of the two a load-varied "
+        "run happens to slow down. Not this file's own measurement.",
+}
 
 # The flat weight a never-measured file packs at. Mirrors
 # ci_selection.DEFAULT_FAST_WEIGHT; a provisional row is EXPLICIT and marked,
 # which is the whole difference from the silent default #3400 removed.
 PROVISIONAL_WEIGHT = 2.0
-
-_ROW_RE = re.compile(r"^  ([A-Za-z0-9_][A-Za-z0-9_./-]*\.py):\s*([0-9.]+)\s*(#.*)?$")
 
 
 def _ci_selection():
@@ -202,8 +222,10 @@ def sweep(sources: list[tuple[str, dict[str, dict[str, float]]]],
 
     ``sources`` is ``[(run_id, legs), ...]``. ``prior`` is the previously
     committed record (used to carry forward values the sweep cannot measure);
-    it is REQUIRED for a faithful regeneration — a partial artifact set must
-    move weights down only when it was not measured, never when a leg was cut.
+    it is REQUIRED for a faithful regeneration — a PARTIAL artifact set retains
+    the committed value and marks the row, and only a sample set at least as
+    complete as the prior's may move a weight (never silently down when a leg
+    was cut, #3395/#5050).
     """
     cs = _ci_selection()
     fast = set(cs.fast_pool(manifest))
@@ -226,7 +248,24 @@ def sweep(sources: list[tuple[str, dict[str, dict[str, float]]]],
             value = legs.get(leg, {}).get(name) if leg else None
             if value is not None:
                 samples[run_id] = round(value, 2)
+        prior_row = prior_rows.get(name) or {}
+        prior_samples = {k: float(v)
+                         for k, v in (prior_row.get("samples") or {}).items()}
+        prior_value = prior_row.get("value")
+        missing = set(prior_samples) - set(samples)
         row: dict = {"leg": leg, "samples": samples}
+        if missing:
+            # PARTIAL artifact set (#5050/#3395): a run that measured this row
+            # before is absent now (a leg was cut, or — until the workflow
+            # named them — the two slow legs collided on one artifact name).
+            # The record must REMEMBER that run: replacing its sample with the
+            # partial set erases the very gap the next sweep compares against,
+            # so a second partial sweep finds no missing run and silently drops
+            # the value. Carry the absent runs' samples forward
+            # UNCONDITIONALLY — the marker/floor below apply only when the
+            # reading is also lower, but the sample universe must be a fixed
+            # point of the sweep either way.
+            row["samples"] = {**prior_samples, **samples}
         if name in RETAINED:
             # A row no source artifact can re-derive keeps its committed value
             # AND an explicit marker — it is never silently re-derived (#4766).
@@ -234,16 +273,38 @@ def sweep(sources: list[tuple[str, dict[str, dict[str, float]]]],
             row["unmeasured"] = True
             row["retained"] = True
             row["note"] = RETAINED[name]
-        elif samples:
-            row["value"] = _round(max(samples.values()))
-        else:
+        elif not samples:
+            # No leg measured the row this sweep. Carry the committed value
+            # forward; when the prior had measured it, keep its samples too and
+            # mark the row retained (an unmeasured row WITH samples is a carried
+            # forward row, not a stale marker).
             row["value"] = _unmeasured_value(name, prior_rows)
             row["unmeasured"] = True
+            if row["samples"]:
+                row["retained"] = True
             note = prior_rows.get(name, {}).get("note")
             if note is None:
                 note = ("no source leg measured it — carried forward, "
                         "refresh from the next sweep")
             row["note"] = note
+        elif missing and isinstance(prior_value, (int, float)) and \
+                _round(max(samples.values())) < float(prior_value):
+            # The partial reading is BELOW the committed value, so it may not
+            # move the weight down: retain the committed value and mark it. A
+            # sweep may lower a value only when its sample set is at least as
+            # complete as the prior's.
+            row["value"] = float(prior_value)
+            row["unmeasured"] = True
+            row["retained"] = True
+            row["note"] = (
+                f"partial artifact set — measured by {len(samples)} of "
+                f"{len(prior_samples)} prior source runs; committed value "
+                f"{float(prior_value):g} retained")
+        else:
+            # A complete (or raising) reading: the value is the max over the
+            # row's whole sample universe, which after the merge above includes
+            # the runs a partial sweep could not re-measure.
+            row["value"] = _round(max(row["samples"].values()))
         rows[name] = row
 
     # Pinned equality: the sweep must not break the test-enforced pair.
@@ -251,6 +312,8 @@ def sweep(sources: list[tuple[str, dict[str, dict[str, float]]]],
         if target in rows and source in rows:
             rows[target]["value"] = rows[source]["value"]
             rows[target]["pinned_to"] = source
+            if target in PIN_NOTES:
+                rows[target]["note"] = PIN_NOTES[target]
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -304,10 +367,18 @@ def render_rows(record: dict) -> str:
     ordered = sorted(rows.items(), key=lambda kv: (-float(kv[1]["value"]), kv[0]))
     lines = []
     for name, row in ordered:
-        line = f"  {name}: {float(row['value']):g}"
         if row.get("pinned_to"):
-            line += f"  # pinned equal to {row['pinned_to']} (test-enforced)"
-        elif row.get("unmeasured"):
+            # A pin's explanation goes ABOVE the row (a reader must see why the
+            # value is borrowed before reading it); `test_mcp_rename_table.py`
+            # asserts this block exists and states its condition.
+            note = row.get("note") or (
+                f"pinned equal to {row['pinned_to']} (test-enforced)")
+            for chunk in textwrap.wrap(note, 78) or [note]:
+                lines.append(f"  # {chunk}")
+            lines.append(f"  {name}: {float(row['value']):g}")
+            continue
+        line = f"  {name}: {float(row['value']):g}"
+        if row.get("unmeasured"):
             line += f"  # unmeasured — {row.get('note', 'carried forward')}"
         lines.append(line)
     return "\n".join(lines) + "\n"
@@ -320,6 +391,12 @@ def split_durations_block(text: str) -> tuple[str, str, str]:
     documents the map — the generator does NOT own that prose (the decisions it
     records cannot be re-derived) and preserves it byte-for-byte. ``after`` is
     any top-level key that follows ``durations`` (today: none).
+
+    The header ends at the first row-shaped line, and an INDENTED comment
+    (`  # …`, which ``render_rows`` emits above a pinned row) is row content,
+    not header: `lstrip()` here would absorb a rendered pin comment into
+    ``before_rows`` and then re-render it, duplicating the block on every
+    `--write` and breaking idempotency.
     """
     lines = text.splitlines(keepends=True)
     start = None
@@ -329,9 +406,9 @@ def split_durations_block(text: str) -> tuple[str, str, str]:
             break
     if start is None:
         raise ValueError("manifest has no top-level `durations:` block")
-    # consume the comment/blank header immediately after `durations:`
+    # consume the unindented comment/blank header immediately after `durations:`
     j = start + 1
-    while j < len(lines) and (lines[j].strip() == "" or lines[j].lstrip().startswith("#")):
+    while j < len(lines) and (lines[j].strip() == "" or lines[j].startswith("#")):
         j += 1
     before_rows = "".join(lines[:j])
     # rows run until the next top-level key
@@ -379,12 +456,18 @@ def _differs(got, want) -> bool:
 
     An int beyond float range raises ``OverflowError`` on conversion, which a
     naive ``abs(float(got) - want)`` turns into a traceback inside the gate
-    that exists to NAME the bad row. Any non-comparable pair is a difference.
+    that exists to NAME the bad row. A non-finite value (``NaN``/``inf``) is a
+    difference too: ``abs(nan - 1) > 1e-9`` is False, so an unguarded compare
+    would read NaN as EQUAL and let a corrupted row silently back its value.
+    Any non-comparable pair is a difference.
     """
     try:
-        return abs(float(got) - float(want)) > 1e-9
+        lhs, rhs = float(got), float(want)
     except (OverflowError, ValueError, TypeError):
         return True
+    if not (math.isfinite(lhs) and math.isfinite(rhs)):
+        return True
+    return abs(lhs - rhs) > 1e-9
 
 
 def value_issues(manifest: dict, record: dict | None = None) -> list[str]:
@@ -401,13 +484,22 @@ def value_issues(manifest: dict, record: dict | None = None) -> list[str]:
             "absent — a map with no measurement record cannot be value-checked "
             "(#4783). Run `tools/ci_manifest.py sweep --junit-dir … --write`"
         ]
+    if not isinstance(record, dict):
+        return [f"the measurement record is {type(record).__name__}, not an "
+                f"object — the map cannot be value-checked (#4783)"]
     cs = _ci_selection()
     fast = set(cs.fast_pool(manifest))
     slow = set(manifest.get("slow_files", []))
     carve = cs.carve_out_files(manifest)
     allowed = fast | slow
-    rows = record.get("rows", {})
+    rows = record.get("rows")
+    rows = rows if isinstance(rows, dict) else {}
     issues: list[str] = []
+    if "rows" in record and not isinstance(record["rows"], dict):
+        issues.append(
+            f"the measurement record's `rows` is "
+            f"{type(record['rows']).__name__}, not a mapping — the record "
+            f"cannot back the map (#4783)")
 
     # 1. dead keys: a key that is neither packed nor a declared lane row.
     for name in sorted(durations):
@@ -432,12 +524,17 @@ def value_issues(manifest: dict, record: dict | None = None) -> list[str]:
     # 3. value check: the map is a strict projection of the record.
     for name in sorted(durations):
         row = rows.get(name)
-        if row is None:
+        if not isinstance(row, dict):
             issues.append(
                 f"durations key {name} has no row in the measurement record — "
                 f"the record is the only author of a weight (#4766)")
             continue
-        want = row["value"]
+        want = row.get("value")
+        if want is None:
+            issues.append(
+                f"measurement record row {name} has no `value` — a row "
+                f"without a value cannot back a weight (#4766)")
+            continue
         got = durations[name]
         if not isinstance(got, (int, float)) or isinstance(got, bool):
             issues.append(f"durations value for {name} is not numeric: {got!r}")
@@ -446,15 +543,37 @@ def value_issues(manifest: dict, record: dict | None = None) -> list[str]:
                 f"durations value for {name} is {got} but the measurement "
                 f"record says {want} — a hand-edited value is not a "
                 f"measurement (#4783)")
-    # 4. the record itself may not carry dead keys.
+    # 4. the record itself may not carry dead keys, and its `leg` must be the
+    #    leg the current manifest derives — a mis-registered row otherwise
+    #    lies about which leg carried the file until the next sweep.
     for name in sorted(rows):
         if name not in allowed:
             issues.append(
                 f"measurement record row {name} is not a fast-pool or slow "
                 f"file — the record must describe the packed universe")
+            continue
+        row = rows.get(name)
+        if isinstance(row, dict):
+            want_leg = carrying_leg(name, fast, slow, carve)
+            if row.get("leg") != want_leg:
+                issues.append(
+                    f"measurement record row {name} says leg "
+                    f"{row.get('leg')!r} but the manifest derives "
+                    f"{want_leg!r} — the record must describe the packed "
+                    f"universe")
     # 5. row self-consistency.
     for name, row in sorted(rows.items()):
-        samples = row.get("samples", {})
+        if not isinstance(row, dict):
+            issues.append(
+                f"measurement record row {name} is "
+                f"{type(row).__name__}, not an object")
+            continue
+        samples = row.get("samples") or {}
+        if not isinstance(samples, dict):
+            issues.append(
+                f"measurement record row {name} `samples` is "
+                f"{type(samples).__name__}, not a mapping")
+            continue
         if row.get("pinned_to"):
             # A pinned row's value is defined by its sibling, not its samples
             # (the equality is test-enforced).
@@ -478,12 +597,20 @@ def value_issues(manifest: dict, record: dict | None = None) -> list[str]:
                 f"record row {name} carries a non-numeric sample — the record "
                 f"must hold measurements only")
             continue
-        if _differs(row["value"], want):
+        if _differs(row.get("value"), want):
             issues.append(
-                f"record row {name} value {row['value']} != max(samples) "
+                f"record row {name} value {row.get('value')} != max(samples) "
                 f"{want}")
     # 6. pinned equality.
-    for target, source in (record.get("pins") or PINS).items():
+    pins = record.get("pins")
+    if pins is None:
+        pins = PINS
+    if not isinstance(pins, dict):
+        issues.append(
+            f"measurement record `pins` is {type(pins).__name__}, not a "
+            f"mapping")
+        pins = {}
+    for target, source in pins.items():
         if target in durations and source in durations and \
                 _differs(durations[target], durations[source]):
             issues.append(
@@ -530,11 +657,49 @@ def partition_issues(manifest: dict) -> list[str]:
             issues.append(
                 f"classified file {name} is in more than one leg "
                 f"{owners} — a leg partition must be total and disjoint")
-    # A leg may not carry a file the manifest does not classify.
-    for name in sorted(set().union(*bare.values())):
+    # A leg may not carry a file the manifest does not classify. `push_extra`
+    # is the documented exception: `push_legs()` appends those entries to the
+    # halves BY DESIGN and `leg_coverage_issues()` requires them to stay
+    # unclassified, so flagging them here would red `--integrity` on the shape
+    # the repo's own guard tells you to create (#4615).
+    extra = {f if f.endswith(".py") else f + ".py"
+             for f in (manifest.get("push_extra") or [])}
+    for name in sorted(set().union(*bare.values()) - extra):
         if name not in classified and name not in env_broken:
             issues.append(f"leg entry {name} is not classified in the manifest")
     return issues
+
+
+def _tracked_files(repo: Path) -> set[str]:
+    """The repo's tracked path set (``git ls-files``).
+
+    Liveness must be decided against what CI checks out, not against whatever
+    sits on a developer's disk: an untracked file satisfies ``Path.exists()``
+    while failing in CI — the exact false-negative the existence check exists to
+    avoid (#4171). Mirrors ``tests/test_ci_selection.py``'s
+    ``test_source_patterns_all_name_something_real`` tracked-set semantics.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "ls-files"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            f"could not list tracked files in {repo} — the guard-reachability "
+            f"existence checks cannot be attested: {exc}") from exc
+    return {line for line in out.splitlines() if line}
+
+
+def _names_something_real(pattern: str, tracked: set[str]) -> bool:
+    """A SOURCE_PATTERNS entry names a tracked path or a tracked subtree.
+
+    ``select()`` matches with ``startswith``, so a directory entry is live with
+    or without its trailing slash. No glob branch: ``select()`` has no glob
+    support, so a glob-shaped entry satisfied here would still select nothing.
+    """
+    return pattern in tracked or any(
+        f.startswith(pattern.rstrip("/") + "/") for f in tracked)
 
 
 def guard_reachability_issues(manifest: dict, repo: Path | None = None) -> list[str]:
@@ -555,54 +720,47 @@ def guard_reachability_issues(manifest: dict, repo: Path | None = None) -> list[
     """
     cs = _ci_selection()
     repo = repo or REPO
+    tracked = _tracked_files(repo)
     issues: list[str] = []
 
     def selectable(path: str) -> bool:
         result = cs.select([path], "pull_request", manifest)
         return bool(result["full"] or result["surfaces"])
 
-    # (a) SOURCE_PATTERNS reality check.
+    # (a) SOURCE_PATTERNS reality check — against the TRACKED set, never the
+    # working tree (an untracked file would green a dead entry locally).
     for surface, patterns in cs.SOURCE_PATTERNS.items():
         for pattern in patterns:
-            if (repo / pattern).exists():
-                continue
-            if pattern.endswith("/"):
-                if not any((repo / pattern).rglob("*")):
-                    issues.append(
-                        f"SOURCE_PATTERNS['{surface}'] entry {pattern} matches "
-                        f"no file (dead prefix, #4165)")
-            elif not any(repo.glob(pattern + "*")):
+            if not _names_something_real(pattern, tracked):
                 issues.append(
-                    f"SOURCE_PATTERNS['{surface}'] entry {pattern} does not "
-                    f"exist (dead entry, #4165)")
+                    f"SOURCE_PATTERNS['{surface}'] entry {pattern} names no "
+                    f"tracked file or subtree — a dead entry is still matched "
+                    f"by `startswith`, so it silently shrinks coverage (#4165)")
 
     # (b) derived tool -> registered guard reachability.
     classified_tests: set[str] = set()
     for files in manifest.get("surfaces", {}).values():
         classified_tests.update(files or ())
     classified_tests.update(manifest.get("tier1", []) or [])
-    tools_dir = repo / "tools"
     for name in sorted(classified_tests):
         stem = Path(name).stem
         if not stem.startswith("test_"):
             continue
         guard_stem = stem[len("test_"):]
-        for candidate in (tools_dir / f"{guard_stem}.py",
-                          tools_dir / f"{guard_stem}.sh"):
-            if candidate.exists() and not selectable(
-                    str(candidate.relative_to(repo))):
+        for rel in (f"tools/{guard_stem}.py", f"tools/{guard_stem}.sh"):
+            if rel in tracked and not selectable(rel):
                 issues.append(
-                    f"{candidate.relative_to(repo)} owns the registered guard "
-                    f"{name} but selects NO CI surface — the guard never runs "
-                    f"on the PR that edits it (#3362/#4115)")
+                    f"{rel} owns the registered guard {name} but selects NO "
+                    f"CI surface — the guard never runs on the PR that edits "
+                    f"it (#3362/#4115)")
 
     # (c) declared guard inputs.
     for surface, paths in (manifest.get("guard_inputs") or {}).items():
         for path in paths or ():
-            if not (repo / path).exists() and not any(repo.glob(path + "*")):
+            if not _names_something_real(path, tracked):
                 issues.append(
-                    f"guard_inputs['{surface}'] entry {path} does not exist "
-                    f"(dead declaration, #4186)")
+                    f"guard_inputs['{surface}'] entry {path} names no tracked "
+                    f"file (dead declaration, #4186)")
                 continue
             result = cs.select([path], "pull_request", manifest)
             if result["full"]:
@@ -643,7 +801,10 @@ def register_provisional(names: list[str], manifest_path: Path | None = None,
     cs = _ci_selection()
     manifest = cs._normalize_surfaces(
         __import__("yaml").safe_load(manifest_path.read_text()))
-    allowed = set(cs.fast_pool(manifest)) | set(manifest.get("slow_files", []))
+    fast = set(cs.fast_pool(manifest))
+    slow = set(manifest.get("slow_files", []))
+    carve = cs.carve_out_files(manifest)
+    allowed = fast | slow
     added = []
     for name in names:
         if name not in allowed:
@@ -651,7 +812,8 @@ def register_provisional(names: list[str], manifest_path: Path | None = None,
         row = record.setdefault("rows", {}).get(name)
         if row is None:
             record["rows"][name] = {
-                "leg": "fast", "samples": {}, "value": PROVISIONAL_WEIGHT,
+                "leg": carrying_leg(name, fast, slow, carve),
+                "samples": {}, "value": PROVISIONAL_WEIGHT,
                 "unmeasured": True,
                 "note": "provisional — registered before CI could measure it "
                         "(#4348/#4364); the next sweep replaces this value",

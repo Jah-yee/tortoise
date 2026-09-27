@@ -15,6 +15,7 @@ implementation detail:
 """
 from __future__ import annotations
 
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -148,6 +149,72 @@ def test_sweep_retains_a_declared_row_even_when_measured(monkeypatch):
     assert row["unmeasured"] is True
 
 
+def test_partial_artifact_set_retains_rather_than_drops():
+    # #5050 Task 2: a source run that measured a row before is now absent (a
+    # leg was cut), so the reading is incomplete and must NOT move the weight
+    # down — the committed value is retained and the row marked.
+    m = _manifest()
+    m["durations"] = {"test_a.py": 30.0}
+    prior = cm.sweep(
+        [("r1", _source(a=[("tests/test_a.py", 30.0)])),
+         ("r2", _source(a=[("tests/test_a.py", 28.0)]))],
+        m, cm.seed_from_manifest(m))
+    assert prior["rows"]["test_a.py"]["samples"] == {"r1": 30.0, "r2": 28.0}
+    # r2's artifact is gone; only r1 reports, and it reports a much lower value.
+    record = cm.sweep([("r1", _source(a=[("tests/test_a.py", 5.0)]))],
+                      m, prior)
+    row = record["rows"]["test_a.py"]
+    assert row["value"] == 30.0, row
+    assert row["unmeasured"] is True and row["retained"] is True, row
+    # ... and the retained row is not mistaken for a stale marker.
+    m["durations"]["test_a.py"] = 30.0
+    issues = cm.value_issues(m, record)
+    assert not any("test_a.py" in i and "stale marker" in i for i in issues), issues
+
+
+def test_partial_sample_universe_is_a_fixed_point():
+    # The guarantee must be a fixed point, not a one-shot: if a partial sweep
+    # replaced the sample set with the partial one (or dropped it entirely),
+    # the next sweep would find no missing run and silently drop the value.
+    # The absent run's sample must be carried forward on EVERY partial reading —
+    # lowering, equal, raising, and zero-sample.
+    for first_partial in (5.0, 30.0, 35.0, None):
+        m = _manifest()
+        m["durations"] = {"test_a.py": 30.0}
+        prior = cm.sweep(
+            [("r1", _source(a=[("tests/test_a.py", 30.0)])),
+             ("r2", _source(a=[("tests/test_a.py", 28.0)]))],
+            m, cm.seed_from_manifest(m))
+        if first_partial is None:
+            src = _source()
+        else:
+            src = _source(a=[("tests/test_a.py", first_partial)])
+        once = cm.sweep([("r1", src)], m, prior)
+        assert {"r1", "r2"} <= set(once["rows"]["test_a.py"]["samples"]), \
+            (first_partial, once["rows"]["test_a.py"])
+        # A later, much lower partial reading must not fall below the floor the
+        # retained reading established.
+        twice = cm.sweep([("r1", _source(a=[("tests/test_a.py", 5.0)]))],
+                         m, once)
+        row = twice["rows"]["test_a.py"]
+        assert row["value"] == once["rows"]["test_a.py"]["value"], \
+            (first_partial, once["rows"]["test_a.py"], row)
+        assert row["value"] >= 30.0, (first_partial, row)
+
+
+def test_a_complete_sample_set_may_lower_a_value():
+    # The complement: when the sample set is at least as complete as the
+    # prior's, the max is a genuine reading and may legitimately move down.
+    m = _manifest()
+    m["durations"] = {"test_a.py": 30.0}
+    prior = cm.sweep(
+        [("r1", _source(a=[("tests/test_a.py", 30.0)]))],
+        m, cm.seed_from_manifest(m))
+    record = cm.sweep([("r1", _source(a=[("tests/test_a.py", 5.0)]))],
+                      m, prior)
+    assert record["rows"]["test_a.py"]["value"] == 5.0
+
+
 def test_sweep_honours_the_pinned_equality(monkeypatch):
     monkeypatch.setitem(cm.PINS, "test_b.py", "test_a.py")
     m = _manifest()
@@ -170,6 +237,29 @@ def test_sweep_drops_a_dead_carve_only_row():
 
 
 # ── rendering / rewriting the manifest in place ───────────────────────────
+
+
+def test_rewrite_is_idempotent_when_the_pinned_row_sorts_first(tmp_path):
+    # The pinned row's explanation is rendered as INDENTED comments above the
+    # row. If the header scan absorbed them (it treated `  #` as header), each
+    # rewrite would append another copy — `render_rows` is not idempotent and
+    # the "regenerable" property fails.
+    path = tmp_path / "ci-surfaces.yml"
+    path.write_text("surfaces:\n  core:\n    - test_a.py\n"
+                    "durations:\n# prose header\n")
+    record = {"rows": {
+        "test_a.py": {"leg": "fast", "samples": {"r": 1.0}, "value": 1.0,
+                      "pinned_to": "test_b.py",
+                      "note": "pinned equal to test_b.py (test-enforced)"},
+        "test_b.py": {"leg": "fast", "samples": {}, "value": 0.5,
+                      "unmeasured": True, "note": "carried forward"},
+    }}
+    cm.rewrite_manifest(path, record)
+    once = path.read_text()
+    assert re.search(r"(  # .*\n)+  test_a\.py:", once), once
+    assert once.count("pinned equal to test_b.py") == 1
+    cm.rewrite_manifest(path, record)
+    assert path.read_text() == once, "rewrite is not idempotent"
 
 
 def test_rewrite_preserves_the_prose_header_and_trailing_keys(tmp_path):
@@ -204,6 +294,43 @@ def test_consistent_manifest_and_record_are_clean():
     m, record = _record_and_manifest()
     assert cm.value_issues(m, record) == []
     assert cm.value_issues(m, record) == []  # deterministic
+
+
+def test_generic_dead_durations_key_fails():
+    # A stale/renamed file left in `durations` by a hand-edit is the more
+    # general form of the carve-out case (#4783): the packer drops it silently.
+    m, record = _record_and_manifest()
+    m["durations"]["test_ghost_5050.py"] = 1.0
+    issues = cm.value_issues(m, record)
+    assert any("test_ghost_5050.py" in i and "not a fast-pool or slow file" in i
+               for i in issues), issues
+
+
+def test_malformed_record_is_named_not_raised():
+    # #3407 totality: a half-written/hand-corrupted record must be NAMED by
+    # the gate, not raise inside it (which would also suppress every other
+    # problem the check chain would have reported).
+    m, _ = _record_and_manifest()
+    bad_records = [
+        [],                                                   # a list, not an object
+        {"rows": []},                                         # rows not a mapping
+        {"rows": {"test_a.py": "nope"}},                    # a row, not an object
+        {"rows": {"test_a.py": {"leg": "fast", "samples": {}}}},  # no value
+    ]
+    for bad in bad_records:
+        issues = cm.value_issues(m, bad)
+        assert issues, bad
+
+
+def test_nan_value_is_a_difference():
+    # `abs(nan - 1) > 1e-9` is False, so an unguarded compare reads NaN as
+    # EQUAL and a corrupted row silently backs its manifest value.
+    m, record = _record_and_manifest()
+    m["durations"]["test_a.py"] = float("nan")
+    assert any("test_a.py" in i for i in cm.value_issues(m, record))
+    m2, record2 = _record_and_manifest()
+    record2["rows"]["test_a.py"]["value"] = float("nan")
+    assert any("test_a.py" in i for i in cm.value_issues(m2, record2))
 
 
 @pytest.mark.parametrize("bad", [0.1, 1880.0])
@@ -285,6 +412,19 @@ def test_partition_flags_a_file_in_two_legs(monkeypatch):
     monkeypatch.setattr(cs, "push_legs", lambda manifest: broken)
     issues = cm.partition_issues(m)
     assert any("more than one leg" in i for i in issues), issues
+
+
+def test_partition_allows_an_unclassified_push_extra(monkeypatch):
+    # `push_legs()` appends `push_extra` to the halves BY DESIGN and
+    # `leg_coverage_issues()` requires those files to stay unclassified, so the
+    # reverse check must not red the shape the repo's own guard mandates.
+    m = cs.load_manifest()
+    real = cs.push_legs(m)
+    broken = dict(real)
+    broken["half_a"] = list(real["half_a"]) + ["bench/test_extra_5050"]
+    m["push_extra"] = ["bench/test_extra_5050"]
+    monkeypatch.setattr(cs, "push_legs", lambda manifest: broken)
+    assert cm.partition_issues(m) == []
 
 
 def test_env_broken_file_is_not_reported_as_a_coverage_hole():
@@ -379,6 +519,16 @@ def test_register_provisional_keeps_the_contract_green(tmp_path):
     # the bootstrap trap is closed: a brand-new file with no measurement no
     # longer reds the strict presence check.
     assert cm.value_issues(loaded_m, loaded_record) == []
+
+
+def test_register_provisional_uses_the_derived_leg(tmp_path):
+    # A file registered into the slow pool must not get a hardcoded `fast` leg.
+    m = _manifest()
+    m["slow_files"].append("test_slownew.py")
+    m["surfaces"]["core"].append("test_slownew.py")
+    mpath, rpath = _write_scratch(tmp_path, m, {"rows": {}})
+    cm.register_provisional(["test_slownew.py"], mpath, rpath)
+    assert cm.load_record(rpath)["rows"]["test_slownew.py"]["leg"] == "slow"
 
 
 def test_register_provisional_is_idempotent(tmp_path):
