@@ -469,7 +469,10 @@ def _supersession_fold_order(proj, records):
 #: It bounds the EMISSION, never the writes: every record is still attempted,
 #: and the withheld count is reported in ONE summary warn. 20 keeps every
 #: realistic batch (a handful of records) fully verbose while capping a
-#: pathological one.
+#: pathological one — and it is well above the warning count any
+#: non-malfunctioning call produces, so the recorded per-record guarantees
+#: (#2242's concurrency-loss warn, #2164's unresolved-ref warn) are untouched
+#: in practice.
 _MAX_SUPERSESSION_WARNS = 20
 
 
@@ -511,10 +514,24 @@ def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
     full provenance) + _fold_object_superseded (count-verified).
     #2164/#2193: shared by capture (_extract_session_v2), eval ingest_v2,
     and the hosted commit endpoint (_execute_commit_writes §6b). warn()
-    receives every skip/failure —
-    never a silent drop of the first ``_MAX_SUPERSESSION_WARNS`` per call;
-    beyond that the per-record emission is counted and reported in ONE
-    summary warn (#5654) — with ONE explicit asymmetry (final-review
+    receives the skip/failure of every record UP TO
+    ``_MAX_SUPERSESSION_WARNS`` per call; the per-record messages beyond that
+    budget are COUNTED, not emitted, and the call then closes with ONE
+    summary warn carrying the batch size, the true warning total and the
+    withheld count (#5654). An over-cap batch therefore stays observable as
+    malformed and sized, but its records past the budget are not named
+    individually. The bound is on the EMISSION only — every record is still
+    attempted by the same gates below. It contradicts no earlier warn
+    guarantee: #2242's "exactly one warn" on a lost concurrent fold and
+    #2164's "unresolved refs warn loudly" hold verbatim for every call with
+    at most ``_MAX_SUPERSESSION_WARNS`` warnings — i.e. every
+    non-malfunctioning call; a call that reaches the budget is ALREADY
+    signalling a malfunction, and the summary says so. Caller-side
+    comments that still promise a per-record "never a silent drop"
+    (``sdk._extract_session_v2``'s docstring + call site, ``hosted_api``
+    §6b, ``tools/longmem_eval/ingest_v2``) describe the pre-#5654
+    contract; THIS docstring is the authoritative one. With ONE explicit
+    asymmetry (final-review
     P3): terminal pt_ olds are treated as idempotent re-ingests and
     skipped SILENTLY regardless of the claimed successor (no
     divergence probe — supersede_point would raise on a terminal old);
@@ -564,8 +581,13 @@ def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
     # Write semantics are untouched — every record is still attempted by the
     # same fail-open gates — this only stops a malformed batch from producing
     # one WARN line per record. `warn` is caller-supplied (capture passes
-    # ``warnings.append``, hosted passes a counting logger delegate), so the
-    # bound applies at this one seam shared by every path.
+    # ``warnings.append``, hosted passes a counting logger delegate, eval
+    # passes ``logger.warning``), so the bound applies at this one seam shared
+    # by every path. Deliberately a BLANKET bound, not a per-class exemption:
+    # exempting the actionable classes would let a broken graph (every fold
+    # failing) storm again. The cost is that a warning past the budget is not
+    # emitted individually — the summary below reports the withheld count so
+    # the malfunction stays visible.
     _raw_warn = warn
     warn = _PerRecordWarnBudget(warn, _MAX_SUPERSESSION_WARNS)
     for i in fold_order:
@@ -933,7 +955,8 @@ def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
             f"supersession batch of {len(records)} record(s): "
             f"{warn.total} per-record warning(s) raised — the first "
             f"{_MAX_SUPERSESSION_WARNS} were reported individually, "
-            f"{warn.suppressed} suppressed. Every record was still applied "
-            f"or skipped by the same fail-open gates."
+            f"{warn.suppressed} withheld (not individually logged). "
+            f"Every record was still applied or skipped by the same "
+            f"fail-open gates."
         )
     return applied
