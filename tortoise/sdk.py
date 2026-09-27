@@ -518,7 +518,13 @@ def _session_llm_transcript(conversation: list[dict]) -> tuple[str, int]:
             speaker = "Speaker"
         raw = turn.get("content")
         content = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
-        body = " ".join(content[:_CAPTURE_TURN_CAP].split())
+        # #4897: the extraction input gets the SAME marked window the node
+        # stores. The clip is normally a no-op (callers pass an already
+        # windowed conversation); if a raw conversation reaches this function
+        # it is marked rather than silently cut, so the LLM never sees a
+        # phrase with no home in a stored turn (#721, and the marker itself
+        # then IS in the stored turn).
+        body = " ".join(_clip_capture_turn_content(content).split())
         sents = [s.group(0).strip() for s in _SENT.finditer(body)]
         sents = [s for s in sents if len(s) >= 3]
         capped = sents[:MAX_EXTRACTIONS_PER_TURN]
@@ -537,29 +543,105 @@ def _normalize_turn_role(raw) -> str:
     return "unknown" if raw is None else str(raw)
 
 
-#: The stored-window cap (#1532 D1). Named once because three consumers now
+#: The stored-window cap (#1532 D1). Named once because four consumers now
 #: depend on the SAME number: the stored turn text, the session Source
-#: transcript (_session_llm_transcript flattens the same window), and the
-#: #4911 scrubber's per-turn bound — a divergence between them would either
-#: scan text that is never persisted or persist text that was never scanned.
+#: transcript (_session_llm_transcript flattens the same window), the
+#: #4911 scrubber's per-turn bound, and the Pi client's ``TURN_MAX_CHARS`` —
+#: a TypeScript literal that CANNOT import this module (it is shipped
+#: standalone) and is therefore pinned to this constant by
+#: ``tests/test_pi_capture_hooks.py`` so a divergence reds a test instead of
+#: storing a different window per lane. A divergence between any of them would
+#: either scan text that is never persisted or persist text that was never
+#: scanned.
 _CAPTURE_TURN_CAP = 5000
+
+#: Sentinel prefix of the truncation marker appended when a turn is clipped at
+#: the stored-window cap (#4897). A READER of a stored turn detects a cut by
+#: this prefix, and the marker also carries the turn's TRUE length, so a
+#: consumer can tell "the user said this much" from "we cut it here". This is
+#: the Python half of a two-language contract; the identical literal lives in
+#: ``tortoise/pi-hooks/tortoise-capture.ts`` (``TRUNCATION_SENTINEL``) and the
+#: two are pinned together by ``tests/test_pi_capture_hooks.py``.
+#:
+#: ⛔ WHY THE MARKER IS IN THE TEXT, NOT A NODE PROPERTY. Both shapes are
+#: available (the #4897 issue offers ``truncated: true`` + ``full_length: n``
+#: OR an appended marker), and the text marker is chosen for two reasons:
+#: (1) FIDELITY — a node property is invisible to the extraction input
+#: (`_session_llm_transcript`), so the LLM would still receive a silently-cut
+#: sentence; the marker reaches the store AND the model, which is what keeps
+#: the stored-source parity invariant (#721) true rather than merely intact;
+#: (2) MACHINERY — a property must be threaded through the turn write Cypher,
+#: the read whitelist, `get_session_detail` and the client confirmation, each a
+#: fresh drift surface, whereas the marker rides the ``content`` property that
+#: already round-trips. The true length is therefore carried in the text only.
+_CAPTURE_TRUNCATION_SENTINEL = "…[truncated:"
+
+
+def _capture_truncation_marker(total: int) -> str:
+    """The marker appended INSIDE the window when a turn is cut (#4897).
+
+    ``total`` is the ORIGINAL character count (before the cut) — the fact the
+    cut itself destroys — so a reader can always tell how much conversation
+    the stored turn no longer holds. The marker's length is a function of
+    ``total`` ALONE, which is what lets :func:`_clip_capture_turn_content`
+    reserve exactly its width without iterating to a fixpoint.
+    """
+    return f" {_CAPTURE_TRUNCATION_SENTINEL} original length {total} chars]"
+
+
+def _clip_capture_turn_content(
+    content: str, cap: int = _CAPTURE_TURN_CAP) -> str:
+    """``content`` unchanged when it fits ``cap``; otherwise cut AND marked.
+
+    This is the ONE place a capture turn is shortened (#4897). Every writer of
+    stored turn text routes through it, so no cut is silent: the result is
+    always ``<= cap`` characters and, whenever the input was longer, ends with
+    :func:`_capture_truncation_marker` carrying the true original length.
+
+    ⛔ STABLE UNDER RE-APPLICATION — the whole point. The server re-applies the
+    cap to the stored body (``_capture_turn_texts``), and the Pi client has
+    already capped before it POSTs; a marker appended AFTER a full-width cut
+    would be destroyed by that second application. The marker is instead
+    reserved INSIDE the cap — ``keep = cap - len(marker)`` — so the result is
+    exactly ``cap`` characters, ``result[:cap] == result``, and every
+    re-application is a true no-op. A clipped turn therefore reaches storage
+    with its marker intact no matter how many times the window is applied.
+
+    Only an ACTUAL cut marks: a turn exactly at ``cap`` is complete and is
+    returned verbatim, so the marker means "there is more", never "we reached
+    the boundary".
+    """
+    if len(content) <= cap:
+        return content
+    marker = _capture_truncation_marker(len(content))
+    keep = cap - len(marker)
+    if keep < 0:
+        # ``cap`` too small to carry the full marker (never the production
+        # 5000). Fall back to the bare sentinel so the cut stays VISIBLE
+        # instead of reverting to a silent ``content[:cap]``.
+        marker = _CAPTURE_TRUNCATION_SENTINEL
+        keep = max(cap - len(marker), 0)
+    return (content[:keep] + marker)[:cap]
 
 
 def _capture_turn_window(
     conversation: list[dict], cap: int = _CAPTURE_TURN_CAP) -> list[dict]:
-    """Truncate each turn's content to the stored-window cap (#1532 D1).
+    """Clip each turn's content to the stored-window cap, MARKED (#1532 D1).
 
     Returns a NEW list; the windowed conversation feeds BOTH the turn-store
     loop and the extraction call so the LLM never sees a phrase with no home
     in any stored turn (stored-source parity, #721). Content coercion matches
     the store loop: None -> '', truthy non-strings -> str() (isinstance-first,
-    #721). Idempotent when the caller already truncated."""
+    #721). Idempotent when the caller already truncated — and since #4897 a
+    clip leaves a marker inside the cap, so a re-applied window preserves the
+    marker rather than letting it fall off the end.
+    """
     out: list[dict] = []
     for turn in conversation:
         t = dict(turn)
         raw = t.get("content")
         content = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
-        t["content"] = content[:cap]
+        t["content"] = _clip_capture_turn_content(content, cap)
         out.append(t)
     return out
 
@@ -622,7 +704,9 @@ def _redact_turn_contents(
         content = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
         cut = False
         if cap is not None and len(content) > cap:
-            content = content[:cap]
+            # #4897: clip WITH the marker — a capped scan that returned a
+            # silently-shortened string is the same defect one layer down.
+            content = _clip_capture_turn_content(content, cap)
             cut = True
         if not content:
             out.append(turn)
@@ -694,7 +778,9 @@ def _capture_turn_texts_with_redactions(
     same spans) the ``:Source`` sink and the extractor do.
 
     The scrubber runs on the FULL content of each turn in the list it is given,
-    and the ``[:5000]`` cut is applied to the RESULT. That order matters for a
+    and the ``_clip_capture_turn_content`` guard is applied to the RESULT (a
+    no-op on the already-windowed turn, and a MARKED cut if a raw turn ever
+    reaches here — #4897). That order matters for a
     credential that straddles the cut, but it ONLY helps when the caller hands
     over the uncapped window: both write lanes pre-cap with
     ``_capture_turn_window``, so on those paths the cut has already happened and
@@ -722,7 +808,11 @@ def _capture_turn_texts_with_redactions(
         role = _normalize_turn_role(turn.get("role"))
         raw = turn.get("content")
         content = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
-        texts.append(f"[{role}] {content[:_CAPTURE_TURN_CAP]}")
+        # #4897: the re-application of the window goes through the SAME clip
+        # the window itself uses, so it cannot cut a marker off (the clip
+        # reserves the marker inside the cap, making this a true no-op on an
+        # already-windowed turn) and cannot silently cut an un-windowed one.
+        texts.append(f"[{role}] {_clip_capture_turn_content(content)}")
     return texts, counts
 
 
@@ -735,8 +825,10 @@ def _capture_turn_texts(windowed: list[dict]) -> list[str]:
     shared with the read path, the cap is write-side), so a dense (vector) hit
     can never resolve to a turn whose stored content differs from what was
     encoded. Coercion is the loop's own (isinstance-first: None -> "", truthy
-    non-strings -> ``str()``, #721); the ``[:5000]`` is the idempotent
-    re-application of ``_capture_turn_window``'s cap (#1532 D1).
+    non-strings -> ``str()``, #721); the ``_clip_capture_turn_content`` call
+    is the idempotent re-application of ``_capture_turn_window``'s cap (#1532
+    D1) — since #4897 it also marks any cut it has to make, and reserves the
+    marker inside the cap so a re-application cannot remove it.
 
     #4911: THIS is where a stored turn's credentials are scrubbed — one place,
     applied by every writer of every lane, because this function IS the stored
