@@ -3823,8 +3823,12 @@ async def get_current_org(request: Request) -> dict:
                 # #5331: per-org byte allowance first, pricing tier second;
                 # absent (both None) = NOT ENFORCED (the node cap stays the
                 # enforced one). t.max_storage_bytes is a Cypher property read
-                # — null on every existing Team node, so this is inert until an
-                # operator sets a per-org allowance; no migration required.
+                # — null on every existing Team node, and setting it requires no
+                # migration. NOTE however that setting it (here or in
+                # pricing.json) is NOT sufficient on its own: no production
+                # caller supplies ``storage_reading`` yet, so the fail-closed
+                # guard would 500 every points-gated write until the graph byte
+                # meter is wired into the gate (#5331, verified 2026-09-26).
                 "max_storage_bytes": (int(msb) if msb is not None
                                       else lim.get("max_storage_bytes")),
                 "max_api_keys": int(mak) if mak is not None else lim["max_api_keys"],

@@ -75,8 +75,18 @@ def tier_limits(tier: str) -> dict:
         # "count storage in MB/GB, not nodes". OPTIONAL, and deliberately NOT
         # in _REQUIRED_LIMIT_KEYS: an absent key (or an explicit null) means NO
         # byte allowance is configured for the tier, which means the node cap
-        # stays the enforced one (#5331 "absent = not enforced"). The owner
-        # sets it per tier by adding the key to pricing.json — no code change.
+        # stays the enforced one (#5331 "absent = not enforced").
+        #
+        # ⛔ ADDING THE KEY IS NOT YET SUFFICIENT (#5331, verified 2026-09-26).
+        # Enabling a byte allowance routes ``enforce_org_limit`` into
+        # ``_enforce_storage_allowance``, which is FAIL-CLOSED when no reading
+        # is supplied — and today NO production caller supplies
+        # ``storage_reading`` (only tests do). So setting this key turns every
+        # points-gated write into a 500 until the graph byte meter is wired
+        # into the gate. Order the work: wire the meter FIRST, then set the
+        # key. The guard is deliberately fail-closed rather than fail-open — a
+        # configured ceiling that silently enforces nothing is the worse bug.
+        #
         # Unit-agnostic: the gate compares a count against this allowance in
         # ONE unit and never converts; which unit the UI presents is a
         # presentation decision made once the ranges are known.
