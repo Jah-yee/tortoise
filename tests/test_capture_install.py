@@ -3260,8 +3260,11 @@ def test_shipped_install_contract_generations(harness):
     more (session-start.sh now writes the local hook-run observation that
     lets an installed-but-unconfigured install report that it RAN), so claude
     moved 6→7 — the bump is what carries it to already-installed hosts, whose
-    hook bytes are frozen at install time.  Those numbers are a reviewed
-    decision, not a
+    hook bytes are frozen at install time.  #4041 changed the claude hooks'
+    BEHAVIOUR once more (session-start.sh now RENDERS the capture breadcrumb to
+    stdout, which Claude Code injects into the session context), so claude
+    moved 7→8 — again the bump is what carries the new behaviour to an
+    already-installed copy.  Those numbers are a reviewed decision, not a
     detail, so they are pinned once and explicitly.
 
     `pi` (#4680) reaches the same table through the ARTIFACT half of the

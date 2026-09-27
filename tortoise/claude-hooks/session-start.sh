@@ -129,8 +129,9 @@ _record_breadcrumb() {
 # ONE four-line payload, two renderers, because the two `kind` values have
 # different reachability:
 #
-#   code: install-inert  -> PURE SHELL (`_render_breadcrumb_inert`). This record
-#          is reached BECAUSE the interpreter or the module dir could not be
+#   code: install-inert  -> PURE SHELL (`_render_breadcrumb_inert`), which owns
+#          BOTH that record's payload and its recovery text. This record is
+#          reached BECAUSE the interpreter or the module dir could not be
 #          resolved, so a Python-only renderer could never report it.
 #   code: capture-failure -> Python (`tortoise.capture_breadcrumb`), which sends
 #          the detail through `tortoise.security.redact_secrets` — an error
@@ -145,9 +146,11 @@ _record_breadcrumb() {
 # right; `Run `tortoise session drain` now` costs the payload its injection.
 # Do not "fix" this into imperatives.
 #
-# The exit-0 contract is inviolable: no breadcrumb file -> no output at all;
-# any renderer failure is swallowed. `set -euo pipefail` is active, so every
-# stage is guarded and each function returns 0.
+# The exit-0 contract is inviolable: no breadcrumb file -> no output at all.
+# The capture payload is BUFFERED and printed only when the renderer exits 0, so
+# a renderer that fails — including one that writes partial output and THEN
+# exits non-zero — contributes NOTHING to the session context. `set -euo
+# pipefail` is active, so every stage is guarded and each function returns 0.
 
 # The INSTALL-leg renderer. PURE SHELL, no python3 — the branch is reached
 # because the interpreter or module dir did not resolve. The `detail` and stamp
@@ -165,35 +168,43 @@ _render_breadcrumb_inert() {
   return 0
 }
 
-# The CAPTURE-leg renderer. Only a `capture-failure` record is rendered here:
-# an `install-inert` record surviving from an EARLIER inert run is stale by the
-# time this branch resolves a module dir, and rendering it would claim memory
-# is not being filed while the working seam is filing it. The fresh
-# install-inert record is rendered by `_render_breadcrumb_inert` instead.
+# The CAPTURE-leg renderer. The record's `kind` is decided IN PYTHON by
+# `render_file`, which parses the record as JSON and returns nothing for any
+# kind but `capture-failure`. A `sed`/`head` gate here would be a second,
+# weaker parser: it would silently DISCARD a compact single-line record (the
+# writer's `indent=2` is not a contract) — reintroducing the exact "nobody is
+# told" defect #4041 exists to fix — and it would disable the whole feature
+# wherever `sed`/`head` are absent, even though the interpreter this half exists
+# to use IS present. An `install-inert` record is owned by
+# `_render_breadcrumb_inert`; a STALE one reaching this path renders nothing
+# because Python refuses the kind.
 _render_capture_failure_breadcrumb() {
-  local harness="$1" crumb kind py
+  local harness="$1" crumb py payload
   crumb="$(_tortoise_state_dir capture-errors)/$harness.json"
   [ -f "$crumb" ] || return 0
-  # POSIX sed, anchored to the JSON writer's own indented `"kind":` line, so a
-  # `"kind"` substring inside the detail cannot be mistaken for the marker.
-  kind="$(sed -n 's/^[[:space:]]*"kind"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    "$crumb" 2>/dev/null | head -n 1 || true)"
-  [ "$kind" = "capture-failure" ] || return 0
   py="${PYTHON_BIN:-$(command -v python3 || true)}"
   [ -n "$py" ] || return 0
   # Same CWE-427 posture as every other embedded block here: drop the process
   # cwd, then prepend the resolved module dir from ARGV (never `-m`, never
   # string-interpolated). An EMPTY module dir falls back to the installed
-  # package on `sys.path`; if neither is importable the `|| true` above makes
-  # this a silent no-op, never a broken session start.
-  "$py" -c '
+  # package on `sys.path`; if neither is importable the `|| return 0` below
+  # makes this a silent no-op, never a broken session start.
+  #
+  # ATOMIC: capture the payload and print it ONLY on exit 0. A renderer that
+  # writes partial output and THEN fails would otherwise inject garbage into
+  # the session context at rc 0. `local payload="$(...)"` would MASK that exit
+  # status (`local` always returns 0), so the assignment is deliberately a
+  # separate command carrying its own guard.
+  payload="$("$py" -c '
 import sys
 sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 if sys.argv[1]:
     sys.path.insert(0, sys.argv[1])
 from tortoise.capture_breadcrumb import render_file
 sys.stdout.write(render_file(sys.argv[2]))
-' "${TORTOISE_MODULE:-}" "$crumb" 2>/dev/null || true
+' "${TORTOISE_MODULE:-}" "$crumb" 2>/dev/null)" || return 0
+  [ -n "$payload" ] || return 0
+  printf '%s' "$payload" || true
   return 0
 }
 
