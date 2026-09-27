@@ -460,6 +460,49 @@ def _supersession_fold_order(proj, records):
     return order
 
 
+#: #5654: cap on the per-record WARN emission from ``apply_supersessions``.
+#: Its record loop is fail-open — ``warn(...)`` + ``continue`` per record — so
+#: an over-cap batch turns malformed input into ONE WARN line per record. The
+#: commit API bounds the batch list itself in Layer-1 (#2243), but the CAPTURE
+#: path (``sdk._extract_session_v2``) applies the raw extractor batch with no
+#: Layer-1 gate at all, so this bound is the only limit on the storm there.
+#: It bounds the EMISSION, never the writes: every record is still attempted,
+#: and the withheld count is reported in ONE summary warn. 20 keeps every
+#: realistic batch (a handful of records) fully verbose while capping a
+#: pathological one.
+_MAX_SUPERSESSION_WARNS = 20
+
+
+class _PerRecordWarnBudget:
+    """Bound a per-record ``warn()`` emission to a fixed budget (#5654).
+
+    Wraps the caller's warn callable: the first ``limit`` messages are
+    emitted verbatim, later ones are counted but not emitted, so a caller
+    that warns once per record cannot amplify a malformed batch into one
+    WARN line per record. The bound is on the EMISSION only — the caller's
+    control flow is untouched (every record is still attempted) — and
+    ``suppressed`` lets the caller report the withheld count in ONE summary
+    warn.
+    """
+
+    __slots__ = ("_emit", "_limit", "total")
+
+    def __init__(self, emit, limit: int) -> None:
+        self._emit = emit
+        self._limit = limit
+        self.total = 0
+
+    def __call__(self, msg, *args, **kwargs) -> None:
+        self.total += 1
+        if self.total <= self._limit:
+            self._emit(msg, *args, **kwargs)
+
+    @property
+    def suppressed(self) -> int:
+        """Per-record messages counted but not emitted."""
+        return max(0, self.total - self._limit)
+
+
 def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
     """Apply canonical supersession records — the ONE consumer-side
     discipline (producer side: extractor_v2._supersession_records).
@@ -469,7 +512,9 @@ def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
     #2164/#2193: shared by capture (_extract_session_v2), eval ingest_v2,
     and the hosted commit endpoint (_execute_commit_writes §6b). warn()
     receives every skip/failure —
-    never a silent drop — with ONE explicit asymmetry (final-review
+    never a silent drop of the first ``_MAX_SUPERSESSION_WARNS`` per call;
+    beyond that the per-record emission is counted and reported in ONE
+    summary warn (#5654) — with ONE explicit asymmetry (final-review
     P3): terminal pt_ olds are treated as idempotent re-ingests and
     skipped SILENTLY regardless of the claimed successor (no
     divergence probe — supersede_point would raise on a terminal old);
@@ -515,6 +560,14 @@ def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
         warn(f"supersession fold-order pre-pass failed ({exc}) — "
              f"falling back to payload order")
         fold_order = list(range(len(records)))
+    # #5654: bound the EMISSION of the per-record warns in the loop below.
+    # Write semantics are untouched — every record is still attempted by the
+    # same fail-open gates — this only stops a malformed batch from producing
+    # one WARN line per record. `warn` is caller-supplied (capture passes
+    # ``warnings.append``, hosted passes a counting logger delegate), so the
+    # bound applies at this one seam shared by every path.
+    _raw_warn = warn
+    warn = _PerRecordWarnBudget(warn, _MAX_SUPERSESSION_WARNS)
     for i in fold_order:
         record = records[i]
         ref = str(_sr_attr(record, "superseded") or "").strip()
@@ -875,4 +928,12 @@ def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
                 applied += 1
         except Exception as exc:
             warn(f"ObjectSuperseded emit/fold failed for {obj_name!r}: {exc}")
+    if warn.suppressed:
+        _raw_warn(
+            f"supersession batch of {len(records)} record(s): "
+            f"{warn.total} per-record warning(s) raised — the first "
+            f"{_MAX_SUPERSESSION_WARNS} were reported individually, "
+            f"{warn.suppressed} suppressed. Every record was still applied "
+            f"or skipped by the same fail-open gates."
+        )
     return applied
