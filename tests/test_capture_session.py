@@ -1990,9 +1990,11 @@ def test_extract_session_v2_supersession_meta_warnings(sdk, monkeypatch):
 def test_extract_session_v2_over_cap_supersession_batch_warns_bounded(
         sdk, monkeypatch):
     """#5654: CAPTURE applies the raw extractor batch with NO Layer-1 gate
-    (#2243 capped the commit API's ``supersessions`` list, and only there),
-    so an over-cap batch reaches ``commit_ops.apply_supersessions``, whose
-    fail-open loop emitted ONE warn PER RECORD. The per-record emission is
+    (#2243 proposes a Layer-1 cap on the commit API's ``supersessions`` list —
+    PR #5648, still open at this base — which would not cover the capture
+    path anyway), so an over-cap batch reaches
+    ``commit_ops.apply_supersessions``, whose fail-open loop emitted ONE warn
+    PER RECORD. The per-record emission is
     now bounded (the first N, then ONE summary carrying the total) — an
     emission bound only: the batch below places records that MUST still be
     folded AFTER the warn budget is exhausted, so the loop is proven not to

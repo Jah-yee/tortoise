@@ -462,17 +462,15 @@ def _supersession_fold_order(proj, records):
 
 #: #5654: cap on the per-record WARN emission from ``apply_supersessions``.
 #: Its record loop is fail-open — ``warn(...)`` + ``continue`` per record — so
-#: an over-cap batch turns malformed input into ONE WARN line per record. The
-#: commit API bounds the batch list itself in Layer-1 (#2243), but the CAPTURE
-#: path (``sdk._extract_session_v2``) applies the raw extractor batch with no
-#: Layer-1 gate at all, so this bound is the only limit on the storm there.
+#: an over-cap batch turns malformed input into ONE WARN line per record.
+#: #2243 proposes a Layer-1 cap on ``len(payload.supersessions)`` (PR #5648,
+#: still OPEN at #5654's base); until it lands NO path is Layer-1-gated —
+#: capture, hosted commit §6b and eval ingest all hand this helper the raw
+#: batch — so this emission bound is the only limit on the storm everywhere.
 #: It bounds the EMISSION, never the writes: every record is still attempted,
 #: and the withheld count is reported in ONE summary warn. 20 keeps every
 #: realistic batch (a handful of records) fully verbose while capping a
-#: pathological one — and it is well above the warning count any
-#: non-malfunctioning call produces, so the recorded per-record guarantees
-#: (#2242's concurrency-loss warn, #2164's unresolved-ref warn) are untouched
-#: in practice.
+#: pathological one.
 _MAX_SUPERSESSION_WARNS = 20
 
 
@@ -521,16 +519,19 @@ def apply_supersessions(proj, sdk, records, *, session_id, warn=None):
     withheld count (#5654). An over-cap batch therefore stays observable as
     malformed and sized, but its records past the budget are not named
     individually. The bound is on the EMISSION only — every record is still
-    attempted by the same gates below. It contradicts no earlier warn
-    guarantee: #2242's "exactly one warn" on a lost concurrent fold and
-    #2164's "unresolved refs warn loudly" hold verbatim for every call with
-    at most ``_MAX_SUPERSESSION_WARNS`` warnings — i.e. every
-    non-malfunctioning call; a call that reaches the budget is ALREADY
-    signalling a malfunction, and the summary says so. Caller-side
-    comments that still promise a per-record "never a silent drop"
-    (``sdk._extract_session_v2``'s docstring + call site, ``hosted_api``
-    §6b, ``tools/longmem_eval/ingest_v2``) describe the pre-#5654
-    contract; THIS docstring is the authoritative one. With ONE explicit
+    attempted by the same gates below. The per-record guarantees recorded
+    earlier (#2242's "exactly one warn" on a lost concurrent fold, #2164's
+    "unresolved refs warn loudly") hold verbatim for any call emitting at
+    most ``_MAX_SUPERSESSION_WARNS`` warnings; a call above the budget has
+    its withheld warnings counted, sized and reported in the summary but not
+    named individually — whatever their cause (a legitimate batch can exceed
+    the budget, e.g. many concurrent-race losses, so exceeding it is not by
+    itself evidence of malformed input). Caller-side comments that still
+    promise a per-record "never a silent drop" (``sdk._extract_session_v2``'s
+    docstring and call site, ``tools/longmem_eval/ingest_v2``) describe the
+    pre-#5654 contract; the divergence is recorded and tracked on #5654, not
+    an override of the public meta-``warnings`` contract documented in the
+    frozen ``sdk.py``. With ONE explicit
     asymmetry (final-review
     P3): terminal pt_ olds are treated as idempotent re-ingests and
     skipped SILENTLY regardless of the claimed successor (no
