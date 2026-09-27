@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -76,19 +77,27 @@ def _capture_failure(**overrides) -> dict:
     return record
 
 
-def _mock_tortoise(bindir: Path, log: Path) -> None:
+def _mock_tortoise(bindir: Path, log: Path,
+                  digest: str | None = None) -> None:
     """A fake ``tortoise`` on PATH: logs argv, exits 0 for everything.
 
     The digest, the install probe and the replay drain must not reach the
     network in a hermetic test; the renderer under test does not go through
     this binary at all.
+
+    ``digest``, when given, is printed on every invocation (the probe and drain
+    calls redirect their own stdout away, so only ``tortoise context``'s copy
+    reaches the hook's stdout).  A test that needs to observe the BOUNDARY
+    between the breadcrumb payload and the memory digest needs a digest present —
+    without one, stdout has no following line for the payload to merge into.
     """
     bindir.mkdir(parents=True, exist_ok=True)
     mock = bindir / "tortoise"
     mock.write_text(
         "#!/usr/bin/env bash\n"
         f'echo "$@" >> "{log}"\n'
-        "exit 0\n",
+        + (f'printf \'%s\\n\' "{digest}"\n' if digest is not None else "")
+        + "exit 0\n",
         encoding="utf-8")
     mock.chmod(0o755)
 
@@ -128,13 +137,39 @@ def _link(bindir: Path, *tools: str) -> Path:
     return bindir
 
 
+def _custom_python3(bindir: Path, *, stdout: str = "", stderr: str = "",
+                    rc: int = 0, marker: Path | None = None) -> Path:
+    """A ``python3`` whose behaviour the test controls exactly.
+
+    The hook always runs the breadcrumb renderer through ``python3 -c``; this
+    shim lets a test inject a renderer that prints nothing, fails, or records
+    that it was spawned at all.
+    """
+    bindir.mkdir(parents=True, exist_ok=True)
+    shim = bindir / "python3"
+    body = "#!/usr/bin/env bash\n"
+    if marker is not None:
+        body += f'touch "{marker}"\n'
+    if stdout:
+        body += f'printf \'%s\\n\' "{stdout}"\n'
+    if stderr:
+        body += f'printf \'%s\\n\' "{stderr}" >&2\n'
+    body += f"exit {rc}\n"
+    shim.write_text(body, encoding="utf-8")
+    shim.chmod(0o755)
+    return shim
+
+
 def _run_hook(home: Path, *, path: str, src: Path | None = None,
-              hook: Path | None = None) -> subprocess.CompletedProcess:
+              hook: Path | None = None,
+              cwd: Path | None = None) -> subprocess.CompletedProcess:
     """Drive the REAL shipped hook with a hermetic env.
 
     ``HOME`` is always the caller's tmp dir: the hook writes a breadcrumb and a
     hook-run record, and a test must never let them land in the developer's
-    real ``$HOME``.
+    real ``$HOME``.  ``cwd`` is settable for the CWE-427 test: ``python3 -c``
+    puts the process cwd on ``sys.path``, so the hook's cwd is an attacker-
+    influenced surface.
     """
     (home / "tmp").mkdir(parents=True, exist_ok=True)
     env = {"HOME": str(home), "PATH": path, "TMPDIR": str(home / "tmp")}
@@ -142,7 +177,8 @@ def _run_hook(home: Path, *, path: str, src: Path | None = None,
         env["TORTOISE_SRC_DIR"] = str(src)
     return subprocess.run(
         ["/bin/bash", str(hook or SESSION_START)], input="",
-        capture_output=True, text=True, env=env, timeout=120)
+        capture_output=True, text=True, env=env, timeout=120,
+        cwd=str(cwd) if cwd is not None else None)
 
 
 def _fields(stdout: str) -> dict[str, str]:
@@ -190,6 +226,41 @@ def test_a_capture_failure_breadcrumb_reaches_the_agent(tmp_path):
     assert "tortoise session drain" in fields.get("next", ""), proc.stdout
 
 
+def test_the_payload_and_the_memory_digest_do_not_merge(tmp_path):
+    """The breadcrumb payload and the memory digest are written to the SAME
+    stdout, payload first.  ``payload="$(...)"`` strips EVERY trailing newline,
+    so without the explicit one ``printf '%s'`` glues the payload's last line
+    (``next: …``) onto the digest's first line (``# Tortoise memory …``): the
+    recovery line is corrupted AND the digest header stops being a Markdown
+    heading.  Every other test mocks ``tortoise`` without a digest, so stdout
+    never had a following line and no test could see the merge.
+
+    Mutation: print ``printf '%s' "$payload"`` (or otherwise drop the trailing
+    newline) — the two surfaces share a line and this REDs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log",
+                   digest="# Tortoise memory (from previous sessions) — local")
+    _python3_shim(bindir)
+    _seed_breadcrumb(home, **_capture_failure())
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
+
+    assert proc.returncode == 0, proc.stderr
+    # Both surfaces reached this stdout...
+    assert "next:     Recovery:" in proc.stdout, proc.stdout
+    assert "# Tortoise memory" in proc.stdout, proc.stdout
+    # ...and the boundary between them is a real newline: the digest header
+    # STARTS a line, and the exact glued artefact is absent.
+    assert "\n# Tortoise memory (from previous sessions) — local" in proc.stdout, \
+        proc.stdout
+    assert "meanwhile.# Tortoise memory" not in proc.stdout, proc.stdout
+    lines = proc.stdout.splitlines()
+    assert any(line.startswith("next:") for line in lines), proc.stdout
+    assert any(line.startswith("# Tortoise memory") for line in lines), proc.stdout
+
+
 def test_no_breadcrumb_means_no_output_and_exit_zero(tmp_path):
     """The exit-0 contract is inviolable: with no breadcrumb file the hook must
     emit NOTHING.  A single stray byte here is injected into every session.
@@ -208,6 +279,31 @@ def test_no_breadcrumb_means_no_output_and_exit_zero(tmp_path):
     assert proc.stdout == "", (
         f"a no-breadcrumb session start emitted {len(proc.stdout)} bytes "
         f"({proc.stdout!r}) — it must emit none")
+
+
+def test_an_absent_breadcrumb_does_not_even_spawn_the_renderer(tmp_path):
+    """``[ -f "$crumb" ]`` is not merely an optimisation: with no breadcrumb
+    file the renderer must not be spawned at all.  Spawning it means every
+    session start pays an interpreter start-up for a file that is absent in the
+    overwhelming majority of sessions, and it makes the branch's behaviour
+    depend on what an unreadable path happens to raise.
+
+    Mutation: drop the ``[ -f "$crumb" ] || return 0`` guard — the renderer is
+    spawned, the marker appears, and this REDs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log")
+    marker = tmp_path / "renderer-spawned"
+    _custom_python3(bindir, marker=marker)
+    # Deliberately NO breadcrumb seeded.
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", proc.stdout
+    assert not marker.exists(), (
+        "the renderer was spawned although no breadcrumb file exists")
 
 
 def test_a_stale_install_inert_breadcrumb_is_not_rendered_as_live(tmp_path):
@@ -342,6 +438,84 @@ def test_a_renderer_that_writes_then_fails_injects_nothing(tmp_path):
     assert proc.stdout == "", proc.stdout
 
 
+def test_a_renderer_that_succeeds_with_no_output_prints_nothing(tmp_path):
+    """A renderer can exit 0 and still produce an EMPTY payload (the record is
+    malformed, its kind is unknown, or the file vanished between the ``-f``
+    check and the read).  Printing that empty payload would still emit a bare
+    newline into the session context — a stray byte in EVERY such session.
+
+    Mutation: drop ``[ -n "$payload" ] || return 0`` — ``printf '%s\n'``
+    emits the newline and this REDs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log")
+    _custom_python3(bindir, stdout="", rc=0)
+    _seed_breadcrumb(home, **_capture_failure())
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", (
+        f"an empty payload emitted {len(proc.stdout)} bytes: {proc.stdout!r}")
+
+
+def test_a_renderer_failure_cannot_leak_onto_hook_stderr(tmp_path):
+    """The renderer is best-effort: a ``python3`` that fails (an unimportable
+    module, a traceback) must not write its diagnostics to the hook's stderr.
+    Claude Code surfaces hook stderr, and the crash shape that matters is the
+    one that did NOT get caught — a raised exception rendered by the
+    interpreter.
+
+    Mutation: drop ``2>/dev/null`` from the renderer invocation — the traceback
+    reaches stderr and this REDs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log")
+    _custom_python3(bindir, stderr="TRACEBACK-MARKER", rc=1)
+    _seed_breadcrumb(home, **_capture_failure())
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", proc.stdout
+    assert "TRACEBACK-MARKER" not in proc.stderr, (
+        f"a failing renderer wrote to hook stderr: {proc.stderr!r}")
+
+
+def test_the_renderer_never_imports_a_planted_cwd_module(tmp_path):
+    """CWE-427: ``python3 -c`` puts the process cwd (``''``/``'.'``) at
+    ``sys.path[0]``, and the hook's cwd is the agent's workspace — an
+    attacker-influenced surface.  ``capture_breadcrumb`` imports ``json`` at
+    module level, so a planted ``./json.py`` would execute as the user at every
+    session start.  The ``-c`` block drops ``''``/``'.'`` from ``sys.path``
+    BEFORE importing anything beyond the builtin ``sys``.
+
+    Mutation: drop the ``sys.path`` scrub — the planted ``./json.py`` executes,
+    the marker appears, and this REDs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log")
+    _python3_shim(bindir)
+    _seed_breadcrumb(home, **_capture_failure())
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    marker = tmp_path / "pwned"
+    (workdir / "json.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8")
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO,
+                     cwd=workdir)
+
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists(), (
+        "a planted ./json.py in the hook cwd executed — the cwd is "
+        "attacker-influenced (CWE-427)")
+
+
 # ── the install-inert path (no interpreter reachable) ────────────────────
 
 def test_install_inert_is_rendered_with_no_python_on_path(tmp_path):
@@ -384,6 +558,37 @@ def test_install_inert_is_rendered_with_no_python_on_path(tmp_path):
     # can read the same evidence.
     body = json.loads(_crumb_path(home).read_text(encoding="utf-8"))
     assert body["kind"] == "install-inert", body
+
+
+def test_the_second_inert_branch_also_renders_the_breadcrumb(tmp_path):
+    """There are TWO inert branches and each renders its OWN record.  This is
+    the SECOND: a tortoise module dir RESOLVED (so the first branch does not
+    apply) but no python3 exists to render the capture half with.  Branch 1's
+    call is exercised by ``test_install_inert_is_rendered_with_no_python_on_
+    path``; branch 2's call is a SEPARATE statement and needs its own proof.
+
+    Mutation: drop the ``_render_breadcrumb_inert`` call from the resolved-
+    module-dir branch — nothing is printed and this REDs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _shell_tools_only(bindir)  # no python3, no tortoise
+
+    # A resolved module dir: `TORTOISE_SRC_DIR` holds a real `tortoise/`
+    # package, so the hook does NOT take the unresolvable branch.
+    src = tmp_path / "src"
+    (src / "tortoise").mkdir(parents=True)
+    (src / "tortoise" / "__init__.py").write_text("", encoding="utf-8")
+
+    proc = _run_hook(home, path=str(bindir), src=src)
+
+    assert proc.returncode == 0, proc.stderr
+    assert shutil.which("python3", path=str(bindir)) is None
+    fields = _fields(proc.stdout)
+    assert fields.get("code") == "install-inert", proc.stdout
+    assert "resolved a tortoise module dir but found no python3" in \
+        fields.get("why", ""), proc.stdout
+    assert fields.get("next", "").startswith("Recovery:"), proc.stdout
 
 
 # ── the payload's wording contract ───────────────────────────────────────
@@ -538,6 +743,105 @@ def test_bound_detail_redacts_before_it_bounds():
     assert "ghp_" not in out, out
     assert "[REDACTED" in out, out
     assert len(out) <= MAX_DETAIL_CHARS + 1, len(out)
+
+
+def test_a_very_large_detail_is_redacted_within_a_bounded_window():
+    """The detail is an error string that can be a whole HTTP response body
+    stored verbatim (``import failed (HTTP {code}): {body}``).  The redaction
+    table is a set of regexes whose cost is linear in the text, so scanning all
+    of a large body stalls the session start — measured through the real hook:
+    1 MB = 1.9 s, 50 MB = 109 s, past the hook's 60 s timeout.  Redaction must
+    run over a bounded WINDOW while still redacting a secret that sits inside
+    it.
+
+    Mutation: redact the whole detail (drop the window slice) — a 20 MB body
+    takes tens of seconds and the elapsed-time assertion REDs."""
+    from tortoise.capture_breadcrumb import bound_detail
+
+    token = "ghp_" + "a" * 36
+    detail = token + " " + "A" * 20_000_000
+
+    start = time.perf_counter()
+    out = bound_detail(detail)
+    elapsed = time.perf_counter() - start
+
+    # The secret inside the window is STILL redacted...
+    assert "ghp_" not in out, out
+    assert "[REDACTED:github_token]" in out, out[:200]
+    # ...and the render is bounded, not seconds-long.
+    assert elapsed < 1.0, (
+        f"bound_detail took {elapsed:.2f}s on a 20 MB detail — the redaction "
+        f"scan is unbounded and will stall the session start past its timeout")
+
+
+def test_a_secret_straddling_the_window_boundary_cannot_leak_a_fragment():
+    """The window must not cut MID-SECRET without redacting: a credential that
+    BEGINS inside the rendered bound has to be captured WHOLE by the redaction
+    window, or the cut leaves a prefix that no rule matches and that prefix is
+    rendered in cleartext.  The window therefore extends a margin past the
+    bound.  The tail beyond the window is never rendered, so skipping its
+    redaction cannot expose it.
+
+    Mutation: set the window to the bound (no margin) — the token's ``ghp_``
+    prefix is left in cleartext inside the rendered 400 chars and this REDs."""
+    from tortoise.capture_breadcrumb import MAX_DETAIL_CHARS, REDACT_WINDOW_CHARS, bound_detail
+
+    # The window must extend past everything that is rendered.
+    assert REDACT_WINDOW_CHARS > MAX_DETAIL_CHARS
+
+    token = "ghp_" + "a" * 36
+
+    # (1) The token STARTS inside the rendered bound and ENDS beyond it, so a
+    # zero-margin window cuts it — the prefix would render.  The leading space
+    # is the rule's own word boundary (a credential glued to a letter is not
+    # the anchored shape the table matches).
+    out = bound_detail("A" * 394 + " " + token + " " + "B" * 50)
+    assert "ghp_" not in out, out
+    assert "aaaaa" not in out, out
+
+    # (2) The same token placed so its redaction MARKER is complete within the
+    # rendered bound: redaction really ran (not merely truncated away).
+    marked = bound_detail("A" * 390 + " " + token + " " + "B" * 50)
+    assert "[REDACTED" in marked, marked
+
+    # (3) The token straddling the REDACTION WINDOW's own end must still not
+    # put a cleartext fragment in the output, and the output stays bounded.
+    tail = "A" * (REDACT_WINDOW_CHARS - 6) + " " + token + " " + "C" * 50
+    out2 = bound_detail(tail)
+    assert "ghp_" not in out2, out2
+    assert len(out2) <= MAX_DETAIL_CHARS + 1, len(out2)
+
+
+@pytest.mark.parametrize("label, raw", [
+    ("malformed JSON", b"{not json at all"),
+    ("non-UTF-8 bytes", b'{"kind": "capture-failure", "detail": "\xff\xfe"}'),
+])
+def test_render_file_refuses_undecodable_and_malformed_records(tmp_path, label, raw):
+    """``render_file`` runs inside a hook whose exit-0 contract is inviolable:
+    an unreadable, undecodable or malformed record must yield NO output rather
+    than propagate.  The catch is broad on purpose.
+
+    Mutation: narrow ``except Exception`` to ``except OSError`` — the
+    ``JSONDecodeError``/``UnicodeDecodeError`` escapes and this REDs."""
+    from tortoise.capture_breadcrumb import render_file
+
+    path = tmp_path / "crumb.json"
+    path.write_bytes(raw)
+    assert render_file(path) == "", label
+
+
+def test_render_file_refuses_a_deeply_nested_record(tmp_path):
+    """A deeply nested document raises ``RecursionError`` inside
+    ``json.loads``, which is NOT an ``OSError`` — the docstring names this
+    case, so the catch must stay broad enough to absorb it.
+
+    Mutation: narrow ``except Exception`` to ``except OSError`` — the
+    ``RecursionError`` escapes and this REDs."""
+    from tortoise.capture_breadcrumb import render_file
+
+    path = tmp_path / "crumb.json"
+    path.write_text("[" * 200_000, encoding="utf-8")
+    assert render_file(path) == ""
 
 
 def test_a_bom_prefixed_record_is_still_rendered(tmp_path):

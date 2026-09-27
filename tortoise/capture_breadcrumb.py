@@ -59,6 +59,33 @@ from tortoise.security import redact_secrets
 #: and capped here rather than dumped into the session context verbatim.
 MAX_DETAIL_CHARS = 400
 
+#: How far past :data:`MAX_DETAIL_CHARS` redaction still runs.  A credential
+#: that BEGINS inside the rendered bound must be captured WHOLE, or the window
+#: would cut it into a fragment no rule can match and that fragment would be
+#: rendered in cleartext.  Every BOUNDED secret shape in ``tortoise.security``
+#: is far under this (the longest is ``github_pat_`` at ~61 chars), so 64 KiB is
+#: orders of magnitude of headroom.  Of the two unbounded shapes, the PEM
+#: private-key rule fails CLOSED — it matches to ``\Z`` when the END line is
+#: absent, so a key cut by the window is redacted rather than leaked; a JWT
+#: longer than the margin is the one residual (a real token is a few hundred
+#: bytes, and the rule already caps its first segment at 512).  The margin is
+#: what makes the window safe at its edge, so it is deliberately not the
+#: minimum that would pass.
+_REDACT_MARGIN = 64 * 1024
+
+#: The redaction WINDOW: :func:`redact_secrets` scans at most this many
+#: characters of the detail, never the whole of it.  The detail is an error
+#: string that can be a response body stored verbatim
+#: (``import failed (HTTP {code}): {body}``), and the redaction table is a set of
+#: regexes whose cost is linear in the text: 1 MB measured ~1.9 s and 50 MB
+#: ~109 s through the real hook, past its configured 60 s timeout, while the
+#: window measures ~0.15 s at its worst observed content.  Redaction MUST run
+#: before the bound (a cut can only land on the ``[REDACTED:…]`` marker, never
+#: on the secret — see :func:`bound_detail`), so the bound cannot be used to
+#: shrink the SCAN; instead the scan is windowed and the tail past the window is
+#: simply never rendered, so skipping its redaction cannot expose it.
+REDACT_WINDOW_CHARS = MAX_DETAIL_CHARS + _REDACT_MARGIN
+
 #: The field label column: ``code:``/``what:``/``why:``/``next:`` all start
 #: their value at this column, so the payload reads as a table.
 _FIELD_WIDTH = 10
@@ -100,9 +127,17 @@ def bound_detail(detail: Any) -> str:
     leave a suffix of the secret in cleartext.  Whitespace (including newlines)
     is collapsed to single spaces, and the result is capped at
     :data:`MAX_DETAIL_CHARS`.
+
+    Redaction is scanned over a bounded WINDOW (:data:`REDACT_WINDOW_CHARS`),
+    not the whole detail, so a multi-megabyte body cannot stall the session
+    start past the hook's timeout.  The window extends
+    :data:`_REDACT_MARGIN` characters past the rendered bound, so a secret that
+    begins inside the rendered bound and is shorter than the margin is redacted
+    whole; the tail past the window is never rendered, so its un-redacted bytes
+    cannot reach the output.
     """
     text = "" if detail is None else str(detail)
-    redacted, _counts = redact_secrets(text)
+    redacted, _counts = redact_secrets(text[:REDACT_WINDOW_CHARS])
     text = " ".join(redacted.split())
     if len(text) > MAX_DETAIL_CHARS:
         text = text[:MAX_DETAIL_CHARS].rstrip() + "…"

@@ -204,7 +204,12 @@ from tortoise.capture_breadcrumb import render_file
 sys.stdout.write(render_file(sys.argv[2]))
 ' "${TORTOISE_MODULE:-}" "$crumb" 2>/dev/null)" || return 0
   [ -n "$payload" ] || return 0
-  printf '%s' "$payload" || true
+  # ⛔ The trailing newline is LOAD-BEARING, not cosmetic. Command substitution
+  # strips EVERY trailing newline, so `printf '%s'` would glue the payload's
+  # last line (`next: …`) onto the memory digest's first line — `tortoise
+  # context` writes to this SAME stdout immediately below — corrupting the
+  # recovery line AND stopping the digest header from being a Markdown heading.
+  printf '%s\n' "$payload" || true
   return 0
 }
 
