@@ -62,15 +62,24 @@ MAX_DETAIL_CHARS = 400
 #: How far past :data:`MAX_DETAIL_CHARS` redaction still runs.  A credential
 #: that BEGINS inside the rendered bound must be captured WHOLE, or the window
 #: would cut it into a fragment no rule can match and that fragment would be
-#: rendered in cleartext.  Every BOUNDED secret shape in ``tortoise.security``
-#: is far under this (the longest is ``github_pat_`` at ~61 chars), so 64 KiB is
-#: orders of magnitude of headroom.  Of the two unbounded shapes, the PEM
-#: private-key rule fails CLOSED — it matches to ``\Z`` when the END line is
-#: absent, so a key cut by the window is redacted rather than leaked; a JWT
-#: longer than the margin is the one residual (a real token is a few hundred
-#: bytes, and the rule already caps its first segment at 512).  The margin is
-#: what makes the window safe at its edge, so it is deliberately not the
-#: minimum that would pass.
+#: rendered in cleartext.  What keeps the cut safe is the KIND of rule, not a
+#: bounded shape: a VENDOR-PREFIX rule is anchored by its prefix, so the cut
+#: leaves that prefix intact and the rule still matches at end-of-string — it
+#: fails CLOSED (``ghp_``/``github_pat_``, ``glpat-``, ``sk-ant-``, ``AIza``,
+#: ``xox…``, the PEM header with its ``\Z`` fallback, and the name-anchored
+#: ``aws_secret_access_key``/``Bearer`` pairs).  The residual is the STRUCTURED
+#: MULTI-DELIMITER family, whose LATER delimiters can fall past the cut:
+#: ``jwt`` (three dot-separated segments) and the Slack ``xapp-…`` form
+#: (``N-…-N-…``).  A token of that family whose interior is longer than the
+#: margin renders its prefix with NO marker.  No realistic token reaches
+#: 64 KiB, but this is a residual of the window, not a proof of safety, and it
+#: is pinned by
+#: ``test_the_structured_multi_delimiter_residual_at_the_window_edge`` rather
+#: than argued away.  A prefix-anchored shape can still be MISSED on a FULL
+#: scan for unrelated reasons (the ``AKIA`` family has such a pre-existing
+#: shape-table recall gap); that is not a window artefact and this margin does
+#: not address it.  The margin is what makes the window safe at its edge, so it
+#: is deliberately not the minimum that would pass.
 _REDACT_MARGIN = 64 * 1024
 
 #: The redaction WINDOW: :func:`redact_secrets` scans at most this many
@@ -110,17 +119,22 @@ _RECOVERY = (
 
 
 def one_line(value: Any) -> str:
-    """A rendered scalar as ONE line, whitespace-collapsed.
+    """A rendered scalar as ONE bounded, redacted line.
 
-    Used for ``harness``/``recorded_at``: neither is redacted, and a newline in
-    either would forge an extra ``next:``-looking line, breaking the ONE
-    four-line payload invariant the agent's context depends on.
+    Used for ``harness``/``recorded_at``.  Those two are attacker-influenced
+    text exactly as ``detail`` is — all three arrive in the SAME JSON record —
+    so they go through the SAME redact-then-bound path: a token planted in
+    either cannot render in cleartext, an oversized value cannot blow the
+    payload past ONE four-line shape, and a value spanning lines cannot forge
+    an extra ``next:``-looking line and break the invariant the agent's context
+    depends on.
     """
-    return " ".join(str(value).split())
+    return bound_detail(value)
 
 
 def bound_detail(detail: Any) -> str:
-    """The ``detail`` as ONE bounded, redacted line.
+    """A rendered scalar (``detail``/``harness``/``recorded_at``) as ONE
+    bounded, redacted line.
 
     Redaction runs BEFORE the bound, so a credential-shaped span is replaced
     whole and a truncation can only cut the ``[REDACTED:<kind>]`` marker — never

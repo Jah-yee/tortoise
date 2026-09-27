@@ -46,9 +46,13 @@ SESSION_START = Path(os.environ.get("TORTOISE_SESSION_START_OVERRIDE")
 pytestmark = pytest.mark.skipif(
     not SESSION_START.exists(), reason="claude-hooks script not present")
 
-#: The literal words the payload may NEVER use — the capture is spooled and
-#: retried by design, so "failed" would be untrue and "run <cmd>" is the
-#: imperative phrasing Claude Code's injection defences reject.
+#: The literal words the payload TEMPLATE (``what:``/``next:``) may NEVER use —
+#: the capture is spooled and retried by design, so "failed" would be untrue and
+#: "run <cmd>" is the imperative phrasing Claude Code's injection defences
+#: reject.  Deliberately NOT asserted over the echoed ``why:`` detail: the
+#: shipped writer's detail is ``f"import failed (HTTP {code}): {body}"``, so a
+#: whole-stdout scan would only pass while the fixture happened to avoid the
+#: word.
 _FORBIDDEN = ("failed", "run `", "execute `", "you must", "you should")
 
 
@@ -304,6 +308,33 @@ def test_an_absent_breadcrumb_does_not_even_spawn_the_renderer(tmp_path):
     assert proc.stdout == "", proc.stdout
     assert not marker.exists(), (
         "the renderer was spawned although no breadcrumb file exists")
+
+
+def test_a_directory_at_the_crumb_path_does_not_spawn_the_renderer(tmp_path):
+    """``[ -f "$crumb" ]`` — not ``-e`` — is what keeps a DIRECTORY named
+    ``claude.json`` from costing an interpreter start.  ``-e`` is equally true
+    for a directory, so it would spawn the renderer for a path that can never
+    be a record.  The OUTPUT is the same either way (``render_file`` refuses a
+    directory and prints nothing), which is exactly why only a spawn marker can
+    see the difference.
+
+    Mutation: widen the test to ``[ -e "$crumb" ]`` — the marker appears and
+    this REDs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log")
+    marker = tmp_path / "renderer-spawned"
+    _custom_python3(bindir, marker=marker)
+    _crumb_path(home).mkdir(parents=True)  # a DIRECTORY, not a record
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", proc.stdout
+    assert not marker.exists(), (
+        "the renderer was spawned for a crumb path that is a directory — the "
+        "`-f` test must not be widened to `-e`")
 
 
 def test_a_stale_install_inert_breadcrumb_is_not_rendered_as_live(tmp_path):
@@ -590,6 +621,17 @@ def test_the_second_inert_branch_also_renders_the_breadcrumb(tmp_path):
         fields.get("why", ""), proc.stdout
     assert fields.get("next", "").startswith("Recovery:"), proc.stdout
 
+    # The INERT RECORD this branch writes is what `session verify` reads, so it
+    # must be pinned too — the stdout alone does not prove the write happened.
+    # Mutation: drop this branch's `_record_breadcrumb` call — stdout stays
+    # correct and this REDs.
+    body = json.loads(_crumb_path(home).read_text(encoding="utf-8"))
+    assert body["kind"] == "install-inert", body
+    assert body["harness"] == "claude", body
+    assert "resolved a tortoise module dir but found no python3" in \
+        body["detail"], body
+    assert body["recorded_at"], body
+
 
 # ── the payload's wording contract ───────────────────────────────────────
 
@@ -615,7 +657,13 @@ def test_the_payload_says_not_filed_and_is_never_imperative(tmp_path, kind):
     if kind == "capture-failure":
         _mock_tortoise(bindir, tmp_path / "calls.log")
         _python3_shim(bindir)
-        _seed_breadcrumb(home, **_capture_failure())
+        # The REAL writer emits f"import failed (HTTP {e.code}): {body}"
+        # (__main__.py:4957), so the ECHOED detail legitimately contains
+        # "failed".  Seeding that exact shape makes the template check below
+        # prove itself: a whole-stdout scan would have passed only because the
+        # previous fixture happened to avoid the word.
+        _seed_breadcrumb(home, **_capture_failure(
+            detail="import failed (HTTP 503): upstream unavailable"))
         proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
     else:
         hook = home / ".claude" / "hooks" / "session-start.sh"
@@ -626,10 +674,19 @@ def test_the_payload_says_not_filed_and_is_never_imperative(tmp_path, kind):
         proc = _run_hook(home, path=str(bindir), hook=hook)
 
     assert proc.returncode == 0, proc.stderr
-    lowered = proc.stdout.lower()
-    assert "not filed" in lowered, proc.stdout
+    fields = _fields(proc.stdout)
+    # The ban is on the TEMPLATE's words — `what:` and `next:` — never on the
+    # echoed `why:` detail.  The detail is the writer's own error string and may
+    # legitimately say "failed"; asserting over the whole stdout would silently
+    # stop pinning the template the moment a fixture carried the word.
+    template = f"{fields.get('what', '')}\n{fields.get('next', '')}".lower()
+    assert "not filed" in template, proc.stdout
     for phrase in _FORBIDDEN:
-        assert phrase not in lowered, (phrase, proc.stdout)
+        assert phrase not in template, (phrase, proc.stdout)
+    if kind == "capture-failure":
+        # The fixture really does carry the forbidden word, so the assertion
+        # above is exercised rather than vacuous.
+        assert "failed" in fields.get("why", "").lower(), proc.stdout
     # The recovery half names actions, and only after the factual three parts.
     lines = proc.stdout.splitlines()
     assert lines[-1].startswith("next:     Recovery:"), proc.stdout
@@ -812,6 +869,92 @@ def test_a_secret_straddling_the_window_boundary_cannot_leak_a_fragment():
     assert len(out2) <= MAX_DETAIL_CHARS + 1, len(out2)
 
 
+def test_the_structured_multi_delimiter_residual_at_the_window_edge():
+    """The documented WINDOW residual, pinned rather than asserted.
+
+    A VENDOR-PREFIX rule is anchored by its prefix, so the window's cut at
+    end-of-string leaves the prefix intact and the rule still matches — it fails
+    CLOSED (pinned by
+    ``test_vendor_prefix_rules_fail_closed_at_the_window_edge``).  A STRUCTURED
+    MULTI-DELIMITER rule instead needs delimiters that can fall PAST the cut:
+    the Slack ``xapp-…`` form puts only its first field inside the window, and
+    a ``jwt``'s second and third dot-separated segments sit the same way.  A
+    token of that family whose interior is longer than the margin therefore
+    renders its prefix with NO marker.
+
+    This test exists so the residual is BOUND to the code: it is what REDs if
+    the window/margin relationship changes, and it is the evidence the
+    ``_REDACT_MARGIN`` comment points to instead of claiming safety.
+    """
+    from tortoise.capture_breadcrumb import (
+        MAX_DETAIL_CHARS, REDACT_WINDOW_CHARS, bound_detail)
+    from tortoise.security import redact_secrets
+
+    # (1) Inside the window the whole xapp token redacts — the rule works.
+    small = "xapp-1-" + "A" * 40 + "-1234-" + "B" * 20
+    assert "[REDACTED:slack_token]" in bound_detail(small), bound_detail(small)
+
+    # (2) A token whose interior runs past the window: the later delimiters
+    # fall beyond the cut, no rule matches the truncated prefix, and the prefix
+    # is what renders — bounded, but cleartext.  THIS is the residual.
+    huge = "xapp-1-" + "A" * 200_000 + "-1234-" + "B" * 100
+    out = bound_detail(huge)
+    assert len(huge) > REDACT_WINDOW_CHARS, "premise: the token exceeds the window"
+    assert "[REDACTED" not in out, out[:120]
+    assert out.startswith("xapp-1-"), out[:120]
+    assert len(out) <= MAX_DETAIL_CHARS + 1, len(out)
+
+    # (3) The miss is the WINDOW, not a broken rule: scanning the same text
+    # whole redacts it — which is why REDACT_WINDOW_CHARS (not the rule) is the
+    # thing the residual is attributed to.
+    assert redact_secrets(huge)[1].get("slack_token") == 1
+
+
+@pytest.mark.parametrize("name, text", [
+    ("ghp_", "ghp_" + "A" * 200_000),
+    ("github_pat_", "github_pat_" + "A" * 200_000),
+    ("glpat-", "glpat-" + "A" * 200_000),
+    ("sk-ant-", "sk-ant-" + "A" * 200_000),
+    ("AIza", "AIza" + "A" * 200_000),
+    ("xoxb-", "xoxb-" + "A" * 200_000),
+    ("aws_secret_access_key", "aws_secret_access_key=" + "A" * 200_000),
+    ("Authorization: Bearer", "Authorization: Bearer " + "A" * 200_000),
+    ("PEM", "-----BEGIN RSA PRIVATE KEY-----\n" + "A" * 200_000),
+])
+def test_vendor_prefix_rules_fail_closed_at_the_window_edge(name, text):
+    """The OTHER half of ``_REDACT_MARGIN``'s claim, pinned: a VENDOR-PREFIX
+    rule is anchored by its PREFIX, so a window cut at end-of-string leaves the
+    prefix intact and the rule still matches — the token's body may run past the
+    whole window and the rendered bound still shows the MARKER, never the
+    prefix.  This is the safe direction the comment describes, and this test is
+    what keeps it evidence rather than assertion.
+
+    Mutation: de-anchor a vendor rule so it instead needs its trailing delimiter
+    present (the JWT/``xapp-`` shape) — the prefix renders in cleartext and this
+    REDs."""
+    from tortoise.capture_breadcrumb import REDACT_WINDOW_CHARS, bound_detail
+
+    assert len(text) > REDACT_WINDOW_CHARS, "premise: the token exceeds the window"
+    out = bound_detail(text)
+    assert "[REDACTED" in out, (name, out[:120])
+
+
+def test_render_returns_a_newline_terminated_payload():
+    """``render`` returns its four lines TERMINATED by a newline.  The shell
+    capture half strips trailing newlines in ``$(...)`` and re-adds one with
+    ``printf '%s\\n'``, so the terminator is benign END TO END — but it is part
+    of ``render``'s own contract (the payload is a complete final line, not a
+    fragment a caller might concatenate) and nothing pinned it.
+
+    Mutation: return ``"\\n".join(lines)`` without the terminator — this REDs."""
+    from tortoise.capture_breadcrumb import render
+
+    out = render(_capture_failure())
+    assert out.endswith("\n"), repr(out[-40:])
+    assert out.count("\n") == 4, repr(out)
+    assert not out.endswith("\n\n"), repr(out[-4:])
+
+
 @pytest.mark.parametrize("label, raw", [
     ("malformed JSON", b"{not json at all"),
     ("non-UTF-8 bytes", b'{"kind": "capture-failure", "detail": "\xff\xfe"}'),
@@ -842,6 +985,26 @@ def test_render_file_refuses_a_deeply_nested_record(tmp_path):
     path = tmp_path / "crumb.json"
     path.write_text("[" * 200_000, encoding="utf-8")
     assert render_file(path) == ""
+
+
+@pytest.mark.parametrize("raw", [
+    "[]", '["capture-failure"]', '"a string"', "42", "true", "null",
+])
+def test_render_file_refuses_a_non_dict_document(tmp_path, raw):
+    """``render_file``'s docstring says a non-dict document is refused the same
+    way as malformed JSON.  A top-level JSON list/string/number/bool/null is
+    VALID JSON, so it passes ``json.loads`` and reaches ``render`` — where
+    ``.get`` raises.  Without the ``isinstance(data, dict)`` guard that
+    ``AttributeError`` escapes ``render_file`` and breaks the exit-0 contract
+    the hook depends on.
+
+    Mutation: drop the ``isinstance(data, dict)`` guard — this REDs with
+    ``AttributeError`` instead of ``""``."""
+    from tortoise.capture_breadcrumb import render_file
+
+    path = tmp_path / "crumb.json"
+    path.write_text(raw, encoding="utf-8")
+    assert render_file(path) == "", raw
 
 
 def test_a_bom_prefixed_record_is_still_rendered(tmp_path):
@@ -895,6 +1058,62 @@ def test_a_newline_in_a_scalar_cannot_forge_an_extra_payload_line(tmp_path):
     assert len(lines) == 4, proc.stdout
     assert sum(1 for line in lines if line.startswith("next:")) == 1, \
         proc.stdout
+
+
+def test_the_payload_and_the_record_scalars_are_bounded_and_redacted(tmp_path):
+    """``harness`` and ``recorded_at`` arrive in the SAME attacker-influenced
+    JSON record as ``detail``, so they get the SAME redact-then-bound treatment
+    — directly AND end to end through the real hook.  Without it a token planted
+    in either renders in cleartext, and an oversized scalar blows the payload
+    past the ONE four-line shape the agent's context depends on.
+
+    Mutation: interpolate the scalars with whitespace-collapse only (the old
+    ``" ".join(str(value).split())``) — the token survives and the multi-MB
+    line appears, and this REDs."""
+    from tortoise.capture_breadcrumb import MAX_DETAIL_CHARS, one_line, render
+
+    token = "ghp_" + "a" * 36
+
+    # (1) The cap: an oversized scalar is bounded exactly as the detail is.
+    assert len(one_line("A" * 5_000_000)) <= MAX_DETAIL_CHARS + 1
+    # (2) The redaction: a token planted in a scalar cannot render in cleartext.
+    assert token not in one_line("claude " + token), one_line("claude " + token)
+    assert "[REDACTED:github_token]" in one_line(token)
+
+    # (3) End to end through the payload: redacted and bounded, with the ONE
+    # four-line shape intact.
+    out = render({"kind": "capture-failure", "harness": "claude " + token,
+                  "recorded_at": "2026-09-26T00:00:00Z " + token, "detail": "d"})
+    assert token not in out, out
+    assert "[REDACTED:github_token]" in out, out
+    assert len(out.splitlines()) == 4, out
+
+    huge = render({"kind": "capture-failure", "harness": "A" * 5_000_000,
+                   "recorded_at": "t", "detail": "d"})
+    assert len(huge.splitlines()) == 4, huge
+    widest = max(len(line) for line in huge.splitlines())
+    assert widest <= 900, (widest, huge[:120])
+
+    # (4) The same through the REAL shipped hook: the crumb on disk carries the
+    # secret in its scalars and the hook's stdout must not.
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log")
+    _python3_shim(bindir)
+    crumb = _crumb_path(home)
+    crumb.parent.mkdir(parents=True, exist_ok=True)
+    crumb.write_text(json.dumps(_capture_failure(
+        harness="claude " + token,
+        recorded_at="2026-09-26T00:00:00Z " + token), indent=2),
+        encoding="utf-8")
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
+
+    assert proc.returncode == 0, proc.stderr
+    assert token not in proc.stdout, proc.stdout
+    assert "[REDACTED:github_token]" in proc.stdout, proc.stdout
+    assert len(proc.stdout.splitlines()) == 4, proc.stdout
 
 
 def test_the_vendor_phrasing_constraint_is_recorded_in_the_code(tmp_path):
