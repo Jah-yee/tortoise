@@ -561,9 +561,39 @@ wasDerivedFrom
 > Action was dissolved in Ontology v3.0.
 >
 > **Vocabulary-only edges** (valid predicates with zero producers):
-> `reportsTo` (org hierarchy, Subject→Subject), `related` (generic catch-all),
+> `reportsTo` (org hierarchy, Subject→Subject),
 > `dependsOn` (pack-declared — dev:api dependsOn dev:database; used by `list_relations()`
-> for kind expansion). All three remain valid for `create_edge()`.
+> for kind expansion), and `related` — **defined below**. All three remain valid for
+> `create_edge()`.
+>
+> **`related` — the neutral association edge.** `related(A, B)` asserts that A and B
+> are associated, and nothing else. It does not imply, contradict, supersede, or nest,
+> and it is neither aboutness nor provenance. Semantics adopted from the SKOS Reference
+> (W3C Recommendation), which states exactly three commitments for its equivalent:
+>
+>   * **symmetric** — `related(A,B)` means `related(B,A)` (S23: "an instance of
+>     `owl:SymmetricProperty`");
+>   * **NOT transitive** — `related(A,B)` and `related(B,C)` do **not** entail
+>     `related(A,C)` (§8.6.4: "Note that `skos:related` is not a transitive property");
+>   * **disjoint from the hierarchy** — never a substitute for `hasPart` / `memberOf` /
+>     `reportsTo` (§8.6.10: the hierarchical and associative relations are
+>     "fundamentally distinct in nature").
+>
+> **`related` carries no confidence, is not an operator, and no confidence path may read
+> it.** It must never be traversed by factor extraction (`ep.py` reads `IMPL|NAND` only)
+> or by the source-credibility prior path (`_apply_source_inheritance`, which reads
+> `extractedFrom`). A structural link that an evidence path traverses is not neutral —
+> see §8. This is what makes `related` neutral rather than an unlabelled belief edge.
+>
+> **Enforcement status, stated rather than implied:** symmetry, non-transitivity and
+> hierarchy-disjointness are **declared semantics, not machine-enforced** —
+> `_VALID_EDGE_PREDICATES` is a flat frozenset and `create_edge()` checks membership
+> only. Replay and supersede classification: `related` is in **neither**
+> `DERIVABLE_STRUCTURAL_RELS` (so it gets no replay descriptor) **nor**
+> `SUPERSEDE_STRUCTURAL_RELS` (so a supersede does not transfer it — it stays at the old
+> point; pinned by `tests/test_dry_run_preview.py`, "in NO transfer leg"). Per #2489 a
+> predicate's label and its replay key are one unit, so wiring a writer requires
+> revisiting both sets first.
 ```
 
 Epistemic edges (operators): `IMPL`, `NAND` (+ semantic label).
@@ -1074,6 +1104,15 @@ edge attribute.
 | Point↔Point support / contradict (IMPL/NAND) | **Yes** | EP over the IMPL/NAND edge |
 | Any edge needing mitigation (+/− relevance) | **Yes** — mitigations attach to the operator | EP over IMPL/NAND |
 | Structural edge without mitigation (about\*, performs/produces/uses, memberOf/ownedBy, provenance) | **No** — plain edge | confidence edge attribute |
+| `related` — the neutral association edge (§3.9) | **No** — plain edge | **none** — evidence-free by construction; no belief path may read it |
+
+- **Neutral vs structural (#5025):** the row above permits a confidence attribute on a
+  plain structural edge; `related` is the predicate where that is **not** permitted,
+  because its neutrality is the point. "Structural" and "belief-free" are not synonyms
+  in this graph: `extractedFrom` is a structural edge that **does** carry weight, via the
+  Beta prior in `_apply_source_inheritance`; and `ep`'s affected-set BFS is unfiltered on
+  the relation, so a non-`IMPL|NAND` edge onto an operator pulls the far endpoint into
+  the recompute set (#5566). A predicate is neutral only when no read path traverses it.
 
 - **Operator-less propagation:** an IMPL/NAND edge may be direct Point→Point
   (no operator); EP propagates over it the same way.
