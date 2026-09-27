@@ -518,6 +518,11 @@ def test_oauth_quota_fields_no_nameerror():
     # dict, so a finite max_sessions here re-caps every OAuth-authenticated
     # MCP capture. Pin the value, not just the absence of a NameError.
     assert out["max_sessions"] is None
+    # #5331: the byte dimension must be carried here too (absent = not
+    # enforced); a builder that drops it loses a per-org override.
+    assert out["max_storage_bytes"] is None
+    with_cap = oa._quota_fields(cp, {**row, "max_storage_bytes": 4242})
+    assert with_cap["max_storage_bytes"] == 4242
 
 
 def test_unlink_token_never_in_logs(client, monkeypatch, fake, caplog):

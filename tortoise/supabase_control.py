@@ -837,6 +837,14 @@ def resolve_api_key(cp, token: str) -> dict | None:
         # forces the reduced node cap.
         "max_points": (int(lim["max_graph_nodes"]) if anon_override
                        else (int(max_points) if max_points is not None else lim["max_graph_nodes"])),
+        # #5331: byte dimension — anon forces the tier value (mirrors
+        # max_points); otherwise per-org first, pricing tier second, absent
+        # (both None) = NOT ENFORCED. Inert until _QUOTA_SELECT carries it.
+        "max_storage_bytes": (
+            lim.get("max_storage_bytes") if anon_override
+            else (int(org_row["max_storage_bytes"])
+                  if org_row.get("max_storage_bytes") is not None
+                  else lim.get("max_storage_bytes"))),
         # 0006 orgs has no max_api_keys column — pricing resolves it.
         # #4010: sessions are UNLIMITED for every tier; max_sessions has no
         # column either, and no constant supplies one.

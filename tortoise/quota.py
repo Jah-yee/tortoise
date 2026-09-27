@@ -320,10 +320,11 @@ def storage_allowance(limits: dict) -> int | None:
     (hosted_api's several org-dict sites) may omit the key entirely; the tier
     fallback keeps a TIER-level allowance effective on that lane rather than
     silently disabling the dimension. A PER-ORG override is only recoverable
-    from the org row, so a builder that drops it falls back to the tier value —
-    every points-gating builder carries it explicitly for that reason. Absent
-    everywhere → ``None`` → the node cap stays the enforced one. A malformed
-    configured value fails CLOSED (QuotaCheckError), never as a raw ValueError.
+    from the org row, so a builder that drops it falls back to the tier value;
+    the points-gating builders carry it explicitly to preserve per-org
+    overrides. Absent everywhere → ``None`` → the node cap stays the enforced
+    one. A malformed configured value fails CLOSED (QuotaCheckError), never as
+    a raw ValueError.
     """
     per_org = limits.get("max_storage_bytes")
     if per_org is not None:

@@ -287,6 +287,10 @@ surfaces:
   - test_pricing_tiers.py
   - test_provisioning_edge_function.py
   - test_quota.py
+  # #5331: the byte-cap dimension mechanism — dual-registered with `core`,
+  # same quota/api surface as test_quota.py (it exercises the resolver and
+  # the hosted auth-path dict builders).
+  - test_quota_5331_storage_cap.py
   # #4010: the session-cap removal — drives the hosted capture path + the
   # registry resolver, so it belongs with the quota/api surface.
   - test_issue_4010_sessions_unlimited.py
@@ -536,6 +540,7 @@ surfaces:
   # gap is #4454's job, not this registration's; do not read this entry as
   # covering a hand-edited document.
   - test_mcp_rename_table.py
+  - test_quota_5331_storage_cap.py
   - test_rotate_key.py
   # #3981: dual-registered with `api` (the arm that fires on a tortoise/hosted_api.py-only
   # change); this `core` entry is the fallback arm, since core is only added when nothing

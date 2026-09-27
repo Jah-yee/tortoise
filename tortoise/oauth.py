@@ -1364,6 +1364,12 @@ def _quota_fields(cp, org_row: dict) -> dict:
         "max_points": (int(mp)
                        if mp is not None
                        else int(lim["max_graph_nodes"])),
+        # #5331: byte dimension — per-org first, pricing tier second, absent
+        # (both None) = NOT ENFORCED. Inert until the organizations select
+        # carries the column; the tier fallback still applies.
+        "max_storage_bytes": (int(org_row["max_storage_bytes"])
+                              if org_row.get("max_storage_bytes") is not None
+                              else lim.get("max_storage_bytes")),
         "max_api_keys": lim["max_api_keys"],
         # #4010: sessions are unlimited for every tier — no cap of any kind
         # (the pre-#4010 DEFAULT_MAX_SESSIONS fallback is deleted).
