@@ -49,7 +49,7 @@ doc_status: live
 >   `""` remains. Which of the two is intended — an OPEN window start or an ABSENT one — is an
 >   owner decision over temporal semantics, not a predicate alignment, so it is left open and
 >   tracked as **#6140** (deliberately not decided here; it is NOT #3982, which ruled on
->   date-only parsing — a different question, whose own fix is still in review).
+>   date-only parsing — a different question).
 > - Supersedes the v3.13 no-kwarg sentence's scope from "the falsey case" to "the
 >   falsey-and-unorderable case". This entry records only what the code now does.
 >
