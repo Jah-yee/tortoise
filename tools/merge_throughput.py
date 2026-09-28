@@ -825,7 +825,7 @@ def collect_shard_balance():
     push-to-main python-ci run. Never derived from the durations map."""
     try:
         sys.path.insert(0, str(REPO / "tools"))
-        import ci_timing  # noqa: PLC0415
+        import ci_timing
 
         run_id = ci_timing.pick_run(OWNER_REPO)
         if not run_id:
@@ -903,7 +903,7 @@ def collect_durations_map():
     """
     try:
         sys.path.insert(0, str(REPO / "tools"))
-        import ci_selection as cs  # noqa: PLC0415
+        import ci_selection as cs
 
         manifest = cs.load_manifest()
         durations = cs._durations_map(manifest)

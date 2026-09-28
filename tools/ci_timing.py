@@ -371,7 +371,7 @@ def validate_refreshed_manifest(manifest_text: str) -> list[str]:
     import yaml
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import ci_selection as cs  # noqa: PLC0415
+    import ci_selection as cs
 
     manifest = cs._normalize_surfaces(yaml.safe_load(manifest_text))
     return cs.duration_issues(manifest) + cs.duration_coverage_issues(manifest)
