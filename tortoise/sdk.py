@@ -531,10 +531,9 @@ def _session_llm_transcript(conversation: list[dict]) -> tuple[str, int]:
         # #4897: the extraction input is the SAME marked window the node
         # stores — the caller passes `_capture_turn_window`'s output (the
         # windowed, cap-applied conversation), so the marker and its TRUE
-        # pre-redaction
-        # length ride through here untouched. Re-clipping here would recompute
-        # that length from already-scrubbed text (see the CALLER CONTRACT
-        # above) and break #721 parity exactly when the marker matters.
+        # pre-redaction length ride through here untouched. Re-clipping it
+        # would recompute that length from already-scrubbed text (see the
+        # CALLER CONTRACT above) and break #721 parity when the marker matters.
         body = " ".join(content.split())
         sents = [s.group(0).strip() for s in _SENT.finditer(body)]
         sents = [s for s in sents if len(s) >= 3]
