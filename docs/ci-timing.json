@@ -1,4 +1,1252 @@
 {
+  "candidate_flakes": [],
+  "failed_tests": [
+    "tests/test_queue_window_observe.py::test_cli_writes_a_json_record"
+  ],
+  "files": {
+    "test_4314_inert_hooks.py": {
+      "max_ms": 20070.0,
+      "tests": 1,
+      "total_ms": 20070.0
+    },
+    "test_battery_corpus.py": {
+      "max_ms": 9890.0,
+      "tests": 1,
+      "total_ms": 9890.0
+    },
+    "test_battery_setup.py": {
+      "max_ms": 23010.0,
+      "tests": 3,
+      "total_ms": 47770.0
+    },
+    "test_client_surface.py": {
+      "max_ms": 12910.0,
+      "tests": 1,
+      "total_ms": 12910.0
+    },
+    "test_embedded_concurrency.py": {
+      "max_ms": 49890.0,
+      "tests": 7,
+      "total_ms": 131830.0
+    },
+    "test_embedded_lifecycle.py": {
+      "max_ms": 12470.0,
+      "tests": 4,
+      "total_ms": 46590.0
+    },
+    "test_ep_selector.py": {
+      "max_ms": 12110.0,
+      "tests": 1,
+      "total_ms": 12110.0
+    },
+    "test_epic903_scheduler.py": {
+      "max_ms": 9840.0,
+      "tests": 1,
+      "total_ms": 9840.0
+    },
+    "test_event_store.py": {
+      "max_ms": 5780.0,
+      "tests": 2,
+      "total_ms": 7830.0
+    },
+    "test_github_indexer.py": {
+      "max_ms": 24420.0,
+      "tests": 1,
+      "total_ms": 24420.0
+    },
+    "test_graph_diagnostics.py": {
+      "max_ms": 17170.0,
+      "tests": 1,
+      "total_ms": 17170.0
+    },
+    "test_guard.py": {
+      "max_ms": 11160.0,
+      "tests": 1,
+      "total_ms": 11160.0
+    },
+    "test_index_directory.py": {
+      "max_ms": 1930.0,
+      "tests": 4,
+      "total_ms": 5800.0
+    },
+    "test_integration.py": {
+      "max_ms": 472470.0,
+      "tests": 4,
+      "total_ms": 1529460.0
+    },
+    "test_longmem_runner.py": {
+      "max_ms": 16970.0,
+      "tests": 1,
+      "total_ms": 16970.0
+    },
+    "test_markers.py": {
+      "max_ms": 12350.0,
+      "tests": 1,
+      "total_ms": 12350.0
+    },
+    "test_mcp_http.py": {
+      "max_ms": 2150.0,
+      "tests": 3,
+      "total_ms": 4170.0
+    },
+    "test_migrate_db.py": {
+      "max_ms": 10790.0,
+      "tests": 1,
+      "total_ms": 10790.0
+    },
+    "test_onboarding_state_split.py": {
+      "max_ms": 18380.0,
+      "tests": 1,
+      "total_ms": 18380.0
+    },
+    "test_pack_shipping_wheel.py": {
+      "max_ms": 24120.0,
+      "tests": 2,
+      "total_ms": 34410.0
+    },
+    "test_reaper.py": {
+      "max_ms": 11770.0,
+      "tests": 3,
+      "total_ms": 34340.0
+    },
+    "test_run.py": {
+      "max_ms": 137410.0,
+      "tests": 3,
+      "total_ms": 179340.0
+    },
+    "test_search_engine_gaps.py": {
+      "max_ms": 1800.0,
+      "tests": 2,
+      "total_ms": 2820.0
+    },
+    "test_selfhost_rest.py": {
+      "max_ms": 60350.0,
+      "tests": 1,
+      "total_ms": 60350.0
+    },
+    "test_session_verify.py": {
+      "max_ms": 20630.0,
+      "tests": 4,
+      "total_ms": 72160.0
+    },
+    "test_smoke_embedded.py": {
+      "max_ms": 40440.0,
+      "tests": 1,
+      "total_ms": 40440.0
+    },
+    "test_surface_manifest.py": {
+      "max_ms": 10560.0,
+      "tests": 3,
+      "total_ms": 31260.0
+    },
+    "test_why_suite_benchmark.py": {
+      "max_ms": 29360.0,
+      "tests": 1,
+      "total_ms": 29360.0
+    },
+    "test_write_path_benchmark.py": {
+      "max_ms": 152020.0,
+      "tests": 3,
+      "total_ms": 229370.0
+    },
+    "test_write_path_runner.py": {
+      "max_ms": 39340.0,
+      "tests": 3,
+      "total_ms": 117400.0
+    }
+  },
+  "history": [
+    {
+      "branch": "main",
+      "conclusion": "failure",
+      "counts": {
+        "error": 0,
+        "failed": 1,
+        "passed": 18846,
+        "skipped": 111,
+        "xfailed": 4,
+        "xpassed": 0
+      },
+      "created_at": "2026-09-28T00:13:15Z",
+      "event": "push",
+      "failed_tests": [
+        "tests/test_queue_window_observe.py::test_cli_writes_a_json_record"
+      ],
+      "killed": false,
+      "run_id": "36361388386",
+      "sample_time": "2026-09-28T04:50:13Z",
+      "sha": "f520a6575b949e65497a856e548f7573c7f8eba8",
+      "steps_max_job_ms": 2460000,
+      "steps_total_ms": 7813000
+    }
+  ],
+  "log_sources": [
+    {
+      "counts": {
+        "error": 0,
+        "failed": 0,
+        "passed": 41,
+        "skipped": 35,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "error": null,
+      "log": "pytest-d14.log"
+    },
+    {
+      "counts": {
+        "error": 0,
+        "failed": 1,
+        "passed": 8264,
+        "skipped": 23,
+        "xfailed": 3,
+        "xpassed": 0
+      },
+      "error": null,
+      "log": "pytest.log"
+    },
+    {
+      "counts": {
+        "error": 0,
+        "failed": 0,
+        "passed": 8803,
+        "skipped": 46,
+        "xfailed": 1,
+        "xpassed": 0
+      },
+      "error": null,
+      "log": "pytest.log"
+    },
+    {
+      "counts": {
+        "error": 0,
+        "failed": 0,
+        "passed": 985,
+        "skipped": 5,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "error": null,
+      "log": "pytest.log"
+    },
+    {
+      "counts": {
+        "error": 0,
+        "failed": 0,
+        "passed": 2,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "error": null,
+      "log": "pytest.log"
+    },
+    {
+      "counts": {
+        "error": 0,
+        "failed": 0,
+        "passed": 747,
+        "skipped": 2,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "error": null,
+      "log": "pytest.log"
+    },
+    {
+      "counts": {
+        "error": 0,
+        "failed": 0,
+        "passed": 4,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "error": null,
+      "log": "trackb.log"
+    }
+  ],
+  "outcome": {
+    "error": 0,
+    "failed": 1,
+    "killed": false,
+    "passed": 18846,
+    "skipped": 111,
+    "xfailed": 4,
+    "xpassed": 0
+  },
+  "sampled_run": {
+    "conclusion": "failure",
+    "created_at": "2026-09-28T00:13:15Z",
+    "head_sha": "f520a6575b949e65497a856e548f7573c7f8eba8",
+    "run_id": "36361388386",
+    "sample_time": "2026-09-28T04:50:13Z",
+    "selection": "latest completed event=push&branch=main run, exclude_pull_requests=true, cancelled skipped"
+  },
   "schema_version": 1,
-  "history": []
+  "steps": {
+    "canary-streak": [
+      {
+        "conclusion": "success",
+        "duration_ms": 2000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 4000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Download half-b artifacts (the P1-7 canary contract)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 2000,
+        "name": "Download previous streak artifact (chain continuity)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Classify run + update the canary streak (epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Upload canary streak artifact"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post canary-streak summary"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "changes": [
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 10000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Tiered selection"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Emit push matrix (#1472)"
+      },
+      {
+        "conclusion": "skipped",
+        "duration_ms": 0,
+        "name": "Tier-2 duration split (#1473)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Secrets scan (evidence artifacts,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "manifest-integrity": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 5000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Install pyyaml"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Manifest integrity (drift gate, #1262)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "packs-compile": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 4000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 26000,
+        "name": "Install package"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Whole-registry compile (all packs, zero validation errors)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "python-ci-gate": [
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "failure",
+        "duration_ms": 0,
+        "name": "Aggregate matrix result"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "surface-guard": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 5000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 27000,
+        "name": "Install"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Pin the gate's tooling to the base ref"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 2000,
+        "name": "The surface cannot expand without an explicit human decision"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 11000,
+        "name": "The ordering lint (AC13)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "The list is generated from the manifest and cannot drift from it"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "test (a)": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 11000,
+        "name": "Initialize containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 4000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-node@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 128000,
+        "name": "Install package + test extras"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Clean stale redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 3000,
+        "name": "Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 8000,
+        "name": "Embedding model REQUIRED (BAAI/bge-small-en-v1.5) \u2014 dense retrieval leg"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Compute docker URI (epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 94000,
+        "name": "Generate coverage manifest (expected nodeids, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Canary producer (epic"
+      },
+      {
+        "conclusion": "failure",
+        "duration_ms": 2207000,
+        "name": "Run fast test suite (slow files run in the test-slow job)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 2000,
+        "name": "Upload pytest log (measurement artifact,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Skip-fail guard: live-FalkorDB tests must run, never skip (#1436)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Dump redislite-hygiene end-sweep decision (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Assert no redislite orphans (issue"
+      },
+      {
+        "conclusion": "skipped",
+        "duration_ms": 0,
+        "name": "Post Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "skipped",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-node@v4"
+      },
+      {
+        "conclusion": "skipped",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Stop containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "test (b)": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 12000,
+        "name": "Initialize containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 5000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-node@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 108000,
+        "name": "Install package + test extras"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Clean stale redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 2000,
+        "name": "Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 6000,
+        "name": "Embedding model REQUIRED (BAAI/bge-small-en-v1.5) \u2014 dense retrieval leg"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Compute docker URI (epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 61000,
+        "name": "Generate coverage manifest (expected nodeids, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Canary producer (epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1338000,
+        "name": "Run fast test suite (slow files run in the test-slow job)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Upload pytest log (measurement artifact,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Skip-fail guard: live-FalkorDB tests must run, never skip (#1436)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Dump redislite-hygiene end-sweep decision (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Assert no redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Post Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-node@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Stop containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "test-carve-out": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 4000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 98000,
+        "name": "Install package + test extras"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Clean stale redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 14000,
+        "name": "Generate coverage manifest (carve-out \u2014 expected nodeids, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 937000,
+        "name": "Run carve-out suite (embedded, URI unset \u2014 E2E-4)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Skip-fail guard (carve-out, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Assert no redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Upload carve-out log (measurement artifact,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "test-concurrency-falkor": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 18000,
+        "name": "Initialize containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 5000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 126000,
+        "name": "Install package + test extras"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Clean stale redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 2000,
+        "name": "Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 7000,
+        "name": "Embedding model REQUIRED (BAAI/bge-small-en-v1.5) \u2014 dense retrieval leg"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 26000,
+        "name": "Run live concurrency tests (real FalkorDB sidecar)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Upload pytest log (measurement artifact,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Validate docker-compose.yml (ports + header edits)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Docs-consistency guard (embedded must never be \"default\" again)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Stop containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "test-d14-hosted-api": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 4000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 111000,
+        "name": "Install package + test extras"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 107000,
+        "name": "Run the embedded_only marker selection (URI unset \u2014"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Upload D14 log (measurement artifact,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Complete job"
+      }
+    ],
+    "test-slow (a)": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 9000,
+        "name": "Initialize containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 5000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 99000,
+        "name": "Install package + test extras"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Clean stale redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 7000,
+        "name": "Embedding model REQUIRED (BAAI/bge-small-en-v1.5) \u2014 dense retrieval leg"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Drift guard \u2014 legs cover slow_files minus carve-out (#1471)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Compute docker URI (epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 9000,
+        "name": "Generate coverage manifest (slow legs \u2014 expected nodeids, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 285000,
+        "name": "Run slow test suite \u2014 leg a (known-slow files,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Skip-fail guard (slow legs, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Assert no redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Upload pytest log (measurement artifact,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Stop containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "test-slow (b)": [
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 13000,
+        "name": "Initialize containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 4000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 100000,
+        "name": "Install package + test extras"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Clean stale redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 7000,
+        "name": "Embedding model REQUIRED (BAAI/bge-small-en-v1.5) \u2014 dense retrieval leg"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Drift guard \u2014 legs cover slow_files minus carve-out (#1471)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Compute docker URI (epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 8000,
+        "name": "Generate coverage manifest (slow legs \u2014 expected nodeids, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1637000,
+        "name": "Run slow test suite \u2014 leg b (known-slow files,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Skip-fail guard (slow legs, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Assert no redislite orphans (issue"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Upload pytest log (measurement artifact,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Cache HF embedding model (BAAI/bge-small-en-v1.5)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Stop containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ],
+    "test-track-b": [
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Set up job"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 11000,
+        "name": "Initialize containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 5000,
+        "name": "Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 2000,
+        "name": "Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 23000,
+        "name": "Install"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 2000,
+        "name": "Generate coverage manifest (track-b, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 5000,
+        "name": "Run Track B tests (explicit marker)"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Skip-fail guard (track-b, epic"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Upload track-b log (measurement artifact,"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/setup-python@v5"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Post Run actions/checkout@v4"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 1000,
+        "name": "Stop containers"
+      },
+      {
+        "conclusion": "success",
+        "duration_ms": 0,
+        "name": "Complete job"
+      }
+    ]
+  }
 }
