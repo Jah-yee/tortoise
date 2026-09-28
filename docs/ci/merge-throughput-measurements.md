@@ -177,10 +177,11 @@ grep -aoE "[0-9]+ passed[^=]* in [0-9.]+s" a.raw   # pytest session banner
 grep -aoE "pytest exit code: [0-9]+"        b.raw
 grep -ac  "stopping after"                  b.raw   # 0 ⇒ --maxfail not hit
 
-# 4. Duration-map weights per half (consumes ci_selection.py, never a second packer)
+# 4. Duration-map weights per SHARD (consumes ci_selection.py, never a second packer)
+#    #6135: push_legs returns N shards under `shards`, not half_a/half_b.
 python3 -c "import sys; sys.path.insert(0,'tools'); import ci_selection as c; \
 m=c.load_manifest(); l=c.push_legs(m); d=c._durations_map(m); \
-print({h: round(sum(c._duration_weight(d.get(f if f.endswith('.py') else f+'.py')) for f in l[h])/60, 2) for h in ('half_a','half_b')})"
+print({s['name']: round(sum(c._duration_weight(d.get(f if f.endswith('.py') else f+'.py')) for f in s['files'])/60, 2) for s in l['shards']})"
 ```
 
 ---

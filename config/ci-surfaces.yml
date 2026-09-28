@@ -1,4 +1,26 @@
 version: 1
+
+# #6135: how many parallel shards the fast pool (`test`) is split into. The PR
+# gate's critical path IS `max(shard)`, so this single number decides it.
+#
+# WHY A REVIEWED LITERAL (and not derived from `durations` per diff): the shard
+# set IS the required-check name set (`test (a)`, `test (b)`, …). The merge
+# rail's lane-parity subtracts the PR's job names from main's, and branch
+# protection / the Mergify queue name `python-ci-gate` — so a set that drifted
+# per diff would change an unreviewed contract run to run. Raising S here is a
+# one-line, reviewable change; the labels are positional letters so an S-adding
+# diff stays a SUPERSET of main's names (a rename would refuse every merge).
+#
+# The value: LPT over the `durations` map puts max(shard) at 6.6 min of test
+# time at S=9 (29.6 min at S=2), and the measured per-shard fixed cost is
+# ~3.4 min, so T ≈ 10.0 min — the epic's goal. S>11 buys nothing: the largest
+# single fast file (`test_onboarding_state_split.py`, 310.7 s) saturates
+# max(shard) at ~5.2 min, which is #6133's floor expressed as a number. Raising
+# this trades WALL CLOCK for AGGREGATE runner time (~66 → ~90 min at S=9, the
+# same self-hosted capacity the epic is trying to enlarge), so it is a
+# wall-clock lever, not a free win.
+fast_shards: 9
+
 surfaces:
   api:
   - test_1162_add_operator_local_svbp.py
