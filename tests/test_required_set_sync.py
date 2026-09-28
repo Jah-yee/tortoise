@@ -200,6 +200,58 @@ def test_run_flags_a_stale_mirror_end_to_end(guard, tmp_guard_env, monkeypatch):
 # ── the mirror must speak for `main` ───────────────────────────────────────
 
 
+def test_run_flags_an_unproducible_merge_condition_end_to_end(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: `run()` must call `check_deadlock` for the MERGE bucket.
+
+    The deadlock this guard exists to prevent is the MERGE one — a
+    `merge_conditions` name the queue branch never reports. Pinning only the
+    entry bucket left this call droppable with a green suite.
+    """
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha"])
+    _write_workflow(guard, "push.yml", "push", ["beta"])  # beta: push-only
+    _write_minimal_gate(guard, needs=["alpha"], legs=["alpha"])
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("DEADLOCK" in v for v in violations), violations
+
+
+def test_run_flags_an_unaccounted_required_check_end_to_end(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: `run()` must call `check_partition`."""
+    _write_minimal_mergify(guard, ["alpha", "ghost"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "ghost", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("unaccounted" in v for v in violations), violations
+
+
+def test_run_flags_a_strict_mismatch_on_the_live_path(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: `run(live=True)` must call `check_declared_strict`.
+
+    Offline `live_strict` is None, so that call is a NO-OP there — only a live
+    run can pin it. The real live and mirror values are both `false`, so the
+    `--live` test on the real tree cannot pin it either.
+    """
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        strict: true\n"
+        "        contexts:\n          - alpha\n          - beta\n")
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    monkeypatch.setattr(guard, "read_live_protection", lambda: ({"alpha", "beta"}, False))
+    code, violations, _ = guard.run(live=True)
+    assert code == 1, violations
+    assert any("#4764" in v for v in violations), violations
+
+
 def test_run_flags_a_mirror_that_also_speaks_for_another_branch(guard, tmp_guard_env, monkeypatch):
     """COMPOSITION: `run()` must call `check_settings_branches`.
 
@@ -253,6 +305,54 @@ def test_an_entry_without_a_branch_is_not_treated_as_main(guard, tmp_guard_env):
         "        contexts:\n          - docs\n")
     assert guard.declared_settings_contexts() == set()
     assert guard.declared_settings_off_main() == ["<missing branch>"]
+
+
+def test_declared_settings_strict_reads_only_the_main_entry(guard, tmp_guard_env):
+    """The reader must pick the `main` entry's `strict`, not a sibling's."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n"
+        "    - branch: develop\n      required_status_checks:\n        strict: true\n"
+        "    - branch: main\n      required_status_checks:\n        strict: false\n")
+    assert guard.declared_settings_strict() is False
+    guard.SETTINGS_PATH.write_text("repository:\n  branch-protection: []\n")
+    assert guard.declared_settings_strict() is None
+
+
+@pytest.mark.parametrize("body", [
+    "repository:\n  branch-protection: []\n",
+    "repository:\n  branch-protection:\n",
+    "repository:\n  branch-protection:\n    - branch: develop\n",
+])
+def test_a_present_but_empty_declaration_is_a_violation_not_a_pass(guard, tmp_guard_env, body):
+    """Present-but-empty is NOT "the mirror does not exist".
+
+    Returning None here would skip `check_settings` entirely — a fail-open in the
+    one place that exists to fail closed.
+    """
+    guard.SETTINGS_PATH.write_text(body)
+    contexts = guard.declared_settings_contexts()
+    assert contexts is not None, "present-but-empty must not read as 'absent'"
+    assert contexts == set()
+    assert guard.check_settings(contexts, {"alpha"}) != []
+
+
+def test_a_misshaped_declaration_cannot_be_measured(guard, tmp_guard_env):
+    """A mapping where a list belongs is exit 2, not a silent pass."""
+    guard.SETTINGS_PATH.write_text("repository:\n  branch-protection:\n    branch: main\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_off_main()
+
+
+def test_an_off_main_entry_declaring_only_strict_is_still_mis_filed(guard, tmp_guard_env):
+    """Off-main `strict` with no `contexts:` is still a mis-filed mirror."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n"
+        "    - branch: main\n      required_status_checks:\n        strict: false\n"
+        "        contexts:\n          - alpha\n"
+        "    - branch: develop\n      required_status_checks:\n        strict: true\n")
+    assert guard.declared_settings_off_main() == ["develop"]
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):

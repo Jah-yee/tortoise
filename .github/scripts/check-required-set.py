@@ -278,20 +278,53 @@ def producible_on_pull_request(workflows_dir: Path | None = None) -> set[str]:
     return names
 
 
-def _settings_entries(path: Path | None) -> list[dict[str, Any]]:
-    """The `repository.branch-protection` entries, or [] when the file declares none."""
+_KEY_ABSENT = object()
+
+
+def _raw_settings_entries(path: Path | None) -> Any:
+    """The `repository.branch-protection` VALUE, or `_KEY_ABSENT` if the key is absent.
+
+    The distinction matters and is load-bearing. "The key is absent" means the
+    mirror does not exist (not a violation). "The key is present but declares
+    nothing" is a real defect and must reach `check_settings` as an EMPTY set,
+    not as None — otherwise an emptied declaration passes vacuously, which is a
+    fail-open in the one place this guard exists to fail closed.
+    """
     path = path or SETTINGS_PATH
     if not path.exists():
-        return []
+        return _KEY_ABSENT
     try:
         doc = read_yaml(path)
     except yaml.YAMLError as exc:
         raise CannotMeasure(f"{path} unparsable: {exc}") from exc
-    try:
-        entries = doc["repository"]["branch-protection"]
-    except (KeyError, TypeError):
+    if not isinstance(doc, dict):
+        raise CannotMeasure(f"{path}: top level is not a mapping")
+    repository = doc.get("repository")
+    if not isinstance(repository, dict) or "branch-protection" not in repository:
+        return _KEY_ABSENT
+    return repository["branch-protection"]
+
+
+def _settings_entries(path: Path | None) -> list[dict[str, Any]]:
+    """The `repository.branch-protection` entries; [] when the key is absent.
+
+    A present key that is not a list of mappings is UNUSABLE, not empty: it exits
+    2 rather than quietly yielding no entries (a dict here used to raise
+    AttributeError, i.e. a non-zero exit — that must not silently become a pass).
+    """
+    raw = _raw_settings_entries(path)
+    if raw is _KEY_ABSENT or raw is None:
         return []
-    return [e for e in (entries or []) if isinstance(e, dict)]
+    if not isinstance(raw, list):
+        raise CannotMeasure(
+            f"{path or SETTINGS_PATH}: repository.branch-protection must be a list, "
+            f"got {type(raw).__name__} — cannot measure")
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise CannotMeasure(
+                f"{path or SETTINGS_PATH}: branch-protection entries must be mappings, "
+                f"got {type(entry).__name__} — cannot measure")
+    return raw
 
 
 def _is_main(entry: dict[str, Any]) -> bool:
@@ -300,7 +333,7 @@ def _is_main(entry: dict[str, Any]) -> bool:
 
 
 def declared_settings_contexts(path: Path | None = None) -> set[str] | None:
-    """Contexts declared for `main` by `.github/settings.yml`, or None when none.
+    """Contexts declared for `main` by `.github/settings.yml`, or None if the mirror is absent.
 
     Note the file is INERT: probot-settings reads top-level `branches:`, while
     this file nests under `repository: -> branch-protection:`. That is precisely
@@ -310,20 +343,23 @@ def declared_settings_contexts(path: Path | None = None) -> set[str] | None:
     Only `branch: main` entries count. Unioning every entry would let the mirror
     declare the RIGHT six contexts for the WRONG branch — the exact mis-filing
     this guard exists to catch — and still pass.
+
+    Returns an EMPTY SET (not None) when the key is present but declares no main
+    contexts, so `check_settings` flags it instead of skipping it.
     """
+    if _raw_settings_entries(path) is _KEY_ABSENT:
+        return None
     contexts: set[str] = set()
     for entry in _settings_entries(path):
         if not _is_main(entry):
             continue
         rsc = entry.get("required_status_checks") or {}
         contexts |= {str(c) for c in (rsc.get("contexts") or [])}
-    if not contexts and not _settings_entries(path):
-        return None
     return contexts
 
 
 def declared_settings_off_main(path: Path | None = None) -> list[str]:
-    """Branches other than `main` that the mirror declares contexts for."""
+    """Branches other than `main` the mirror declares contexts or `strict` for."""
     off: list[str] = []
     for entry in _settings_entries(path):
         if _is_main(entry):
