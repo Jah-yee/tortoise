@@ -755,7 +755,8 @@ def test_refresh_durations_on_the_real_manifest_of_record() -> None:
     """
     manifest_path = REPO_ROOT / "config" / "ci-surfaces.yml"
     before = manifest_path.read_text()
-    _block, before_entries = ci_timing._locate_durations_block(before.split("\n"))
+    before_lines = before.split("\n")
+    _block, before_entries = ci_timing._locate_durations_block(before_lines)
     assert before_entries, "the durations block must exist in the manifest of record"
     # The OLD frozen literal's real function was not the number: it was an
     # INDEPENDENT check that the parse is COMPLETE. Both sides of the comparison
@@ -765,16 +766,30 @@ def test_refresh_durations_on_the_real_manifest_of_record() -> None:
     # is the second implementation that restores that anchor without re-freezing
     # a total, so a growing map is still no reason to red the lane (#6143).
     assert set(before_entries) == set(yaml.safe_load(before)["durations"])
+    # A key set alone is not enough: `render_refreshed_manifest` WRITES at
+    # `lines[entries[key]]`, so an index that is wrong for any key other than the
+    # one resampled below overwrites the wrong duration line in the real manifest
+    # and nothing here would notice — measured: a helper returning the correct
+    # keys with shifted indices passed all 35 tests in this file. Round-trip every
+    # index back through the same regex that produced it.
+    for key, index in before_entries.items():
+        assert ci_timing._DURATION_LINE_RE.match(before_lines[index]).group("key") == key
     new_text, stats = ci_timing.render_refreshed_manifest(
         before, {"test_bridge_table.py": 123.4}, "2026-09-28T00:00:00Z")
     assert stats["sampled_keys"] == 1
     # The property the frozen total was a proxy for, checked on the OUTPUT: the
-    # refresh invents and drops no key. Comparing the emitted key set against the
-    # input's is not tautological (they are different texts); asserting a literal
-    # total was, and it re-reddened the lane every time the map legitimately grew.
-    _block2, after_entries = ci_timing._locate_durations_block(new_text.split("\n"))
+    # refresh invents and drops no key. This is not tautological with respect to
+    # the RENDER step — render can drop or rename a key while the parse it is
+    # compared against stays intact — but it IS blind to a defect inside
+    # `_locate_durations_block` itself, which is why the PyYAML anchors around it
+    # are load-bearing and must NOT be deleted as redundant (that is the exact
+    # regression a review already found here once).
+    after_lines = new_text.split("\n")
+    _block2, after_entries = ci_timing._locate_durations_block(after_lines)
     assert set(after_entries) == set(before_entries)
     assert set(after_entries) == set(yaml.safe_load(new_text)["durations"])
+    for key, index in after_entries.items():
+        assert ci_timing._DURATION_LINE_RE.match(after_lines[index]).group("key") == key
     assert stats["manifest_keys"] == stats["carried_forward"] + stats["sampled_keys"]
     assert "  test_bridge_table.py: 123.4" in new_text
     assert "# #3395: per-file CI wall time" in new_text
