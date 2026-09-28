@@ -3714,6 +3714,12 @@ def _probe_db() -> dict:
     #669: NEVER probe the registry namespace — FalkorDB auto-creates the
     graph on select, so a registry-namespaced probe RECREATES a deleted
     registry_control_plane on every health check.
+
+    ``db["latency_ms"]`` is UNCHANGED by the move: ``probe_db`` subtracts the
+    acquisition phase's own elapsed time, so this coordinator reports the SAME
+    probe latency it did before #3446 (when it acquired the handle itself and
+    the probe clock started afterwards) instead of silently inflating it by up
+    to ``PROBE_SDK_ACQUISITION_BUDGET`` (2.0s) on a cold acquisition.
     """
     from tortoise.monitoring import probe_db
     # #4608: the episode spans the handle fetch AND the query, so a reset or a

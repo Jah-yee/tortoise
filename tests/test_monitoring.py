@@ -771,6 +771,57 @@ class TestProbeDbBoundedAcquisition:
         assert timed_out["ok"] is False
         assert timed_out["latency_ms"] == 0.0, timed_out
 
+    def test_latency_ms_excludes_the_acquisition_phase(self):
+        """``latency_ms`` keeps its pre-#3446 meaning: the PROBE, not the call.
+
+        Before #3446 BOTH coordinators acquired the SDK themselves and then
+        called ``probe_db(sdk)``, so the reported latency started AFTER the
+        acquisition. Now that ``acquire=`` runs the phase INSIDE ``probe_db``,
+        subtracting its elapsed time is what keeps an ``acquire=`` caller and
+        an equivalent ``sdk=`` caller reporting the same number — otherwise a
+        cold embedded acquisition (up to ``PROBE_SDK_ACQUISITION_BUDGET``,
+        and the deadline binds on essentially every cold acquisition there)
+        would add ~2s to every chart of ``db.latency_ms``.
+
+        Measured shape (review, PR #5609): a 300ms acquisition reported
+        ``latency_ms=309.1`` before this exclusion, against ``1.6`` for the
+        equivalent ``sdk=`` shape.
+
+        LOAD-BEARING (mutation: drop ``- acquisition_elapsed`` from the return):
+        the acquisition's ~0.5s is charged to the probe and the ``< 250``
+        assertion below reds.
+        """
+        # A leftover abandoned acquisition from an earlier test in this class
+        # must not share the single probe slot and be charged to this probe.
+        monitoring._reset_probe_worker()
+
+        acquisition = {"elapsed": 0.0}
+
+        def slow_acquire():
+            began = time.monotonic()
+            time.sleep(0.5)  # unmistakably inside the 2.0s budget
+            acquisition["elapsed"] = time.monotonic() - began
+            return FakeSDK(db_ok=True)
+
+        acquired = monitoring.probe_db(acquire=slow_acquire)
+        assert acquired["ok"] is True, acquired
+        # The acquisition really did take the time: the exclusion below is
+        # observable, not a rounding artifact.
+        assert acquisition["elapsed"] >= 0.5, acquisition
+        assert acquired["latency_ms"] < 250, (
+            f"the acquire= shape reported latency_ms={acquired['latency_ms']} "
+            f"while its acquisition alone took {acquisition['elapsed']:.3f}s — "
+            "the reported field must keep meaning PROBE latency (pre-#3446 "
+            "semantics), not silently absorb the acquisition phase (#3446 "
+            "review)"
+        )
+
+        # The equivalent sdk= shape reports the same order: the acquisition's
+        # cost belongs to NEITHER.
+        supplied = monitoring.probe_db(FakeSDK(db_ok=True))
+        assert supplied["ok"] is True, supplied
+        assert supplied["latency_ms"] < 250, supplied
+
     def test_queued_acquisition_names_the_wait_not_an_overrun(self):
         """An acquisition that never STARTED must not read as one that ran.
 
@@ -838,14 +889,15 @@ class TestProbeDbBoundedAcquisition:
 
         A bound that is a sum over three constants is only a bound if
         ``probe_db`` can enter no other phase. The tests that pin the
-        derivation recompute CONSTANTS, so they cannot see a phase added to
-        ``probe_db``. One test in this file counts submissions
-        (``test_combined_budget_exhausted_in_setup_never_submits_the_query``),
-        but on the SETUP early-return path, which never reaches the call below.
-        The path this test takes — a non-retrying successful call, entering
-        each declared phase exactly once, which is the tight case for a
-        per-phase sum — was the one premise of the proof that prose alone held
-        up.
+        derivation recompute CONSTANTS (the derivation lock is
+        ``tests/test_health_ready_nonblocking.py``), so they cannot see a phase
+        added to ``probe_db``. One other test in this file also counts
+        submissions, but it asserts a literal ``1`` on the SETUP early-return
+        path, where the query is never submitted — it does not pin the path
+        this test takes. What this test pins is the case in which the
+        submission count equals the size of the phase SET: a non-retrying
+        successful call entering each declared phase exactly once. That was the
+        one premise of the proof that prose alone held up.
 
         The load-bearing half is the SUBMISSION COUNT, not the recorded tuple:
         ``_PROBE_LAST_PHASES`` is self-reported by ``probe_db`` from a
@@ -855,25 +907,25 @@ class TestProbeDbBoundedAcquisition:
         ``_probe_worker`` cannot be fooled that way.
 
         SCOPE of that count, stated because it is narrower than "any fourth
-        phase": it is taken on a NON-RETRYING successful call, which enters
-        each declared phase exactly once. A fourth phase that bounds its wait
-        on the shared probe worker on THIS path raises the count to 4, whether
-        or not anyone named it. A phase reachable only on another branch — the
-        transient-retry path, or a branch gated on ``setup_timeout`` — would
-        submit more waits without being counted here, so it must still be added
-        to the derivation by hand. (The retry re-enters only the two probe
-        phases — the acquisition is one-shot, taken once at the top of
-        ``probe_db`` and never re-entered by the retry branch, which
-        ``test_acquisition_is_one_phase_even_when_the_probe_retries`` pins —
-        so retrying adds submissions without changing the SET. That is why the
-        derivation sums the SET and not a global submission total: a total
-        would double-count the retry, and the retry is not a phase.)
+        phase": the ``len(declared)`` equality holds on a NON-RETRYING
+        successful call, which enters each declared phase exactly once. A fourth
+        phase that bounds its wait on the shared probe worker on THIS path
+        raises the count to 4, whether or not anyone named it. The transient
+        retry is the one other branch that submits bounded waits, and its
+        composition is pinned separately below. A phase added on any OTHER
+        branch — one gated on ``setup_timeout``, say — would submit more waits
+        without being counted here, so it must still be added to the derivation
+        by hand. That is also why the derivation sums the SET and not a global
+        submission total: a total would charge the retry's re-entry as if it
+        were new phases.
 
         LOAD-BEARING (mutation: insert a new bounded phase in ``probe_db`` —
         e.g. ``_acquire_on_probe_worker(lambda: None, 0.5)`` right before
         ``_probe_once`` — WITHOUT appending its name): ``submits`` becomes 4
         and this reds. The record assertions alone would NOT have caught that
-        — which is why the count is here.
+        — which is why the count is here. The retry delta at the end reds on a
+        bounded wait added on the RETRY branch, which the ``len(declared)``
+        equality cannot see.
         """
         declared = monitoring._PROBE_ENFORCED_PHASES
         assert declared == ("sdk_acquisition", "projection_setup",
@@ -913,6 +965,26 @@ class TestProbeDbBoundedAcquisition:
         assert submits["n"] - before == len(declared) - 1, (
             "the ``sdk=`` shape must submit one bounded wait FEWER (there is "
             "no acquisition phase — the caller acquired the handle)"
+        )
+
+        # The #1565 retry is the ONE other branch that submits bounded waits.
+        # Pin its composition too, or a phase added there would inflate the
+        # real inner total while every assertion above stayed green.
+        before_retry = submits["n"]
+        retried = monitoring.probe_db(
+            acquire=lambda: TransientOnceSDK({"probe": 0}))
+        assert retried["ok"] is True, retried
+        assert declared == monitoring._PROBE_LAST_PHASES, (
+            f"the transient retry entered {monitoring._PROBE_LAST_PHASES!r} — "
+            "it must ride the SAME phases rather than add one (#3446)"
+        )
+        # 1 acquisition + the first attempt's setup (its transient connect
+        # failure returned before the query) + the retry's two probe phases.
+        assert submits["n"] - before_retry == len(declared) + 1, (
+            "the transient retry must submit the acquisition once, the first "
+            "attempt's setup, and the retry's two phases — an extra bounded "
+            "wait on the retry branch would make the outer bound an "
+            "under-estimate (#3446)"
         )
 
 

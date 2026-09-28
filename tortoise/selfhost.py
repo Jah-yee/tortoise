@@ -402,6 +402,12 @@ def _probe_db() -> dict:
     prefix running on this coordinator's thread — which is what makes
     ``_liveness_probe_hard_timeout()`` a bound over ENFORCED deadlines.
 
+    ``db["latency_ms"]`` is UNCHANGED by the move: ``probe_db`` subtracts the
+    acquisition phase's own elapsed time, so this coordinator reports the SAME
+    probe latency it did before #3446 (when it acquired the handle itself and
+    the probe clock started afterwards) instead of silently inflating it by up
+    to ``PROBE_SDK_ACQUISITION_BUDGET`` (2.0s) on a cold acquisition.
+
     The allowance is resolved HERE, at call time, for the same reason
     ``probe_setup_timeout`` is a function: ``mcp_server._load_dotenv()`` runs
     after the monitoring module is imported, so an import-time read would

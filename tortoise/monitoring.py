@@ -255,8 +255,8 @@ PROBE_STALE_AFTER = 30.0
 # ...and it does not cover the phase SET: the sum is over the acquisition, the
 # projection setup and the reachability query. That set is declared in
 # ``_PROBE_ENFORCED_PHASES``, and a test COUNTS the bounded waits ``probe_db``
-# submits to ``_probe_worker`` on its non-retrying path — so a FOURTH phase
-# that bounds its wait there is caught instead of silently turning this
+# submits to ``_probe_worker`` on its non-retrying SUCCESSFUL path — so a FOURTH
+# phase that bounds its wait there is caught instead of silently turning this
 # derivation into an under-estimate. A phase bounded somewhere ELSE, or
 # reachable only on a branch that test does not exercise, is still invisible:
 # add it to this derivation by hand.
@@ -1791,8 +1791,23 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
     The retry clock starts AFTER the acquisition (#3446 review): the
     acquisition has its OWN deadline, so charging its elapsed time to the
     probe's ``total_budget`` would let a slow-but-in-budget acquisition eat the
-    retry window and report a reachable graph degraded. ``latency_ms`` still
-    measures from function entry.
+    retry window and report a reachable graph degraded.
+
+    ``latency_ms`` EXCLUDES the acquisition phase. That is a deliberate
+    continuity contract, not an oversight: before #3446 BOTH coordinators
+    acquired the SDK themselves and then called ``probe_db(sdk)``, so the
+    reported latency never contained the acquisition. Now that ``acquire=``
+    runs it inside this function, the phase's own elapsed time is SUBTRACTED so
+    an ``acquire=`` caller and an equivalent ``sdk=`` caller report the same
+    probe latency. Without the subtraction a successful COLD acquisition — up
+    to ``PROBE_SDK_ACQUISITION_BUDGET`` on the embedded lane, where the
+    deadline binds on essentially every cold acquisition — would silently
+    inflate ``latency_ms`` by ~2 s for every reader of ``metrics()`` / the
+    ``/health`` payload, changing the field's meaning one step away from the
+    caller that can still see the acquisition. The acquisition-failure returns
+    below already report the pre-#3446 ``0.0`` for the same reason; this keeps
+    the SUCCESS path continuous too. Pinned by
+    ``test_latency_ms_excludes_the_acquisition_phase``.
 
     #3446 — ``acquire``: the SDK handle may be handed in either way. ``sdk``
     is the historical shape, where the CALLER acquired it and therefore owns
@@ -1894,6 +1909,10 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
     global _PROBE_LAST_PHASES
     start = time.monotonic()
     phases_entered: list[str] = []
+    # The acquisition phase's OWN elapsed time, subtracted from ``latency_ms``
+    # at the return below so the field keeps meaning "probe latency" for the
+    # ``acquire=`` shape exactly as it did for the pre-#3446 ``sdk=`` shape.
+    acquisition_elapsed = 0.0
     if acquire is not None:
         if sdk is not None:
             raise ValueError(
@@ -1906,6 +1925,7 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
                 "probe_db's acquire must be a zero-arg callable, got "
                 f"{type(acquire).__name__}")
         phases_entered.append("sdk_acquisition")
+        acquisition_start = time.monotonic()
         try:
             # May raise: an acquisition callable that itself fails is classified
             # here so this function keeps its never-raise contract for the DB.
@@ -1921,6 +1941,7 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
         if acquire_error is not None:
             _PROBE_LAST_PHASES = tuple(phases_entered)
             return {"ok": False, "latency_ms": 0.0, "error": acquire_error}
+        acquisition_elapsed = time.monotonic() - acquisition_start
         if sdk is None:
             # A callable that RETURNED a falsy handle is a malformed CALL too:
             # classifying it as a DB error reports a downstream AttributeError
@@ -1942,8 +1963,7 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
     # retry window: for the platform shape ``total_budget`` is ``PROBE_TIMEOUT``
     # (1.5s) while the acquisition's budget is 2.0s, so an acquisition slower
     # than ~1.4s SUPPRESSED the transient retry outright and reported a
-    # reachable graph degraded. ``start`` (function entry) is still what
-    # ``latency_ms`` measures.
+    # reachable graph degraded.
     probe_start = time.monotonic()
     ok, error, transient = _probe_once(sdk, setup_timeout=setup_timeout)
     phases_entered += ["projection_setup", "reachability_query"]
@@ -1971,7 +1991,12 @@ def probe_db(sdk=None, setup_timeout=None, *, acquire=None) -> dict:
             # cover the 0 < remaining < cold-start window (#3143 review).
     return {
         "ok": ok,
-        "latency_ms": round((time.monotonic() - start) * 1000, 1),
+        # ``latency_ms`` measures the PROBE, not the whole call: the
+        # acquisition phase's elapsed time is subtracted so the ``acquire=``
+        # shape reports what the pre-#3446 ``sdk=`` shape reported (see the
+        # docstring). For the ``sdk=`` shape ``acquisition_elapsed`` is 0.0.
+        "latency_ms": round(
+            (time.monotonic() - start - acquisition_elapsed) * 1000, 1),
         "error": error,
     }
 
