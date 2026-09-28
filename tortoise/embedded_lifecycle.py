@@ -2885,10 +2885,8 @@ class _RedisliteGuardInstaller:
 
         def exec_module(module):
             original_exec_module(module)
-            try:
+            with contextlib.suppress(Exception):  # pragma: no cover - a patch must never break an import
                 install_redislite_guards()
-            except Exception:  # pragma: no cover - a patch must never break an import
-                pass
 
         spec.loader.exec_module = exec_module
         return spec
