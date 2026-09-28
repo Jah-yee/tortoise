@@ -426,9 +426,11 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # anchored to HEX rather than loose alnum because the minting site is
     # ``uuid4().hex``: the exact shape is available, so it is used, and it is
     # maximally specific. This carries the DeepSeek rule's argument one notch
-    # further — that rule exists because DeepSeek is the repo's own default
-    # PROVIDER; this is the repo's own PRODUCT credential, and the one a bare
-    # read of ``~/.pi/agent/tortoise-config.json`` dumps into a turn.
+    # further — that rule exists because DeepSeek is the model behind the repo's
+    # default extractor route (``_SESSION_LLM_PROVIDER_PRIORITY`` is headed by
+    # ``openrouter``), so its shape reaches the transcripts routinely; this is
+    # the repo's own PRODUCT credential, and the one a bare read of
+    # ``~/.pi/agent/tortoise-config.json`` dumps into a turn.
     #
     # ⛔ BOTH PREFIXES, because they differ only in the prefix: covering ``tt_``
     # alone leaves a ``tk_`` key — the same secret, same mint, same leak —
@@ -438,8 +440,15 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # Measured BEFORE this rule existed: ``redact_secrets`` returned the key
     # VERBATIM with ``counts == {}``, so the capture path stored it with
     # ``capture_redactions: 0`` — the #4911 mitigation did not cover our own
-    # key, which is the whole reason #5109's leak was durable. Neither prefix is
-    # claimed by another rule, so the ordering rule above is not engaged.
+    # key. That makes this a LATENT SINK, not the cause of the observed leak:
+    # #5109's own measurements place the exposure in pi's local session
+    # ``.jsonl`` files and in agent scratch files under ``/tmp`` — paths this
+    # repo does not write — and the issue explicitly records that the claim a
+    # sub-agent echoed the key into its transcript "does not hold up". No
+    # measurement shows the key reaching a captured turn. So this rule closes
+    # the hole before it was used; it does not explain the durability the issue
+    # measured. Neither prefix is claimed by another rule, so the ordering rule
+    # above is not engaged.
     ("tortoise_api_key",
      re.compile(r"(?<![A-Za-z0-9])(?:tt|tk)_[0-9a-f]{32}(?![A-Za-z0-9])"),
      _REDACTION_VALUE.format(kind="tortoise_api_key")),

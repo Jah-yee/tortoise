@@ -851,9 +851,13 @@ def test_the_repos_own_api_key_is_redacted():
     ``<prefix>`` + 32 lowercase hex. Measured BEFORE this rule existed,
     ``redact_secrets`` returned the key VERBATIM with ``counts == {}`` — so the
     capture path stored the product's own live key with
-    ``capture_redactions: 0``. That is what made #5109's exposure durable: the
-    issue records an agent dumping the config into a turn, and until this rule
-    existed the capture path preserved the key byte-for-byte.
+    ``capture_redactions: 0``. That is a LATENT SINK, not the cause of the
+    exposure #5109 measured: the issue's own record places the leak in pi's
+    local session ``.jsonl`` files and in agent scratch files under ``/tmp``
+    (paths this repo does not write), and it states that the claim a sub-agent
+    echoed the key into its transcript "does not hold up". No measurement shows
+    the key reaching a captured turn, so the test below pins the hole this rule
+    closes, not a leak that was observed here.
 
     ⛔ BOTH prefixes are exercised. ``tt_`` is the default; ``tk_`` is the
     per-graph scoped key the provisioning service mints via the SAME one-line
