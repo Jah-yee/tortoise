@@ -419,6 +419,30 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("huggingface_token",
      re.compile(r"(?<![A-Za-z0-9])(?:hf_|api_org_)[A-Za-z0-9]{34,}(?![A-Za-z0-9])"),
      _REDACTION_VALUE.format(kind="huggingface_token")),
+    # Tortoise's OWN API key (#5109) — minted as ``f"{prefix}{uuid.uuid4().hex}"``
+    # in ``tortoise/sdk.py::apikey_create``, i.e. EXACTLY ``<prefix>`` + 32
+    # lowercase hex, for the DEFAULT ``tt_`` and for the ``tk_`` per-graph keys
+    # the provisioning service mints (``prefix`` kwarg, C2 #2111). The body is
+    # anchored to HEX rather than loose alnum because the minting site is
+    # ``uuid4().hex``: the exact shape is available, so it is used, and it is
+    # maximally specific. This carries the DeepSeek rule's argument one notch
+    # further — that rule exists because DeepSeek is the repo's own default
+    # PROVIDER; this is the repo's own PRODUCT credential, and the one a bare
+    # read of ``~/.pi/agent/tortoise-config.json`` dumps into a turn.
+    #
+    # ⛔ BOTH PREFIXES, because they differ only in the prefix: covering ``tt_``
+    # alone leaves a ``tk_`` key — the same secret, same mint, same leak —
+    # stored verbatim. ``api_key = f"{prefix}{uuid.uuid4().hex}"`` (sdk.py) is
+    # one expression for both, so the rule must be one alternative for both.
+    #
+    # Measured BEFORE this rule existed: ``redact_secrets`` returned the key
+    # VERBATIM with ``counts == {}``, so the capture path stored it with
+    # ``capture_redactions: 0`` — the #4911 mitigation did not cover our own
+    # key, which is the whole reason #5109's leak was durable. Neither prefix is
+    # claimed by another rule, so the ordering rule above is not engaged.
+    ("tortoise_api_key",
+     re.compile(r"(?<![A-Za-z0-9])(?:tt|tk)_[0-9a-f]{32}(?![A-Za-z0-9])"),
+     _REDACTION_VALUE.format(kind="tortoise_api_key")),
     # Jev / TypeSafe AI (`jv_live_…`, `jv_test_…`).
     ("jev_api_key",
      re.compile(r"(?<![A-Za-z0-9])jv_(?:live|test)_[A-Za-z0-9_-]{8,}(?![A-Za-z0-9])"),

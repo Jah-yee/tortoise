@@ -115,6 +115,13 @@ CASES: tuple[tuple[str, str, str], ...] = (
     ("npm", "npm_token", "npm_" + _fill(36)),
     ("huggingface", "huggingface_token", "hf_" + _fill(34)),
     ("huggingface_org", "huggingface_token", "api_org_" + _fill(34)),
+    # #5109: the repo's OWN key — ``tt_`` + ``uuid4().hex``, minted in
+    # ``tortoise/sdk.py``. Synthetic, and assembled at runtime (see ``_synth``)
+    # like every other row. The body is HEX specifically because the minting
+    # site is ``uuid4().hex``: that is what the rule anchors on, so a
+    # mixed-case ``_fill`` body would not represent the real shape.
+    ("tortoise", "tortoise_api_key",
+     _synth("tt_", "0123456789abcdef0123456789abcdef")),
     ("supabase_pat", "supabase_secret_key", "sbp_" + _fill(40)),
     ("slack_workflow_webhook", "slack_webhook_url",
      _synth("https://", _webhook(
@@ -834,6 +841,66 @@ def test_every_rule_scans_linearly_on_adversarial_input():
             f"a JWT glued after {pre!r} leaked — the lookbehind was narrowed "
             "past a real base64url body character to buy scan speed")
         assert counts.get("jwt") == 1, pre
+
+
+def test_the_repos_own_api_key_is_redacted():
+    """#5109: the #4911 mitigation did not cover Tortoise's OWN credential.
+
+    The key is minted as ``f"{prefix}{uuid.uuid4().hex}"``
+    (``tortoise/sdk.py::apikey_create``), so its shape is exactly
+    ``<prefix>`` + 32 lowercase hex. Measured BEFORE this rule existed,
+    ``redact_secrets`` returned the key VERBATIM with ``counts == {}`` — so the
+    capture path stored the product's own live key with
+    ``capture_redactions: 0``. That is what made #5109's exposure durable: the
+    issue records an agent dumping the config into a turn, and until this rule
+    existed the capture path preserved the key byte-for-byte.
+
+    ⛔ BOTH prefixes are exercised. ``tt_`` is the default; ``tk_`` is the
+    per-graph scoped key the provisioning service mints via the SAME one-line
+    expression (``prefix`` kwarg, C2 #2111). They differ only in the prefix, so
+    a rule covering ``tt_`` alone would leave the same secret with the same
+    leak shape stored verbatim.
+
+    REDs on: removing the ``tortoise_api_key`` rule (back to verbatim + empty
+    counts), or narrowing it to ``tt_``.
+    """
+    for prefix in ("tt_", "tk_"):
+        key = _synth(prefix, "0123456789abcdef0123456789abcdef")
+        out, counts = redact_secrets(f"my key is {key}, keep it safe")
+        assert key not in out, out
+        assert "[REDACTED:tortoise_api_key]" in out, out
+        assert counts == {"tortoise_api_key": 1}, counts
+        # and the recorded count survives the capture double-pass (see the
+        # idempotency test below)
+        again, extra = redact_secrets(out)
+        assert again == out and extra == {}, extra
+
+
+def test_the_tortoise_key_rule_is_narrow_enough():
+    """``tt_``/``tk_`` are only TWO-character prefixes, so the body does the work.
+
+    That precision is real rather than cosmetic: the minting site is
+    ``uuid4().hex``, so a genuine key body is pure lowercase hex. A body of the
+    wrong length, a body containing a non-hex character, a prefix sitting
+    inside a word, and the repo's own OTHER two-letter-prefixed ids (``ev_``,
+    ``pt_``) must all survive untouched.
+
+    REDs on: widening the body to loose alnum or to ``{32,}``, or dropping the
+    lookbehind/lookahead anchors.
+    """
+    survivors = [
+        _synth("tt_", "0123456789abcdef0123456789abcde"),      # 31, too short
+        _synth("tt_", "0123456789abcdef0123456789abcdeg"),     # non-hex body
+        _synth("tt_", "0123456789abcdef0123456789abcdef0"),    # 33, too long
+        _synth("outt_", "0123456789abcdef0123456789abcdef"),   # inside a word
+        _synth("ev_", "0123456789abcdef0123456789abcdef"),
+        _synth("pt_", "0123456789abcdef0123456789abcdef"),
+        _synth("tkd_", "0123456789abcdef0123456789abcdef"),   # not the tk_ prefix
+    ]
+    for value in survivors:
+        out, counts = redact_secrets(f"value {value} end")
+        assert value in out, f"overscoped — redacted {value!r}"
+        assert counts == {}, f"overscoped — {value!r} -> {counts}"
 
 
 def test_redaction_is_idempotent_under_the_capture_double_pass():
