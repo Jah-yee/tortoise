@@ -6,6 +6,7 @@ Phase 0 (#7748): Foundation — FalkorDB indexes, RRF fusion, degradation chain,
 from __future__ import annotations  # noqa: I001
 
 import logging
+import math
 import os
 import threading
 import time
@@ -723,7 +724,10 @@ def run_fts_query(
                    else f" AND {_exclude_status_clause('n', excluded_statuses or TERMINAL_EXCLUDED_STATUSES)}")
                 + "  AND toLower(n.label) CONTAINS toLower($query) "
                 "RETURN n.id, 1.0 AS score "
-                "ORDER BY score DESC "
+                # #3019: every row scores a constant 1.0, so this leg is ONE giant
+                # tie and DB row order would otherwise decide each document's RRF
+                # rank. The secondary key makes the order a function of the data.
+                "ORDER BY score DESC, n.id ASC "
                 "LIMIT $limit"
             )
             rows = graph.query(
@@ -799,7 +803,9 @@ def run_fts_query(
             "YIELD node, score "
             + status_filter +
             f"RETURN node.{id_field}, score "
-            "ORDER BY score DESC "
+            # #3019: rank alone does not order a tie, and RRF is rank-based — see
+            # the operator path above.
+            f"ORDER BY score DESC, node.{id_field} ASC "
             "LIMIT $limit"
         )
         rows = graph.query(
@@ -1134,7 +1140,9 @@ def run_vector_query(
             "WITH n, vec.euclideanDistance(n.embedding, _qv) AS distance "
             "WHERE distance IS NOT NULL "
             f"RETURN n.{id_field}, 1.0 / (1.0 + distance) AS score "
-            "ORDER BY score DESC "
+            # #3019: a distance tie (equal values, or repeated rows) must not fall
+            # through to DB row order.
+            f"ORDER BY score DESC, n.{id_field} ASC "
             "LIMIT $limit"
         )
         rows = graph.query(
@@ -1433,6 +1441,15 @@ def rrf_fusion(
         w = 1.0
         if strategy_names is not None and weights:
             w = weights.get(strategy_names[i], 1.0)
+            # #3019 part 2: a non-finite weight makes EVERY fused score NaN, and
+            # tuple comparison against NaN is False in BOTH directions, so the
+            # ``(-score, id)`` key below silently degrades to insertion order —
+            # losing the determinism #2952 established. ``json.loads`` accepts
+            # bare ``NaN``/``Infinity``, so TORTOISE_FUSION_WEIGHTS can carry one,
+            # and a kwarg caller can pass one. Guarded at the ROOT so every entry
+            # point is covered, not just the env parse.
+            if not math.isfinite(w):
+                w = 1.0
         for rank, (pid, _score) in enumerate(ranked):
             rrf_score = w / (k + rank + 1)
             scores[pid] = scores.get(pid, 0.0) + rrf_score
