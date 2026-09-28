@@ -115,11 +115,13 @@ CASES: tuple[tuple[str, str, str], ...] = (
     ("npm", "npm_token", "npm_" + _fill(36)),
     ("huggingface", "huggingface_token", "hf_" + _fill(34)),
     ("huggingface_org", "huggingface_token", "api_org_" + _fill(34)),
-    # #5109: the repo's OWN key — ``tt_`` + ``uuid4().hex``, minted in
-    # ``tortoise/sdk.py``. Synthetic, and assembled at runtime (see ``_synth``)
-    # like every other row. The body is HEX specifically because the minting
-    # site is ``uuid4().hex``: that is what the rule anchors on, so a
-    # mixed-case ``_fill`` body would not represent the real shape.
+    # #5109: the repo's OWN key — ``<prefix>`` + ``uuid4().hex``. Synthetic, and
+    # assembled at runtime (see ``_synth``) like every other row. A site is
+    # deliberately NOT named (see the rule comment in ``tortoise/security.py``):
+    # the mint is not a fixed set of call sites, and a partial list reads as a
+    # complete one. The body is HEX specifically because the mint's body is
+    # ``uuid4().hex`` — that is what the rule anchors on, so a mixed-case
+    # ``_fill`` body would not represent the real shape.
     ("tortoise", "tortoise_api_key",
      _synth("tt_", "0123456789abcdef0123456789abcdef")),
     ("supabase_pat", "supabase_secret_key", "sbp_" + _fill(40)),
@@ -847,13 +849,13 @@ def test_the_repos_own_api_key_is_redacted():
     """#5109: the #4911 mitigation did not cover Tortoise's OWN credential.
 
     The key is minted as ``f"{prefix}{uuid.uuid4().hex}"``, so its shape is
-    exactly ``<prefix>`` + 32 lowercase hex. ⛔ The mint is spread over several
-    sites in ``sdk.py`` and ``hosted_api.py`` (``apikey_create``, ``org_create``,
-    ``signup_token_recover``, ``_mint_key``, the agent and session-key paths) —
-    no count is stated on purpose, because a partial list reads as a complete one
-    and re-stales on every new mint (review rounds 2 and 3 each faulted a version
-    of this sentence). The rule anchors on the SHAPE, which is why it covers a
-    site this docstring does not know about. Measured BEFORE this rule existed,
+    exactly ``<prefix>`` + 32 lowercase hex. ⛔ The mint is NOT a fixed set of call
+    sites and spans more than one module, so this docstring states the SHAPE and
+    names no site and no count: any enumeration or figure here is a claim about
+    the source rather than about the rule, it re-stales on the next mint, and a
+    partial list reads as a complete one whether or not it is one. The rule
+    anchors on the SHAPE, which is why it covers a site neither this docstring nor
+    the regex author has heard of. Measured BEFORE this rule existed,
     ``redact_secrets`` returned the key VERBATIM with ``counts == {}`` — so the
     capture path stored the product's own live key with
     ``capture_redactions: 0``. That is a LATENT SINK, not the cause of the

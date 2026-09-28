@@ -426,17 +426,13 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # ``uuid4().hex``: the exact shape is available, so it is used, and it is
     # maximally specific.
     #
-    # ⛔ NO COUNT AND NO SITE LIST, DELIBERATELY (review rounds 2 and 3). The mint is
-    # spread across ``sdk.py`` and ``hosted_api.py`` — ``apikey_create``,
-    # ``org_create``, ``signup_token_recover``, ``_mint_key`` and the agent/session
-    # -key paths — and a comment that names some of them reads as a complete list
-    # whether or not it is one. Round 2 faulted naming ``apikey_create`` alone;
-    # round 3 faulted the correction for swapping in a different partial list. Any
-    # figure written here re-stales on the next mint regardless, because it is a
-    # claim about the source rather than about this rule. The rule is anchored on
-    # the SHAPE precisely so a site this comment does not know about is still
-    # covered, so enumerating sites adds no coverage. State the shape; leave the
-    # list to the regex.
+    # ⛔ STATE THE SHAPE; NEVER A COUNT AND NEVER A SITE LIST. The mint is not a
+    # fixed set of call sites and it spans more than one module, so ANY enumeration
+    # or figure written here is a claim about the SOURCE rather than about this
+    # rule: it re-stales on the next mint, and a partial list reads as a complete
+    # one whether or not it is one. The regex is anchored on the SHAPE precisely so
+    # a mint site this comment has never heard of is still covered — enumerating
+    # sites adds no coverage to the rule. Leave the list to the regex.
     #
     # This carries the DeepSeek rule's argument one notch
     # further — that rule exists because DeepSeek is the model behind the repo's
@@ -447,8 +443,8 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     #
     # ⛔ BOTH PREFIXES, because they differ only in the prefix: covering ``tt_``
     # alone leaves a ``tk_`` key — the same secret, same mint, same leak —
-    # stored verbatim. ``api_key = f"{prefix}{uuid.uuid4().hex}"`` (sdk.py) is
-    # one expression for both, so the rule must be one alternative for both.
+    # stored verbatim. The mint is ONE expression over a prefix variable, so the
+    # rule must be one alternative over the prefix — not a rule per prefix.
     #
     # Measured BEFORE this rule existed: ``redact_secrets`` returned the key
     # VERBATIM with ``counts == {}``, so the capture path stored it with
