@@ -419,13 +419,26 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("huggingface_token",
      re.compile(r"(?<![A-Za-z0-9])(?:hf_|api_org_)[A-Za-z0-9]{34,}(?![A-Za-z0-9])"),
      _REDACTION_VALUE.format(kind="huggingface_token")),
-    # Tortoise's OWN API key (#5109) — minted as ``f"{prefix}{uuid.uuid4().hex}"``
-    # in ``tortoise/sdk.py::apikey_create``, i.e. EXACTLY ``<prefix>`` + 32
-    # lowercase hex, for the DEFAULT ``tt_`` and for the ``tk_`` per-graph keys
-    # the provisioning service mints (``prefix`` kwarg, C2 #2111). The body is
-    # anchored to HEX rather than loose alnum because the minting site is
+    # Tortoise's OWN API key (#5109) — minted as ``f"{prefix}{uuid.uuid4().hex}"``,
+    # i.e. EXACTLY ``<prefix>`` + 32 lowercase hex, for the DEFAULT ``tt_`` and for the
+    # ``tk_`` per-graph keys the provisioning service mints (``prefix`` kwarg, C2
+    # #2111). The body is anchored to HEX rather than loose alnum because the mint is
     # ``uuid4().hex``: the exact shape is available, so it is used, and it is
-    # maximally specific. This carries the DeepSeek rule's argument one notch
+    # maximally specific.
+    #
+    # ⛔ NO COUNT AND NO SITE LIST, DELIBERATELY (review rounds 2 and 3). The mint is
+    # spread across ``sdk.py`` and ``hosted_api.py`` — ``apikey_create``,
+    # ``org_create``, ``signup_token_recover``, ``_mint_key`` and the agent/session
+    # -key paths — and a comment that names some of them reads as a complete list
+    # whether or not it is one. Round 2 faulted naming ``apikey_create`` alone;
+    # round 3 faulted the correction for swapping in a different partial list. Any
+    # figure written here re-stales on the next mint regardless, because it is a
+    # claim about the source rather than about this rule. The rule is anchored on
+    # the SHAPE precisely so a site this comment does not know about is still
+    # covered, so enumerating sites adds no coverage. State the shape; leave the
+    # list to the regex.
+    #
+    # This carries the DeepSeek rule's argument one notch
     # further — that rule exists because DeepSeek is the model behind the repo's
     # default extractor route (``_SESSION_LLM_PROVIDER_PRIORITY`` is headed by
     # ``openrouter``), so its shape reaches the transcripts routinely; this is

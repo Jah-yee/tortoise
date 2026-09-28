@@ -846,9 +846,14 @@ def test_every_rule_scans_linearly_on_adversarial_input():
 def test_the_repos_own_api_key_is_redacted():
     """#5109: the #4911 mitigation did not cover Tortoise's OWN credential.
 
-    The key is minted as ``f"{prefix}{uuid.uuid4().hex}"``
-    (``tortoise/sdk.py::apikey_create``), so its shape is exactly
-    ``<prefix>`` + 32 lowercase hex. Measured BEFORE this rule existed,
+    The key is minted as ``f"{prefix}{uuid.uuid4().hex}"``, so its shape is
+    exactly ``<prefix>`` + 32 lowercase hex. ⛔ The mint is spread over several
+    sites in ``sdk.py`` and ``hosted_api.py`` (``apikey_create``, ``org_create``,
+    ``signup_token_recover``, ``_mint_key``, the agent and session-key paths) —
+    no count is stated on purpose, because a partial list reads as a complete one
+    and re-stales on every new mint (review rounds 2 and 3 each faulted a version
+    of this sentence). The rule anchors on the SHAPE, which is why it covers a
+    site this docstring does not know about. Measured BEFORE this rule existed,
     ``redact_secrets`` returned the key VERBATIM with ``counts == {}`` — so the
     capture path stored the product's own live key with
     ``capture_redactions: 0``. That is a LATENT SINK, not the cause of the
