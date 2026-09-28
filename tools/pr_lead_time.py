@@ -7,23 +7,25 @@ human PR's elapsed time actually go?**
 **A Mergify queue PR is not a development PR.** The speculative-batching lane
 opens a DRAFT pull request per batch attempt (`head.ref` =
 `mergify/merge-queue/<sha>`, author `mergify[bot]`, title `merge queue: checking
-…`). Every one is closed unmerged (0 of 339 in history merged). Counting them as
-"abandoned PRs" measures queue churn, not developer behaviour, so they are
-partitioned OUT of the human population and reported separately. This is the
-single largest accounting error in earlier readings of this queue.
+…`). Every one is closed unmerged (none merged in the enumerated window).
+Counting them as "abandoned PRs" measures queue churn, not developer behaviour, so
+they are partitioned OUT of the human population and reported separately. This is
+the single largest accounting error in earlier readings of this queue.
 
-Segments (mutually exclusive; asserted to partition the human population):
+Segments — the issue's three legs (mutually exclusive; asserted to partition the
+human population's elapsed time):
 
-  for a MERGED human PR:
-    (pre)  created                -> first non-bot review/comment
-    (a)    first activity         -> entry-gate success
-    (b)    entry gate ready       -> merged   (approval wait + queue wait)
-  for an UNMERGED human PR:
-    (pre)  created                -> first non-bot review/comment
-    (c)    first activity         -> closed unmerged   (the abandonment leg)
+  (a)  created            -> entry-gate success   (a MERGED human PR)
+  (b)  entry-gate success -> merged               (a MERGED human PR)
+  (c)  created            -> closed unmerged      (the abandonment leg)
 
-Supporting (non-additive) measurements inside (a): CI wall-clock on the PR's
-head commit, the share that re-runs consumed, and rebase/force-push events.
+Reported separately as NON-partitioning sub-splits:
+
+  - time to first non-bot activity (from creation; it can fall INSIDE (b), since
+    the cheap entry gate usually finishes first)
+  - (a) split at min(activity, gate), over the merged PRs that have an activity
+  - (b) split at queue entry into review/readiness wait + queue residence
+  - CI wall clock on the head commit, its re-run span delta, and force-pushes
 
 Design notes that are load-bearing:
 
@@ -263,27 +265,35 @@ def gate_success(gh: Gh, repo: str, pr_number: int, contexts: list[str],
         author_date = ts(((c.get("commit") or {}).get("author") or {}).get("date"))
         if not_after is not None and author_date is not None and author_date > not_after:
             continue
-        newest: dict[str, dict] = {}
+        newest: dict[tuple, dict] = {}
         for r in check_runs(gh, repo, sha):
             name = r.get("name")
             if name not in need:
                 continue
+            key = ((r.get("app") or {}).get("slug"), name)
             rid = r.get("id") or 0
-            if name not in newest or rid > (newest[name].get("id") or 0):
-                newest[name] = r
+            if key not in newest or rid > (newest[key].get("id") or 0):
+                newest[key] = r
+        by_name: dict[str, list[dict]] = {}
+        for (_slug, name), r in newest.items():
+            by_name.setdefault(name, []).append(r)
         latest: datetime | None = None
         ok = True
         for name in need:
-            r = newest.get(name)
-            if r is None or r.get("conclusion") != "success":
+            group = by_name.get(name)
+            if not group:
                 ok = False
                 break
-            done = ts(r.get("completed_at"))
-            if done is None or (not_after is not None and done > not_after):
-                ok = False
+            for r in group:
+                done = ts(r.get("completed_at"))
+                if (r.get("conclusion") != "success" or done is None
+                        or (not_after is not None and done > not_after)):
+                    ok = False
+                    break
+                if latest is None or done > latest:
+                    latest = done
+            if not ok:
                 break
-            if latest is None or done > latest:
-                latest = done
         if ok and latest is not None and (best is None or latest < best):
             best = latest
     return best
@@ -406,7 +416,8 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
         if not isinstance(batch, list) or not batch:
             break
         in_window.extend(p for p in batch
-                         if (c := ts(p.get("closed_at"))) is not None and c >= since)
+                         if (c := ts(p.get("closed_at"))) is not None
+                         and since <= c <= now)
         if min((ts(p.get("updated_at")) or since) for p in batch) < since:
             break
     else:
@@ -708,7 +719,7 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
         "queue_pr_lifetime": _queue_lifetime(queue_prs),
         "verified": {
             "partition_asserted": True,
-            "legs_sum_to_population": True,
+            "legs_plus_unknown_sum_to_population": True,
             "closed_equals_merged_plus_unmerged": True,
             "queue_prs_excluded_from_human": True,
             "no_negative_segments": True,
