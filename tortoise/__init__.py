@@ -38,8 +38,9 @@ import os
 
 from tortoise.config import RELATIVE_PATH_ERROR
 
-# #1371: eager import registers the batch atexit flush (module-import time,
-# before any client construction) so LIFO ordering runs it LAST.
+# #1371/#5386: the eager import binds `atexit_fast_close` (used at the
+# registration seam below) and arms the redislite guard finder at
+# module-import time, before any client construction.
 from tortoise.embedded_lifecycle import atexit_fast_close
 from tortoise.fork_safety import (
     enforce_embedded_fork_safety,
@@ -183,8 +184,8 @@ def _build_guarded_falkordb(_OriginalFalkorDB):
             _atexit.register(self._atexit_close)
 
         def _atexit_close(self) -> None:
-            """#1371: atexit seam — collect ephemeral test servers for the
-            batch flush first.
+            """#1371: atexit seam — collect ephemeral test servers so interpreter
+            exit takes the fast close.
 
             Falls through to the normal _t_close when the fast path does not
             apply (non-ephemeral path, flag unset, other clients connected,
