@@ -93,7 +93,34 @@ _REDACT_MARGIN = 64 * 1024
 #: on the secret — see :func:`bound_detail`), so the bound cannot be used to
 #: shrink the SCAN; instead the scan is windowed and the tail past the window is
 #: simply never rendered, so skipping its redaction cannot expose it.
+#:
+#: ⛔ THIS WINDOW BOUNDS THE REDACTION SCAN ONLY — not session start.  The read,
+#: ``json.loads`` and :func:`_normalize` that produce the scan's input are all
+#: O(record), so a multi-megabyte RECORD still stalled session start with this
+#: window in place.  The read is bounded separately at :data:`MAX_RECORD_BYTES`
+#: by :func:`render_file`; do not read this constant as a bound on the file.
 REDACT_WINDOW_CHARS = MAX_DETAIL_CHARS + _REDACT_MARGIN
+
+#: The largest breadcrumb RECORD :func:`render_file` will read and parse.
+#:
+#: :data:`REDACT_WINDOW_CHARS` bounds only the redaction SCAN; the read,
+#: ``json.loads`` and :func:`_normalize` are all O(record), so the window alone
+#: did NOT bound session start.  Measured before this bound: a 52 MiB detail
+#: took 2.6 s and ~142 MiB RSS in ``render_file`` (11.5 s / 682 MiB on the
+#: reviewing host), and the reachable writer is
+#: ``__main__._record_capture_error(harness, f"import failed (HTTP {code}):
+#: {e.read().decode(...)}")`` — an UNCAPPED HTTP error body.  At ~250 MB the
+#: hook's 60 s timeout was exceeded.  The bound is far past anything the
+#: renderer can use (the rendered detail is :data:`MAX_DETAIL_CHARS`, redacted
+#: over a :data:`REDACT_WINDOW_CHARS` window) while keeping the read and
+#: normalize cost flat in the record's size.  An oversized record is refused
+#: BEFORE it is parsed and still renders a bounded synthetic ``why:``.
+MAX_RECORD_BYTES = 1 << 20
+
+#: The ``why:`` detail for a record too large to read.  #4041's goal is to TELL
+#: THE AGENT, so an oversized record still renders a payload — with a bounded,
+#: self-authored reason rather than by parsing a payload nobody can use.
+_OVERSIZED_RECORD_DETAIL = "error detail omitted: record too large"
 
 #: The field label column: ``code:``/``what:``/``why:``/``next:`` all start
 #: their value at this column, so the payload reads as a table.
@@ -121,22 +148,55 @@ _STRIP_CONTROLS: dict[int, None] = {
     **{cp: None for cp in range(0x80, 0xA0) if not chr(cp).isspace()},
 }
 
+#: Invisible / BIDI FORMAT (Unicode ``Cf``) characters REMOVED before the scan
+#: and before rendering.  They are zero-width, so they cannot forge a physical
+#: payload LINE (the whitespace collapse and :data:`_STRIP_CONTROLS` already own
+#: that invariant) — but a BIDI OVERRIDE reorders how a reader DISPLAYS the
+#: line, and a bidi-aware reader can be made to see the ``why:`` value as though
+#: it were a separate ``next:`` field with no byte between them.  The payload is
+#: read by a human AND an agent, so display structure the transport did not
+#: write must not be forgeable.  The zero-width joiners are stripped for the
+#: same reason the C0/C1 controls are: one can split a credential-shaped run the
+#: scan would otherwise see whole (``ghp_`` + ZWSP + the body).
+_STRIP_FORMAT: dict[int, None] = {
+    **{cp: None for cp in range(0x202A, 0x202F)},  # bidi embed/override/PDF
+    **{cp: None for cp in range(0x2060, 0x2070)},  # word joiner … isolates
+    0x200B: None,  # zero-width space
+    0x200C: None,  # zero-width non-joiner
+    0x200D: None,  # zero-width joiner
+    0x200E: None,  # left-to-right mark
+    0x200F: None,  # right-to-left mark
+    0x061C: None,  # Arabic letter mark
+    0xFEFF: None,  # BOM / zero-width no-break space
+}
+
 
 def _normalize(text: str) -> str:
     """The ONE normalization the redaction scan must see.
 
     Whitespace — newlines included — collapses to single spaces and leading/
     trailing whitespace is dropped (so the rendered line is ONE line); then the
-    non-whitespace control characters are removed.  This runs BEFORE
-    :func:`redact_secrets`, and the order is load-bearing, not cosmetic: the
-    shell transport strips NUL from its command substitution, so normalizing
-    after the scan would let a NUL-interrupted credential scan as an unmatched
-    fragment and then be RE-FORMED into contiguous cleartext on the way out
-    (see :data:`_STRIP_CONTROLS`).  Whitespace is normalized in the same pass
-    for the same reason: the scan must see the single-space line the renderer
-    emits, not the raw run it was handed.
+    non-whitespace control characters and the invisible/BIDI format characters
+    are removed.  This runs BEFORE :func:`redact_secrets`, and the order is
+    load-bearing, not cosmetic: the shell transport strips NUL from its command
+    substitution, so normalizing after the scan would let a NUL-interrupted
+    credential scan as an unmatched fragment and then be RE-FORMED into
+    contiguous cleartext on the way out (see :data:`_STRIP_CONTROLS`).
+    Whitespace is normalized in the same pass for the same reason: the scan must
+    see the single-space line the renderer emits, not the raw run it was handed.
+
+    A LONE SURROGATE (a valid JSON escape — ``json.loads`` produces the surrogate
+    code point, not a valid character) makes ``sys.stdout.write`` raise
+    ``UnicodeEncodeError``, which the shell's ``|| return 0`` swallows: the whole
+    breadcrumb silently disappears.  The final UTF-8 round trip with
+    ``errors="replace"`` makes every rendered character encodable, so #4041's
+    "tell the agent" goal survives such a record.  A valid surrogate PAIR is
+    combined into one code point by ``json.loads`` before this runs, so only
+    genuinely unpaired surrogates are replaced.
     """
-    return " ".join(text.split()).translate(_STRIP_CONTROLS)
+    normalized = " ".join(text.split())
+    normalized = normalized.translate(_STRIP_CONTROLS).translate(_STRIP_FORMAT)
+    return normalized.encode("utf-8", "replace").decode("utf-8")
 
 #: What happened, for a human AND an agent with no product context.  Deliberately
 #: says NOT been filed, never "failed": the capture is spooled and retried by
@@ -182,8 +242,11 @@ def bound_detail(detail: Any) -> str:
     :data:`MAX_DETAIL_CHARS`.
 
     Redaction is scanned over a bounded WINDOW (:data:`REDACT_WINDOW_CHARS`),
-    not the whole detail, so a multi-megabyte body cannot stall the session
-    start past the hook's timeout.  The window extends
+    not the whole detail, so the REDACTION SCAN cannot on its own stall the
+    session start past the hook's timeout.  That window bounds the SCAN ONLY —
+    :func:`_normalize` above and the parse that feeds it are O(input), so the
+    READ is bounded separately at :data:`MAX_RECORD_BYTES` by
+    :func:`render_file`.  The window extends
     :data:`_REDACT_MARGIN` characters past the rendered bound, so a secret that
     begins inside the rendered bound and is shorter than the margin is redacted
     whole; the tail past the window is never rendered, so its un-redacted bytes
@@ -214,8 +277,13 @@ def render(record: dict[str, Any]) -> str:
     kind = record.get("kind")
     if kind != KIND_CAPTURE_FAILURE:
         return ""
-    harness = one_line(record.get("harness") or "unknown")
-    stamp = one_line(record.get("recorded_at") or "an unrecorded time")
+    # ``.strip()`` BEFORE the ``or`` fallback: ``"   "`` is TRUTHY, so the bare
+    # ``or`` let a whitespace-only value through, and ``bound_detail`` then
+    # normalized it to "" — the rendered line lost the harness (or the stamp)
+    # entirely instead of taking the documented fallback.
+    harness = one_line(str(record.get("harness") or "").strip() or "unknown")
+    stamp = one_line(
+        str(record.get("recorded_at") or "").strip() or "an unrecorded time")
     lines = (
         f"{'code:':<{_FIELD_WIDTH}}{kind}",
         f"{'what:':<{_FIELD_WIDTH}}{_WHAT.format(stamp=stamp, harness=harness)}",
@@ -234,9 +302,30 @@ def render_file(path: str | Path) -> str:
     deliberately broad (a deeply nested document raises ``RecursionError``), and
     a non-dict document is refused the same way.  ``utf-8-sig`` accepts a
     leading BOM, which a Windows-authored copy can carry.
+
+    The READ is bounded to :data:`MAX_RECORD_BYTES` (one byte past it, so an
+    oversized file is DETECTED without being read): a record larger than the
+    bound renders a synthetic :data:`_OVERSIZED_RECORD_DETAIL` ``why:`` instead
+    of being parsed, which keeps #4041's "tell the agent" goal while making the
+    read, ``json.loads`` and :func:`_normalize` cost independent of the record's
+    size.  The shell writer's ``install-inert`` detail is a fixed small string,
+    so a record that reaches this bound was written by the Python
+    ``capture-failure`` writer (an uncapped HTTP error body) — the synthetic
+    payload's kind follows that writer.
     """
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_RECORD_BYTES + 1)
+    except Exception:
+        return ""
+    if len(raw) > MAX_RECORD_BYTES:
+        return render({
+            "kind": KIND_CAPTURE_FAILURE,
+            "harness": Path(path).stem or "unknown",
+            "detail": _OVERSIZED_RECORD_DETAIL,
+        })
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
     except Exception:
         return ""
     if not isinstance(data, dict):

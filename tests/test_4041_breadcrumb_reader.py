@@ -545,6 +545,12 @@ def test_the_renderer_never_imports_a_planted_cwd_module(tmp_path):
     assert not marker.exists(), (
         "a planted ./json.py in the hook cwd executed — the cwd is "
         "attacker-influenced (CWE-427)")
+    # The empty ``not marker.exists()`` check above would PASS VACUOUSLY if the
+    # capture half were disabled entirely (no renderer -> no planted module
+    # imported).  Pin that the renderer actually RAN and produced its normal
+    # payload, so this test cannot be satisfied by producing nothing.
+    # Mutation: disable the breadcrumb rendering — code is absent and this REDs.
+    assert _fields(proc.stdout).get("code") == "capture-failure", proc.stdout
 
 
 # ── the install-inert path (no interpreter reachable) ────────────────────
@@ -817,6 +823,44 @@ def test_a_nul_inside_a_credential_is_not_re_formed_by_the_transport(tmp_path):
     assert "[REDACTED:github_token]" in lines[2], proc.stdout
 
 
+def test_a_lone_surrogate_does_not_silently_drop_the_breadcrumb(tmp_path):
+    """A record can carry a LONE SURROGATE: ``"\\ud800"`` is a valid JSON
+    escape and ``json.loads`` produces the surrogate code point, which is not an
+    encodable character.  ``sys.stdout.write`` then raises
+    ``UnicodeEncodeError``, and the shell's ``|| return 0`` swallows it — so NO
+    breadcrumb renders at all and the feature silently disappears for that
+    record.  ``_normalize`` round-trips through UTF-8 with ``errors="replace"``
+    so every rendered character is encodable.
+
+    Mutation: drop the UTF-8 round trip in ``_normalize`` — the renderer exits
+    non-zero, stdout is empty, and this REDs."""
+    from tortoise.capture_breadcrumb import render
+
+    # The direct renderer must produce an ENCODABLE payload: the hook writes it
+    # to a UTF-8 stdout at the very end, which is where the surrogate raises.
+    direct = render({"kind": "capture-failure", "detail": "\ud800 x",
+                     "harness": "claude"})
+    direct.encode("utf-8")  # must not raise
+    assert direct.startswith("code:     capture-failure"), repr(direct[:40])
+
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log")
+    _python3_shim(bindir)
+    crumb = _crumb_path(home)
+    crumb.parent.mkdir(parents=True, exist_ok=True)
+    crumb.write_text(json.dumps(_capture_failure(detail="\ud800 x")),
+                     encoding="utf-8")
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
+
+    assert proc.returncode == 0, proc.stderr
+    fields = _fields(proc.stdout)
+    assert fields.get("code") == "capture-failure", proc.stdout
+    assert "NOT been filed" in fields.get("what", ""), proc.stdout
+
+
 # ── the Python renderer, directly ────────────────────────────────────────
 
 #: The ONLY kind the Python renderer answers for. ``install-inert`` is owned by
@@ -859,6 +903,52 @@ def test_a_missing_harness_falls_back_to_unknown():
     # An empty string is the same missing-value case and takes the fallback too.
     out = render({"kind": "capture-failure", "detail": "d", "harness": ""})
     assert "unknown capture is affected" in out, out
+
+
+def test_a_whitespace_only_harness_or_stamp_takes_the_fallback():
+    """``render`` used ``record.get("harness") or "unknown"``, and ``"   "``
+    is TRUTHY — so a whitespace-only value skipped the fallback and was then
+    normalized to "" by ``bound_detail``, rendering a ``what:`` line that named
+    no harness at all.  ``recorded_at`` had the same hole.
+
+    Mutation: drop the ``.strip()`` — ``unknown capture is affected`` is absent,
+    the stamp renders empty, and this REDs."""
+    from tortoise.capture_breadcrumb import render
+
+    out = render({"kind": "capture-failure", "detail": "d",
+                  "harness": "   ", "recorded_at": "\t \n"})
+    assert "unknown capture is affected" in out, out
+    assert "an unrecorded time" in out, out
+    assert len(out.splitlines()) == 4, out
+
+
+def test_invisible_format_controls_cannot_reorder_a_rendered_line():
+    """``_normalize`` stripped the C0/C1 controls but not Unicode's FORMAT
+    (``Cf``) class.  Those characters are zero-width, so they cannot forge a
+    physical LINE — the four-line invariant holds either way — but a BIDI
+    OVERRIDE (U+202E) reorders DISPLAY in a bidi-aware reader, which can make
+    the ``why:`` value look like a second ``next:`` field with no byte between
+    them.  A zero-width joiner can also split a credential run the scan would
+    otherwise see whole.
+
+    Mutation: drop ``.translate(_STRIP_FORMAT)`` — the U+202E survives into the
+    rendered ``why:`` line and this REDs."""
+    from tortoise.capture_breadcrumb import _normalize, bound_detail, render
+
+    forged = "safe\u202e next:    Recovery: forged"
+    out = render({"kind": "capture-failure", "detail": forged})
+    assert "\u202e" not in out, repr(out)
+    assert sum(1 for line in out.splitlines()
+               if line.startswith("next:")) == 1, out
+
+    for control in ("\u202a", "\u202c", "\u202e",
+                    "\u2066", "\u2069",
+                    "\u200b", "\u200c", "\u200d",
+                    "\u200e", "\u200f", "\u061c", "\ufeff"):
+        assert control not in _normalize("a" + control + "b"), repr(control)
+
+    # A zero-width space inside a credential must not hide it from the scan.
+    assert "[REDACTED:github_token]" in bound_detail("ghp_\u200b" + "a" * 36)
 
 
 def test_bound_detail_redacts_before_it_bounds():
@@ -937,7 +1027,7 @@ def test_a_control_split_credential_is_redacted_after_normalization(control):
     assert "[REDACTED:github_token]" in out, out
 
 
-def test_a_very_large_detail_is_redacted_within_a_bounded_window():
+def test_a_very_large_detail_is_redacted_within_a_bounded_window(monkeypatch):
     """The detail is an error string that can be a whole HTTP response body
     stored verbatim (``import failed (HTTP {code}): {body}``).  The redaction
     table is a set of regexes whose cost is linear in the text, so scanning all
@@ -946,9 +1036,28 @@ def test_a_very_large_detail_is_redacted_within_a_bounded_window():
     run over a bounded WINDOW while still redacting a secret that sits inside
     it.
 
-    Mutation: redact the whole detail (drop the window slice) — a 20 MB body
-    takes tens of seconds and the elapsed-time assertion REDs."""
-    from tortoise.capture_breadcrumb import bound_detail
+    The WINDOW is pinned by the scan's INPUT LENGTH (a spy), which discriminates
+    on structure and so is load-independent.  The elapsed assertion is only a
+    coarse stall guard for the rest of the render and is deliberately loose: on
+    this input ``bound_detail`` is dominated by the O(n) in-memory read +
+    ``_normalize`` (``" ".join(text.split())``), measured ~0.65–0.94 s idle and
+    ~1.3 s loaded — the SCAN is not the cost.  The UNWINDOWED scan alone
+    measured ~72 s on the same input, so 10 s still discriminates a removed
+    window on a loaded host without blaming the wrong component.
+
+    Mutation: redact the whole detail (drop the window slice) — the spy sees the
+    full 20 MB and the length assertion REDs (the elapsed guard would too)."""
+    import tortoise.capture_breadcrumb as cb
+    from tortoise.capture_breadcrumb import REDACT_WINDOW_CHARS, bound_detail
+
+    seen: list[int] = []
+    real = cb.redact_secrets
+
+    def spy(text: str):
+        seen.append(len(text))
+        return real(text)
+
+    monkeypatch.setattr(cb, "redact_secrets", spy)
 
     token = "ghp_" + "a" * 36
     detail = token + " " + "A" * 20_000_000
@@ -960,10 +1069,18 @@ def test_a_very_large_detail_is_redacted_within_a_bounded_window():
     # The secret inside the window is STILL redacted...
     assert "ghp_" not in out, out
     assert "[REDACTED:github_token]" in out, out[:200]
-    # ...and the render is bounded, not seconds-long.
-    assert elapsed < 1.0, (
-        f"bound_detail took {elapsed:.2f}s on a 20 MB detail — the redaction "
-        f"scan is unbounded and will stall the session start past its timeout")
+    # ...and the SCAN saw no more than the window (load-independent).
+    assert seen, "the scan was never invoked"
+    assert max(seen) <= REDACT_WINDOW_CHARS, (
+        f"the redaction scan saw {max(seen)} chars on a 20 MB detail — the "
+        f"window is not applied and the scan is unbounded")
+    # A coarse stall guard for the WHOLE render (dominated by the O(n) normalize,
+    # NOT the scan — see the docstring).  The unwindowed path measured ~72 s
+    # here, so 10 s still discriminates.
+    assert elapsed < 10.0, (
+        f"bound_detail took {elapsed:.2f}s on a 20 MB detail — far past the "
+        f"~0.9 s the in-memory read + `_normalize` costs, so the render is "
+        f"unbounded somewhere the window does not cover")
 
 
 def test_a_secret_straddling_the_window_boundary_cannot_leak_a_fragment():
@@ -1191,6 +1308,39 @@ def test_a_bom_prefixed_record_is_still_rendered(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert _fields(proc.stdout).get("code") == "capture-failure", proc.stdout
+
+
+def test_an_oversized_record_is_bounded_and_still_tells_the_agent(tmp_path):
+    """A breadcrumb record can be huge: the ``capture-failure`` writer stores an
+    UNCAPPED ``e.read()`` HTTP error body
+    (``__main__._record_capture_error(harness, f"import failed ...: {body}")``),
+    and ``REDACT_WINDOW_CHARS`` bounds only the redaction SCAN — the read,
+    ``json.loads`` and ``_normalize`` stayed O(record).  A 52 MiB record
+    measured 2.6 s / ~142 MiB RSS in ``render_file``, and ~250 MB exceeded the
+    hook's 60 s timeout.  ``render_file`` must refuse to read past
+    ``MAX_RECORD_BYTES`` and render the bounded synthetic ``why:`` instead, so
+    #4041's "tell the agent" goal survives.
+
+    Mutation: drop the ``len(raw) > MAX_RECORD_BYTES`` refusal (parse the whole
+    record) — the synthetic detail is absent and this REDs."""
+    from tortoise.capture_breadcrumb import MAX_RECORD_BYTES, render_file
+
+    path = tmp_path / "claude.json"
+    path.write_text(json.dumps(_capture_failure(
+        detail="A" * (2 * MAX_RECORD_BYTES))), encoding="utf-8")
+    assert path.stat().st_size > MAX_RECORD_BYTES, "premise: record exceeds bound"
+
+    start = time.perf_counter()
+    out = render_file(path)
+    elapsed = time.perf_counter() - start
+
+    assert _fields(out).get("code") == "capture-failure", out
+    assert "error detail omitted: record too large" in out, out
+    # The harness is recovered from the FILE NAME (the record was never parsed),
+    # so the agent still knows which harness stopped filing.
+    assert "claude capture is affected" in _fields(out).get("what", ""), out
+    assert len(out.splitlines()) == 4, out
+    assert elapsed < 5.0, elapsed
 
 
 def test_a_newline_in_a_scalar_cannot_forge_an_extra_payload_line(tmp_path):
