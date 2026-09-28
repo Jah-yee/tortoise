@@ -2731,7 +2731,8 @@ def _supersede_window_end(*, old_id, new_id, old_vfs, valid_from,
     the predecessor became unreachable from every read surface with no error
     anywhere — a silent, permanent loss of the old fact.
 
-    Resolution order is unchanged and is the ONE home for it::
+    Resolution order is the same five SOURCES in the same order — a clause was
+    inserted, so the step list is not unchanged (#3985)::
 
         str(valid_from) → stored_vf (truthy) → stored_vf (falsey but
         ORDERABLE — #3985) → successor_created_at → now
@@ -6897,16 +6898,21 @@ class TortoiseSDK:
         # always True) — an unparseable QUERY instant also keys as
         # `(1, <text>)` and IS covered by it, so `""` only hides the successor
         # from parseable queries, which land in the predecessor's window end
-        # instead. The resolution
-        # branch below gates on TRUTHINESS instead (`elif stored_vf:`), so for
-        # those two values it falls through to `createdAt`. The guard follows
-        # `_covers`: with a kwarg present it refuses rather than allow an
-        # unchecked window end against a start the read path treats as real
-        # (a `validFrom=0` successor's `[epoch0, ∞)` window overlaps any
-        # predecessor end the kwarg writes at or after epoch 0, and gaps
-        # before it). The no-kwarg falsey case keeps
-        # the pre-existing truthiness fallback — its read/write divergence is
-        # real and tracked in #3985, not silently redefined here.
+        # instead.
+        #
+        # The resolution branch below now follows `_covers` for the case both
+        # paths can ORDER: `elif stored_vf:` (truthy) then
+        # `elif stored_vf is not None and _created_sort_key(stored_vf)[0] == 0:`
+        # (#3985), so a numeric `0` is the predecessor's `validTo` — the
+        # epoch-0 instant the read path already keys it as. Only the
+        # falsey-but-UNORDERABLE `""` still falls through to `createdAt`;
+        # that remaining divergence is the #3985 residual, and deciding whether
+        # `""` means an OPEN or an ABSENT start is the semantic question #3982
+        # owns. The guard follows `_covers`: with a kwarg present it refuses
+        # rather than allow an unchecked window end against a start the read
+        # path treats as real (a `validFrom=0` successor's `[epoch0, ∞)` window
+        # overlaps any predecessor end the kwarg writes at or after epoch 0,
+        # and gaps before it).
         vf_rows = proj.g.query(
             "MATCH (n:Point {id:$id}) RETURN n.validFrom, n.createdAt",
             params={"id": new_id},
