@@ -1373,6 +1373,38 @@ def test_refresh_step_skips_when_a_pr_is_already_open(
     )
 
 
+def test_refresh_step_keeps_a_pre_existing_branch_when_the_query_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed PR query says NOTHING about whether a PR exists — so it cannot be
+    the evidence for deleting a branch this run did not create. A branch that was
+    already on origin may be the head of an open PR, and `--delete` on it would
+    orphan (or close) that PR. Only a branch THIS run pushed is an orphan by
+    construction, so the cleanup is gated on that."""
+    repo = _make_refresh_repo(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo,
+                          capture_output=True, text=True, check=True).stdout.strip()
+    branch = f"chore/ci-timing-refresh-{head}"
+    # Put the branch this run is about to create ALREADY on origin, at the exact
+    # commit the step pushes from — so its push fast-forwards and SUCCEEDS, and the
+    # only thing that then fails is the PR query.
+    subprocess.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"],
+                   cwd=repo, check=True, capture_output=True)
+
+    proc, _ = _run_refresh_step(
+        tmp_path, monkeypatch, repo=repo, list_rc=1, list_out=None,
+    )
+    assert proc.returncode != 0, f"a failed query must fail the step\n{proc.stdout}"
+    remote = subprocess.run(
+        ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+        cwd=repo, capture_output=True, text=True,
+    ).stdout
+    assert remote.strip(), (
+        f"a failed query deleted a branch this run did not create — it may back an "
+        f"open PR:\n{remote}"
+    )
+
+
 def test_refresh_step_fails_loudly_when_pr_create_is_denied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
