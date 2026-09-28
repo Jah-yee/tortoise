@@ -757,6 +757,14 @@ def test_refresh_durations_on_the_real_manifest_of_record() -> None:
     before = manifest_path.read_text()
     _block, before_entries = ci_timing._locate_durations_block(before.split("\n"))
     assert before_entries, "the durations block must exist in the manifest of record"
+    # The OLD frozen literal's real function was not the number: it was an
+    # INDEPENDENT check that the parse is COMPLETE. Both sides of the comparison
+    # below come from `_locate_durations_block`, so a truncated parse shrinks
+    # them identically and compares equal — verified: truncating that helper to
+    # 250 entries made this test pass while the frozen literal caught it. PyYAML
+    # is the second implementation that restores that anchor without re-freezing
+    # a total, so a growing map is still no reason to red the lane (#6143).
+    assert set(before_entries) == set(yaml.safe_load(before)["durations"])
     new_text, stats = ci_timing.render_refreshed_manifest(
         before, {"test_bridge_table.py": 123.4}, "2026-09-28T00:00:00Z")
     assert stats["sampled_keys"] == 1
@@ -766,6 +774,7 @@ def test_refresh_durations_on_the_real_manifest_of_record() -> None:
     # total was, and it re-reddened the lane every time the map legitimately grew.
     _block2, after_entries = ci_timing._locate_durations_block(new_text.split("\n"))
     assert set(after_entries) == set(before_entries)
+    assert set(after_entries) == set(yaml.safe_load(new_text)["durations"])
     assert stats["manifest_keys"] == stats["carried_forward"] + stats["sampled_keys"]
     assert "  test_bridge_table.py: 123.4" in new_text
     assert "# #3395: per-file CI wall time" in new_text
