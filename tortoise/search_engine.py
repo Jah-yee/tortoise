@@ -1302,6 +1302,10 @@ def run_structural_query(
             f"MATCH (n:{label_str}) "
             f"WHERE {where_clause} "
             f"RETURN n.{id_field} "
+            # #3019: this leg scores every row a CONSTANT (1.0 / 0.5, below), so
+            # with no secondary key the WHOLE leg is an unordered tie and the
+            # caller's rank — hence the fused top-k — is DB row order.
+            f"ORDER BY n.{id_field} ASC "
             f"LIMIT $limit"
         )
         params["limit"] = limit

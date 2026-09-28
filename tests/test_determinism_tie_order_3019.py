@@ -35,7 +35,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: I001
 from tortoise import search_engine  # noqa: I001
-from tortoise.search_engine import reset_circuit_breakers, rrf_fusion, run_fts_query
+from tortoise.search_engine import (
+    reset_circuit_breakers,
+    rrf_fusion,
+    run_fts_query,
+    run_structural_query,
+)
 from tortoise.sdk import TortoiseSDK
 
 
@@ -141,21 +146,79 @@ def test_operator_fts_leg_orders_a_tied_result_by_id(sdk):
     assert got == sorted(got), f"a fully-tied leg is not id-ordered: {got}"
 
 
-# ── part 1, all three sites: the clause must not be tidied away ─────────────
+# ── part 1, all four sites: the clause must not be tidied away ─────────────
+
+
+def test_index_fts_leg_orders_a_tied_result_by_id(sdk):
+    """FAIL VALUE: the index-accelerated FTS leg returns rows in index order
+    instead of id order. #3019 asks to CONFIRM the engine honours multi-key
+    ordering on THIS path, not only the brute-force one — so this asserts the
+    behaviour rather than the query text.
+
+    THE FIXTURE REACHES IT: the three nodes are created in DESCENDING id order
+    and all match the term, so they score identically and the tie is real;
+    ``["alpha-ix", "mike-ix", "zulu-ix"]`` is unreachable unless the secondary
+    key is applied.
+    """
+    graph = sdk._get_proj().g
+    for pid in ["zulu-ix", "mike-ix", "alpha-ix"]:
+        graph.query(
+            "CREATE (n:Point {id:$id, content:'determinism needle', "
+            "pointKind:'statement'})",
+            params={"id": pid},
+        )
+
+    rows = run_fts_query(graph, "determinism needle", entity_type="point", limit=10,
+                         excluded_statuses=())
+    got = [pid for pid, _ in rows]
+
+    assert got, "FIXTURE NOT REACHED: the index FTS leg returned no rows"
+    assert len(got) == 3, f"FIXTURE NOT REACHED: expected 3 rows, got {got}"
+    assert got == sorted(got), f"an index-path tie is not id-ordered: {got}"
+
+
+def test_structural_leg_orders_a_constant_scored_result_by_id(sdk):
+    """FAIL VALUE: the structural leg returns its rows in DB row order.
+
+    This leg scores EVERY row a CONSTANT (``1.0`` when a kind is given, else
+    ``0.5``), so it is one tie exactly like the operator leg — and it carried no
+    ``ORDER BY`` at all, which made it the one leg that was completely unordered.
+
+    THE FIXTURE REACHES IT: the three nodes are created in DESCENDING id order,
+    so ``["alpha-st", "mike-st", "zulu-st"]`` is unreachable unless the ordering
+    is imposed.
+    """
+    graph = sdk._get_proj().g
+    for pid in ["zulu-st", "mike-st", "alpha-st"]:
+        graph.query(
+            "CREATE (n:Point {id:$id, pointKind:$kind, content:$id})",
+            params={"id": pid, "kind": "statement"},
+        )
+
+    rows = run_structural_query(graph, "statement", entity_type="point", limit=10,
+                                excluded_statuses=())
+    got = [pid for pid, _ in rows]
+
+    assert got, "FIXTURE NOT REACHED: the structural leg returned no rows"
+    assert len(got) == 3, f"FIXTURE NOT REACHED: expected 3 rows, got {got}"
+    assert got == sorted(got), f"a constant-scored leg is not id-ordered: {got}"
 
 
 def test_every_leg_query_carries_a_secondary_sort_key():
     """A CONTRACT PIN, not behavioural coverage (the behaviour is proved above for
-    the brute-force path; the index-FTS and vector paths would each need a live
-    index to exercise here).
+    the two brute-force paths; the index-FTS and vector paths would each need a
+    live index to exercise here).
 
-    FAIL VALUE: any one of the three leg queries reverting to a bare
-    ``ORDER BY score DESC`` makes the count 2 and the matching assertion fail.
+    FAIL VALUE: any one of the four leg queries losing its tie key makes the
+    count 3 and the matching assertion fail. The count matters: an earlier
+    version pinned exactly 3, which silently ENSHRINED the structural leg's
+    missing ordering rather than catching it.
     """
     src = inspect.getsource(search_engine)
     assert "ORDER BY score DESC, n.id ASC" in src, "operator leg lost its tie key"
     assert "ORDER BY score DESC, node.{id_field} ASC" in src, "index FTS leg lost its tie key"
     assert "ORDER BY score DESC, n.{id_field} ASC" in src, "vector leg lost its tie key"
+    assert "ORDER BY n.{id_field} ASC" in src, "structural leg lost its ordering"
     assert src.count("ORDER BY score DESC, ") == 3, (
-        "expected exactly 3 tie-keyed leg queries"
+        "expected exactly 3 tie-keyed scored leg queries"
     )
