@@ -13,7 +13,8 @@ they are partitioned OUT of the human population and reported separately. This i
 the single largest accounting error in earlier readings of this queue.
 
 Segments — the issue's three legs (mutually exclusive; asserted to partition the
-human population's elapsed time):
+human population's ACCOUNTED elapsed time — the 2 merged no-gate PRs are the
+`unknown` bucket, disclosed separately rather than forced into a leg):
 
   (a)  created            -> entry-gate success   (a MERGED human PR)
   (b)  entry-gate success -> merged               (a MERGED human PR)
@@ -39,7 +40,8 @@ Design notes that are load-bearing:
   page's oldest `updated_at` precedes the window.
 
 * **Survivorship is a reported bucket, never a silent drop.** A PR still open
-  has no end timestamp; it is counted under `in_flight` and reconciled.
+  has no end timestamp; it is counted in `human_open_now` and is NOT reconciled
+  against the closed population.
 
 * **"Entry-gate success" is the AND of the `.mergify.yml` `queue_conditions`**
   (read at run time, never hardcoded — the set changed mid-window once). The
@@ -300,20 +302,26 @@ def gate_success(gh: Gh, repo: str, pr_number: int, contexts: list[str],
 
 
 def _span(runs: list[dict], newest_only: bool) -> float | None:
-    """Wall-clock span of a set of check-runs, optionally newest attempt per name."""
-    pts = [(ts(r.get("started_at")), ts(r.get("completed_at")), r.get("name"))
+    """Wall-clock span of a set of check-runs, optionally newest attempt per group.
+
+    `newest_only` keeps the newest attempt per `(app.slug, name)`, by max `id` —
+    the same key and the same tie-break the gate rule uses.
+    """
+    pts = [(ts(r.get("started_at")), ts(r.get("completed_at")), r.get("name"),
+            (r.get("app") or {}).get("slug"), r.get("id") or 0)
            for r in runs]
-    pts = [(s, e, n) for (s, e, n) in pts if s and e]
+    pts = [(s, e, n, a, i) for (s, e, n, a, i) in pts if s and e]
     if not pts:
         return None
     if newest_only:
-        newest: dict[str, tuple] = {}
-        for s, e, n in pts:
-            if n not in newest or e > newest[n][1]:
-                newest[n] = (s, e)
-        sel = list(newest.values())
+        newest: dict[tuple, tuple] = {}
+        for s, e, n, a, i in pts:
+            key = (a, n)
+            if key not in newest or i > newest[key][2]:
+                newest[key] = (s, e, i)
+        sel = [(s, e) for s, e, _i in newest.values()]
     else:
-        sel = [(s, e) for s, e, _ in pts]
+        sel = [(s, e) for s, e, _n, _a, _i in pts]
     return (max(e for _, e in sel) - min(s for s, _ in sel)).total_seconds()
 
 
@@ -446,8 +454,6 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             "closed_at": closed_at.isoformat() if closed_at else None,
             "merged_at": merged_at.isoformat() if merged_at else None,
             "draft": bool(pr.get("draft")),
-            "additions": pr.get("additions"),
-            "changed_files": pr.get("changed_files"),
         }
         reviews = gh.paged(f"repos/{repo}/pulls/{pr['number']}/reviews?per_page={PAGE}")
         fa = first_activity(gh, repo, pr, reviews)
@@ -701,6 +707,19 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             "ci_rerun": statistics.median(ci_rerun) if ci_rerun else None,
             "review_rounds": statistics.median([r["review_rounds"] for r in rows]) if rows else None,
         },
+        # CI's share of the dominant leg, as an UPPER BOUND. The queue-branch
+        # suite that actually gates the merge (`python-ci-gate`) is not separately
+        # observable here, so this charges the ENTIRE full head-CI wall clock to
+        # queue residence; if that bound is small, no queue-branch CI figure can
+        # make CI the binding constraint.
+        "ci_share_of_merge_leg_bound_pct": {
+            "full_suite_median": (round(100.0 * statistics.median(ci_final)
+                                         / med(merged, "seconds_b"), 2)
+                                   if ci_final and med(merged, "seconds_b") else None),
+            "entry_gate_median": (round(100.0 * statistics.median(ci_gate)
+                                        / med(merged, "seconds_b"), 3)
+                                  if ci_gate and med(merged, "seconds_b") else None),
+        },
         "totals": {
             "human_pr_time_seconds": round(total_secs, 1),
             "merged_pr_time_seconds": round(merged_secs, 1),
@@ -750,6 +769,7 @@ def render(result: dict) -> str:
     active_n = sum(1 for r in result["prs"] if r.get("first_activity_seconds") is not None)
     active_merged_n = sum(1 for r in result["prs"] if r.get("a_gate_seconds") is not None)
     split = result["merge_path_split_pct"]
+    bound = result["ci_share_of_merge_leg_bound_pct"]
     ts = result["leg_shares_of_total_pct"]
 
     def pct(v) -> str:
@@ -781,6 +801,9 @@ def render(result: dict) -> str:
           f"CI on head: final pass median={minutes(m['ci_final_pass'])} "
           f"| gate pass median={minutes(m['ci_gate_pass'])} "
           f"| rerun total={t['ci_rerun_seconds']/3600:.1f}h",
+          f"  CI charged to the merge leg (UPPER BOUND): full suite="
+          f"{pct(bound.get('full_suite_median'))} | entry gate="
+          f"{pct(bound.get('entry_gate_median'))} of (b)",
           f"queue-PR probe lifetime: median="
           f"{result['queue_pr_lifetime'].get('median_seconds',0)/60:.1f}min "
           f"(n={result['queue_pr_lifetime'].get('n',0)})"]
