@@ -182,6 +182,61 @@ STATE_VALUE_CARVE_OUT = (
     "ephemeral counters not central to a decision."
 )
 
+# #1507: the SHORT-SESSION fact-retention clause. The granularity bar was
+# calibrated on LONG design sessions, where the narrative-first rule pays off
+# (Multi-Session +2.6pp, Abstention +11.9pp). On a SHORT, fact-dense session it
+# misfires: the mapper reads the bar as "this turn is too small to be worth a
+# point" and under-extracts the very facts the session exists to record.
+# Measured (#1350, official judge, 500-Q): Information Extraction 76.5% vs the
+# deterministic baseline's 84.7% (-8.2pp) — the ONE clear regression of the v2
+# pipeline — with 0-2 points per short session against a 3-5 target.
+#
+# SCOPE — what this clause does and does NOT assert. The operative instruction
+# ("emit each qualifying claim separately rather than folding it") is
+# length-INDEPENDENT, and that is deliberate: the failure it repairs is a FOLD,
+# and a fold loses a short session's facts far more often than a long one's
+# (there is nothing else in the session to fall back on). No figure above
+# measures THIS clause's long-session effect: the +2.6pp/+11.9pp arms were
+# measured on the PRE-CHANGE pipeline and are not re-measured here. They MUST
+# NOT regress (the issue's indicator (b)), which is a no-regression
+# requirement, not a claim this change improved them.
+#
+# QUALIFICATION is load-bearing, not decoration. "Every stated quantity is
+# durable" would re-admit exactly what S2_TMPL's VALUE FILTER and
+# VALUE_FIDELITY_RULE exclude (test counts, routine readouts), and S1 carries
+# NO anti-routine gate to catch it — so the enumeration is qualified by the
+# SAME test the carve-out uses ("the subject of a decision, observation, or
+# plan"). This clause changes WHERE a qualifying value is emitted, never
+# WHETHER it qualifies.
+#
+# NO NUMERIC RANGE. An earlier draft said "typically 3 to 5 points where the
+# turns previously yielded 0 to 2". Dropped: it contradicts "a point per fact"
+# (if a short session holds one or two facts, 3-5 is reachable only by
+# splitting or hoarding) and models anchor on ranges — it would have
+# functioned as the quota the same sentence disclaimed.
+#
+# SEAMS: S1 (_granularity_text) and the S2/S4 {anti_routine} slot
+# (_s2s4_rules) — deliberately NOT the master render, which would emit it a
+# second time inside the same prompt. The slot is the shared rule-write site
+# (#2453), which is why the clause rides it rather than the master render.
+SHORT_SESSION_FACT_RULE = (
+    "SHORT-SESSION FACT RETENTION (the granularity bar is a predicate over "
+    "content, NEVER over session length): do NOT read a short or sparse "
+    "conversation as 'too small to be worth a point' — brevity is not "
+    "insignificance, and the whole content of a short session is often the "
+    "one or two facts in it. The bar asks whether a claim is DURABLE, not "
+    "how long the session was.\n"
+    "Emit each qualifying claim SEPARATELY rather than folding the session's "
+    "facts into one summary point: a stated date, deadline, name, role, "
+    "quantity, version, threshold, commitment, decision, or stated "
+    "preference is its OWN point WHEN it is the subject of a decision, "
+    "observation, or plan — the OPERATIONAL-VALUE CARVE-OUT decides "
+    "WHICH; this clause decides only WHERE a qualifying value is emitted, "
+    "never WHETHER it qualifies. A routine readout that is not a thing being "
+    "fixed or a chosen target is still a no-op, so do not pad with routine "
+    "asides or mint kinds to reach a count."
+)
+
 
 # #2424 (compounds with #2453 — one PR): the ANTI-ROUTINE exclusion gate —
 # the mapper-level NOOP (Mem0 semantics: a per-candidate relevance decision,
@@ -316,7 +371,8 @@ def _s2s4_rules() -> str:
     (the #2424 residual clause-level strip and the operator rules live in
     the shared blocks, so every mapping stage carries them)."""
     return (ANTI_ROUTINE_EXCLUSION + "\n\n" + VALUE_FIDELITY_RULE
-            + "\n\n" + OPERATOR_SEMANTICS_RULE)
+            + "\n\n" + OPERATOR_SEMANTICS_RULE
+            + "\n\n" + SHORT_SESSION_FACT_RULE)
 
 
 CORE_OBJECT_KEYS = (
@@ -807,7 +863,8 @@ def _granularity_text(master: dict | None = None) -> str:
     master = master or build_master_list()
     g = master.get("memory_granularity", {})
     out = "\n".join(f"- {ns}: {txt}" for ns, txt in g.items())
-    return f"{out}\n{STATE_VALUE_CARVE_OUT}" if out else STATE_VALUE_CARVE_OUT
+    head = f"{out}\n{STATE_VALUE_CARVE_OUT}" if out else STATE_VALUE_CARVE_OUT
+    return head + "\n" + SHORT_SESSION_FACT_RULE
 
 
 # ── Session-date anchoring (E1, #1533) ────────────────────────────────────
