@@ -991,19 +991,30 @@ def collect_conflicts(bound=None):
 def collect_fast_files_unclassified():
     """Files in no manifest classification. Mirrors `ci_selection.integrity()`.
 
-    Files are classified by their tests/-relative path (not basename) and the
-    `tests/e2e/` prefix is skipped, exactly as the drift trap does (#5215).
+    Files are classified by their tests/-relative path (not basename), and both
+    the `tests/e2e/` prefix and the `on_demand:` lane are skipped, exactly as
+    the drift trap does (#5215, #5961). Skipping the on-demand lane is not
+    optional: it is a CLASSIFICATION — the file is deliberately absent from
+    every surface because it does not gate the merge — so it is not drift, and
+    counting it here makes this collector disagree with the trap it mirrors.
     """
     try:
         sys.path.insert(0, str(REPO / "tools"))
         import ci_selection as cs
 
         manifest = cs.load_manifest()
+        on_demand = cs.on_demand_files(manifest)
         tests_dir = REPO / "tests"
         unclassified = []
         for path in sorted(tests_dir.rglob("test_*.py")):
             rel = path.relative_to(tests_dir)
             if rel.parts[0] == "e2e":
+                continue
+            # Same exemption from the same source as `integrity()`. Read the
+            # lane through `on_demand_files()` rather than reaching into the
+            # manifest again, so a file in the on-demand lane is never counted
+            # as unclassified here while the trap it mirrors exempts it.
+            if str(rel) in on_demand or rel.name in on_demand:
                 continue
             if cs.classify_test_file(str(rel), manifest) is None:
                 unclassified.append(str(rel))
