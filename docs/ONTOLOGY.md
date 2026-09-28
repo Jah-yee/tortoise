@@ -4,7 +4,7 @@ type: data
 domain: data
 status: live
 created: 2026-08-05
-updated: 2026-09-27
+updated: 2026-09-28
 ownedBy: epistemic-team
 aboutSubjects: epistemic-team
 aboutObjects: tortoise
@@ -46,11 +46,12 @@ doc_status: live
 >   guard refuses the write rather than persisting an inverted window.
 > - §4.7 (`validTo`): **narrows, and does not resolve,** the v3.13 sentence above. The
 >   falsey-**and-unorderable** `""` still falls through to `createdAt`, so `write != read` for
->   `""` remains. Whether `""` is an OPEN or an ABSENT start is the semantic question **#3982**
->   owns and is deliberately not decided here.
+>   `""` remains. Which of the two is intended — an OPEN window start or an ABSENT one — is an
+>   owner decision over temporal semantics, not a predicate alignment, so it is left open and
+>   tracked as **#6140** (deliberately not decided here; it is NOT #3982, which ruled on
+>   date-only parsing and is closed).
 > - Supersedes the v3.13 no-kwarg sentence's scope from "the falsey case" to "the
->   falsey-and-unorderable case". Which of the two the owner considers the intended contract was
->   never ruled on; this entry records only what the code now does.
+>   falsey-and-unorderable case". This entry records only what the code now does.
 >
 > **Changelog v3.18 (2026-09-27 — issue #5025, owner ruling — `related` is the neutral association link and carries no EP):**
 > - §3.9: **`related` is defined.** It means *connected, and nothing more* — no

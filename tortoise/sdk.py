@@ -2801,9 +2801,11 @@ def _supersede_window_end(*, old_id, new_id, old_vfs, valid_from,
     falsey-but-unparseable ``""`` start still falls through to
     ``successor_created_at``, so write != read for it.  Making it agree means
     deciding whether ``""`` should be an OPEN end or an absent one, which is
-    a semantic choice (the #3982 shape) and an owner decision — not a
-    predicate alignment.  What #3985 does fix is the case where the two paths
-    CAN be made to agree without one: a start both paths can order.
+    a semantic choice of the same CLASS as #3982's (that one ruled on
+    date-only parsing; this is a different question) and an owner decision —
+    not a predicate alignment.  It is tracked as **#6140**.  What #3985 does
+    fix is the case where the two paths CAN be made to agree without one: a
+    start both paths can order.
 
     The ``valid_from``-vs-successor agreement guard is NOT here: it is
     reachable only when a kwarg is passed, and it stays inline at its
@@ -6906,9 +6908,11 @@ class TortoiseSDK:
         # (#3985), so a numeric `0` is the predecessor's `validTo` — the
         # epoch-0 instant the read path already keys it as. Only the
         # falsey-but-UNORDERABLE `""` still falls through to `createdAt`;
-        # that remaining divergence is the #3985 residual, and deciding whether
-        # `""` means an OPEN or an ABSENT start is the semantic question #3982
-        # owns. The guard follows `_covers`: with a kwarg present it refuses
+        # that remaining divergence is the #3985 residual. Deciding it is an
+        # owner call on temporal semantics, not a predicate alignment, so it
+        # is tracked as #6140 and deliberately left open here. (It is NOT
+        # #3982 — that ruled on date-only parsing and is closed.)
+        # The guard follows `_covers`: with a kwarg present it refuses
         # rather than allow an unchecked window end against a start the read
         # path treats as real (a `validFrom=0` successor's `[epoch0, ∞)` window
         # overlaps any predecessor end the kwarg writes at or after epoch 0,
