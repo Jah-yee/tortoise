@@ -742,6 +742,22 @@ def test_refresh_durations_preserves_unknown_top_level_keys(tmp_path: Path) -> N
     assert "future_key: a-value" in new_text
 
 
+def _durations_line_count(lines: list[str], block_start: int) -> int:
+    """Raw `key: <seconds>` lines inside the durations block, duplicates INCLUDED.
+
+    Bounded by the next top-level key using the same termination rule as
+    `_locate_durations_block`, so a `name: number` line elsewhere in the manifest
+    can never red this test for the wrong reason — a false red is the bug this
+    whole change is about.
+    """
+    def ends_block(line: str) -> bool:
+        return (bool(line.strip()) and not line.lstrip().startswith("#")
+                and not line[:1].isspace())
+    end = next((i for i in range(block_start + 1, len(lines)) if ends_block(lines[i])), len(lines))
+    return sum(1 for line in lines[block_start + 1:end]
+               if ci_timing._DURATION_LINE_RE.match(line))
+
+
 def test_refresh_durations_on_the_real_manifest_of_record() -> None:
     """The committed durations map is refreshed without corruption: comments
     survive, a sampled value changes, every OTHER key is carried forward, and
@@ -790,6 +806,13 @@ def test_refresh_durations_on_the_real_manifest_of_record() -> None:
     assert set(after_entries) == set(yaml.safe_load(new_text)["durations"])
     for key, index in after_entries.items():
         assert ci_timing._DURATION_LINE_RE.match(after_lines[index]).group("key") == key
+    # A DUPLICATE LINE is blind to every assertion above: `_locate_durations_block`,
+    # PyYAML and the round-trip all resolve duplicates last-wins, so the key sets
+    # agree and only the surviving line is ever inspected — while the duplicate
+    # silently wins the value. This manifest has a history of exactly that defect
+    # (#2858, #3052). Count raw block lines, not distinct keys.
+    assert _durations_line_count(after_lines, _block2) == len(after_entries), (
+        "the refreshed manifest emitted a duplicate duration key")
     assert stats["manifest_keys"] == stats["carried_forward"] + stats["sampled_keys"]
     assert "  test_bridge_table.py: 123.4" in new_text
     assert "# #3395: per-file CI wall time" in new_text
