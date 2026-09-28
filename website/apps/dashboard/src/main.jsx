@@ -869,8 +869,113 @@ const SKEL_LABEL = { width: '45%', height: '1.2em' }
 // button convention used by the build fork and the key rows). The three-way
 // intent is deliberately NOT preserved: keeping "click anywhere copies" would
 // require the container to stay a control, which is the violation itself.
+
+// #2935: the ONE clipboard-write seam for every Copy control in the wizard's
+// CONNECT step (this card + the three inline buttons below). The two pre-fix
+// shapes were `navigator.clipboard.writeText(text)` fired WITHOUT await/catch
+// while the success state was set unconditionally (this card), and
+// `navigator.clipboard?.writeText(text)` with no feedback at all (the inline
+// buttons). `?.` covers only a MISSING clipboard object — never the real failure
+// mode, a write that REJECTS (permission denied, non-secure context, no user
+// activation). So a rejected write still flipped the label to "Copied ✓" and
+// announced "Copied to clipboard" while the clipboard held the previous payload,
+// and the user pasted the wrong thing into their agent config.
+//
+// The write's promise IS the observation. This runs one attempt and owns the
+// whole feedback lifecycle, so the button label, the live region and the visible
+// error affordance can only ever tell the truth the platform confirmed.
+//
+// Every published state carries an `attempt` token (a counter on the control's
+// ref). The token does two jobs:
+//   * LAST-WINS — a click during an in-flight write starts a newer attempt, and
+//     the earlier write, whenever it finally settles, must not publish over it;
+//   * RE-ANNOUNCE — the visible failure is keyed on the token, so a repeated
+//     failure REMOUNTS the `role="alert"` node instead of re-rendering identical
+//     text. That makes a retry audible even when both publishes land in one React
+//     batch (a synchronous throw from a missing clipboard), and it is why no
+//     "clear to idle first" is needed: the error the user is reading stays
+//     mounted while the retry is in flight.
+//
+// Only a RESOLVED write reaches the success state and schedules the 1.6s reset;
+// that timer is bound to its own token, so an earlier attempt's timer can never
+// clear (or truncate) a later attempt's flash.
+const COPY_IDLE = { copied: false, failed: false, attempt: 0 }
+const COPY_FAILED_MESSAGE = 'Your browser blocked the clipboard — select the text and press ⌘/Ctrl-C.'
+const COPY_FLASH_MS = 1600
+
+async function runCopyAttempt(text, setCopy, attemptRef, button) {
+  const attempt = attemptRef.current + 1
+  attemptRef.current = attempt
+  let outcome
+  try {
+    // #2935 (round-52 review): the write's PROMISE is the observation. A `writeText` that returns
+    // nothing — a page-level shim, an extension overriding `navigator.clipboard`, a non-conforming
+    // polyfill — has observed NOTHING, and `await undefined` RESOLVES, so awaiting it blindly
+    // manufactures a success over an untouched clipboard (byte-for-byte the #2935 harm). Only a
+    // THENABLE may be awaited and reported; anything else fails closed like a rejection.
+    const write = navigator.clipboard.writeText(text)
+    if (!write || typeof write.then !== 'function') throw new Error('clipboard write did not return a promise')
+    await write
+    outcome = { copied: true, failed: false, attempt }
+  } catch {
+    outcome = { copied: false, failed: true, attempt }
+  }
+  // An earlier attempt settling late must not publish over a newer one.
+  if (attemptRef.current !== attempt) return
+  setCopy(outcome)
+  if (outcome.copied) {
+    setTimeout(() => setCopy((cur) => (cur.attempt === attempt && cur.copied ? { ...COPY_IDLE, attempt } : cur)), COPY_FLASH_MS)
+    return
+  }
+  // The manual-copy fallback is BEST-EFFORT and ISOLATED. It runs only for the
+  // attempt that actually published — a superseded attempt must never move the
+  // user's selection — and a throw inside it can never suppress the failure
+  // report above (a silent failure is the class this issue exists to remove).
+  try { selectCopyTarget(button) } catch { /* the report above already told the user */ }
+}
+
+// The Copy control's label, from the attempt's own outcome. A failed attempt
+// returns the IDLE label — never "Copied ✓" — and the visible error below the
+// control carries the failure.
+function copyLabel(outcome, idleLabel) {
+  return outcome.copied ? 'Copied ✓' : idleLabel
+}
+
+// #2935 (review cycle 3): the manual-copy fallback for a REJECTED write — select
+// the text this control could not copy (the card's prompt `<pre>`, the key/URL
+// `<code>`) so a keyboard-only user still has a path: ⌘/Ctrl-C copies the
+// selection. It mirrors the create/rotate reveal's fallback (#4330/#4342). A miss
+// is a silent no-op — `COPY_FAILED_MESSAGE` does NOT claim a selection, so a miss
+// can never become a false claim.
+function selectCopyTarget(button) {
+  if (!button || typeof button.closest !== 'function') return
+  const scope = button.parentElement
+  const card = button.closest('.wizard-prompt-card')
+  const target = (scope && scope.querySelector && scope.querySelector('code, pre'))
+    || (card && card.querySelector && card.querySelector('pre'))
+  if (!target) return
+  const range = document.createRange()
+  range.selectNodeContents(target)
+  const selection = window.getSelection()
+  if (!selection) return
+  selection.removeAllRanges()
+  selection.addRange(range)
+}
+
 function WizardPromptCard({ text, label }) {
-  const [copied, setCopied] = React.useState(false)
+  const [copy, setCopy] = React.useState(COPY_IDLE)
+  const attemptRef = React.useRef(0)
+  // #2935 (review cycle 2): a surface / key-mode switch changes `text` without
+  // remounting this card, so a stale failure must not sit beside a prompt the
+  // user never tried to copy. Bump the attempt (never reset it to 0: the counter
+  // stays monotonic so an in-flight write for the OLD text cannot publish, and an
+  // OLD flash timer cannot collide with the new text's first attempt).
+  // Round 50 (review): LAYOUT effect, not `useEffect`. A passive effect runs
+  // AFTER the browser paints, so the frame that first shows the new prompt still
+  // carried the old outcome — `Copied ✓` beside a prompt that was never copied —
+  // for ~16ms (measured by rAF frame sampling). `useLayoutEffect` resets before
+  // paint, so the new prompt is never painted with a stale claim.
+  React.useLayoutEffect(() => { attemptRef.current += 1; setCopy(COPY_IDLE) }, [text])
   // #2912 (PR-gate a11y): the scroll region must have a UNIQUE accessible name
   // per card — the 2-card surfaces (Pi, Cursor) render two `role="region"`
   // landmarks, and a shared "Setup prompt" name made them
@@ -881,11 +986,7 @@ function WizardPromptCard({ text, label }) {
   // circles above them own the order, so the button/region names describe the
   // PROMPT instead ("Copy the connect prompt" → "the connect prompt").
   const regionLabel = label ? label.replace(/^Copy\s+/i, '') : 'Setup prompt'
-  const doCopy = React.useCallback(() => {
-    navigator.clipboard.writeText(text)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1600)
-  }, [text])
+  const doCopy = React.useCallback((event) => runCopyAttempt(text, setCopy, attemptRef, event && event.currentTarget), [text])
   return (
     <div className="wizard-prompt-card">
       {/* #2912 (review cycle 2): the long prompts scroll, so the <pre> is a
@@ -896,13 +997,25 @@ function WizardPromptCard({ text, label }) {
       {/* #2827 (round-2 P2): the button's own label flips to 'Copied ✓' for
           1.6s — a sighted-only signal. This live region announces the copy
           outcome to screen readers. */}
-      <span className="sr-only" role="status" aria-live="polite">{copied ? 'Copied to clipboard' : ''}</span>
+      <span className="sr-only" role="status" aria-live="polite">{copy.copied ? 'Copied to clipboard' : ''}</span>
       <div className="wizard-prompt-actions">
-        <button type="button" className={copied ? 'ghost small' : 'btn-primary small'}
+        <button type="button" className={copy.copied ? 'ghost small' : 'btn-primary small'}
           onClick={doCopy}>
-          {copied ? 'Copied ✓' : (label || 'Copy')}
+          {copyLabel(copy, label || 'Copy')}
         </button>
       </div>
+      {/* #2935 (review cycle 1, a11y): the failure is announced ONCE, by the
+          visible `role="alert"` below. A second copy of the sentence in the live
+          region made a screen reader read it twice (mirrors the #4330 reveal).
+          Cycle 2: the `key` remounts the alert for a REPEATED failure, so a
+          retry is re-announced even when the text is unchanged.
+          Round 49 (UX review): the alert renders AFTER the actions row, like the
+          three inline controls — placed above it, the 12px alert pushed the
+          button down 26-41px, so `elementFromPoint` at the point the user had
+          just clicked returned the alert and a retry there never registered. */}
+      {copy.failed && (
+        <p key={copy.attempt} className="error" role="alert" style={{ margin: 0, fontSize: 12, textAlign: 'center' }}>{COPY_FAILED_MESSAGE}</p>
+      )}
     </div>
   )
 }
@@ -932,6 +1045,29 @@ function WizardBlock({ step, title, children }) {
       </h2>
       <div className="wizard-block-body">{children}</div>
     </section>
+  )
+}
+
+// #2935: the connect step's three inline Copy controls (the step-1 API-key
+// block, the key row, and the Claude connector's "Copy URL"). Each instance owns
+// its own attempt state, so a failure on one control can never flip another's
+// label; all three report through the same observed-write seam as the card.
+function InlineCopyButton({ text, label = 'Copy', className = 'btn-primary small', style }) {
+  const [copy, setCopy] = React.useState(COPY_IDLE)
+  const attemptRef = React.useRef(0)
+  // #2935 (review cycle 2): the target (the API key / MCP URL) can change under
+  // this control, so a stale failure must not carry over to the new target. The
+  // counter stays monotonic (see the card) so a superseded write cannot publish.
+  React.useLayoutEffect(() => { attemptRef.current += 1; setCopy(COPY_IDLE) }, [text])
+  const onClick = React.useCallback((event) => runCopyAttempt(text, setCopy, attemptRef, event.currentTarget), [text])
+  return (
+    <>
+      <button type="button" className={className} style={style} onClick={onClick}>
+        {copyLabel(copy, label)}
+      </button>
+      <span className="sr-only" role="status" aria-live="polite">{copy.copied ? 'Copied to clipboard' : ''}</span>
+      {copy.failed && <span key={copy.attempt} className="error" style={{ display: 'block', flexBasis: '100%', marginTop: '0.35rem', fontSize: 12 }} role="alert">{COPY_FAILED_MESSAGE}</span>}
+    </>
   )
 }
 
@@ -7540,13 +7676,11 @@ function claimIntentInFlight() {
                             <p className="dim small" style={{ marginBottom: '0.4rem' }}>
                               Copy your API key now.
                             </p>
-                            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                              <code style={{ flex: 1, padding: '0.6rem 0.8rem', background: 'var(--surface,#0d1a2d)', border: '1px solid var(--border,#1e293b)', borderRadius: 8, fontSize: 13, wordBreak: 'break-all' }}>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+                              <code style={{ flex: 1, minWidth: 0, padding: '0.6rem 0.8rem', background: 'var(--surface,#0d1a2d)', border: '1px solid var(--border,#1e293b)', borderRadius: 8, fontSize: 13, wordBreak: 'break-all' }}>
                                 {harnessKey}
                               </code>
-                              <button type="button" className="btn-primary" onClick={() => navigator.clipboard?.writeText(harnessKey)}>
-                                Copy
-                              </button>
+                              <InlineCopyButton text={harnessKey} className="btn-primary" />
                             </div>
                             <p className="wizard-note">{KEY_VISIBILITY_NOTE}</p>
                           </>
@@ -7632,7 +7766,7 @@ function claimIntentInFlight() {
                         <div className="key-row">
                           <p className="dim small">Your API key:</p>
                           <code style={wizardKeyCodeStyle}>{harnessKey}</code>
-                          <button type="button" className="btn-primary small" onClick={() => navigator.clipboard?.writeText(harnessKey)}>Copy</button>
+                          <InlineCopyButton text={harnessKey} />
                         </div>
                       ) : null
 
@@ -7700,8 +7834,7 @@ function claimIntentInFlight() {
                             <ul className="wizard-fields">
                               <li>Name: <strong>Tortoise</strong></li>
                               <li>Server URL: <code>{CANONICAL_MCP_URL}</code>
-                                <button type="button" className="ghost small" style={{ marginLeft: '0.5rem' }}
-                                  onClick={() => navigator.clipboard?.writeText(CANONICAL_MCP_URL)}>Copy URL</button>
+                                <InlineCopyButton text={CANONICAL_MCP_URL} label="Copy URL" className="ghost small" style={{ marginLeft: '0.5rem' }} />
                               </li>
                             </ul>
                             <p className="wizard-caption">
