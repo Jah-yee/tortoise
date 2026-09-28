@@ -6911,7 +6911,7 @@ class TortoiseSDK:
         # that remaining divergence is the #3985 residual. Deciding it is an
         # owner call on temporal semantics, not a predicate alignment, so it
         # is tracked as #6140 and deliberately left open here. (It is NOT
-        # #3982 — that ruled on date-only parsing and is closed.)
+        # #3982 — that one ruled on date-only parsing, a different question.)
         # The guard follows `_covers`: with a kwarg present it refuses
         # rather than allow an unchecked window end against a start the read
         # path treats as real (a `validFrom=0` successor's `[epoch0, ∞)` window
