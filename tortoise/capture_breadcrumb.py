@@ -99,6 +99,45 @@ REDACT_WINDOW_CHARS = MAX_DETAIL_CHARS + _REDACT_MARGIN
 #: their value at this column, so the payload reads as a table.
 _FIELD_WIDTH = 10
 
+#: Control characters REMOVED before the redaction scan — every C0/DEL and C1
+#: control that is NOT whitespace (whitespace is collapsed to a space first, so
+#: removing it here would glue words together).  ``str.translate`` deletes a
+#: ``None`` target.
+#:
+#: ⛔ REMOVAL, NOT COLLAPSE — AND BEFORE THE SCAN, NOT AFTER.  The shell half
+#: captures this payload with ``payload="$(...)"``, and command substitution
+#: strips EVERY NUL byte.  A credential with a NUL inside it therefore scans as
+#: an unmatched fragment and is then RE-JOINED into contiguous cleartext on the
+#: way out: the redactor sees ``ghp_\x00…``, bash removes the NUL, and the
+#: injected stdout carries the whole ``ghp_…`` token.  Removing the control
+#: BEFORE the scan means the scan sees the bytes the transport will actually
+#: emit.  The record is reachable, not synthetic: the ``capture-failure``
+#: detail is ``f"import failed (HTTP {code}): {e.read().decode('utf-8',
+#: 'replace')}"``, and a UTF-16LE / mis-decoded body is
+#: ``g\x00h\x00p\x00_\x00…`` — every credential character NUL-separated.
+_STRIP_CONTROLS: dict[int, None] = {
+    **{cp: None for cp in range(0x20) if not chr(cp).isspace()},
+    0x7F: None,
+    **{cp: None for cp in range(0x80, 0xA0) if not chr(cp).isspace()},
+}
+
+
+def _normalize(text: str) -> str:
+    """The ONE normalization the redaction scan must see.
+
+    Whitespace — newlines included — collapses to single spaces and leading/
+    trailing whitespace is dropped (so the rendered line is ONE line); then the
+    non-whitespace control characters are removed.  This runs BEFORE
+    :func:`redact_secrets`, and the order is load-bearing, not cosmetic: the
+    shell transport strips NUL from its command substitution, so normalizing
+    after the scan would let a NUL-interrupted credential scan as an unmatched
+    fragment and then be RE-FORMED into contiguous cleartext on the way out
+    (see :data:`_STRIP_CONTROLS`).  Whitespace is normalized in the same pass
+    for the same reason: the scan must see the single-space line the renderer
+    emits, not the raw run it was handed.
+    """
+    return " ".join(text.split()).translate(_STRIP_CONTROLS)
+
 #: What happened, for a human AND an agent with no product context.  Deliberately
 #: says NOT been filed, never "failed": the capture is spooled and retried by
 #: design (``tortoise.capture_spool``), so "failed" would be untrue and would
@@ -151,11 +190,15 @@ def bound_detail(detail: Any) -> str:
     cannot reach the output.
     """
     text = "" if detail is None else str(detail)
+    # Normalize BEFORE the scan — the redactor must see the bytes this renderer
+    # (and the shell transport downstream) will actually emit; see `_normalize`.
+    # The window is then taken over the normalized text, and the bound still
+    # runs AFTER redaction so a cut can only land on the marker, never a secret.
+    text = _normalize(text)
     redacted, _counts = redact_secrets(text[:REDACT_WINDOW_CHARS])
-    text = " ".join(redacted.split())
-    if len(text) > MAX_DETAIL_CHARS:
-        text = text[:MAX_DETAIL_CHARS].rstrip() + "…"
-    return text
+    if len(redacted) > MAX_DETAIL_CHARS:
+        redacted = redacted[:MAX_DETAIL_CHARS].rstrip() + "…"
+    return redacted
 
 
 def render(record: dict[str, Any]) -> str:

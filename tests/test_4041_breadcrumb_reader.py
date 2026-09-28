@@ -726,6 +726,24 @@ def test_the_detail_is_bounded_to_one_redacted_line(tmp_path):
     assert why.rstrip().endswith("…"), (len(why), why)
 
 
+def test_a_bound_that_lands_on_whitespace_is_rstripped_before_the_ellipsis():
+    """The bound cuts at :data:`MAX_DETAIL_CHARS` and then ``rstrip()``s the cut
+    BEFORE appending ``"…"``, so the ellipsis sits against the last real
+    character instead of floating after the whitespace the cut happened to
+    leave behind.  Cosmetic, but visible in the injected context.
+
+    Mutation: ``text[:MAX_DETAIL_CHARS] + "…"`` (drop the ``rstrip``) — the
+    rendered line keeps the two cut-trailing spaces before the marker and this
+    REDs."""
+    from tortoise.capture_breadcrumb import MAX_DETAIL_CHARS, bound_detail
+
+    # The normalized line is exactly MAX_DETAIL_CHARS with a single trailing
+    # space at the cut, so the raw 400-char prefix ends on whitespace the
+    # rstrip must remove.
+    out = bound_detail("A" * (MAX_DETAIL_CHARS - 1) + " " + "B" * 50)
+    assert out == "A" * (MAX_DETAIL_CHARS - 1) + "…", repr(out[-8:])
+
+
 def test_a_secret_straddling_the_bound_cannot_leak_a_fragment(tmp_path):
     """The redact-BEFORE-bound ordering is a safety property, not a
     preference: bounding first can cut a credential-shaped span in half, and the
@@ -759,6 +777,46 @@ def test_a_secret_straddling_the_bound_cannot_leak_a_fragment(tmp_path):
     assert why.rstrip().endswith("…"), why
 
 
+def test_a_nul_inside_a_credential_is_not_re_formed_by_the_transport(tmp_path):
+    """A NUL INSIDE a credential is the input the REAL transport composes on:
+    ``_render_capture_failure_breadcrumb`` captures the renderer's output with
+    ``payload="$(...)"``, and command substitution strips EVERY NUL byte — so
+    fragments redaction left untouched are RE-JOINED into a contiguous
+    credential before ``printf '%s\\n'`` writes it to the injected stdout.
+
+    The record is reachable, not synthetic: the ``capture-failure`` detail is
+    ``f"import failed (HTTP {code}): {e.read().decode('utf-8','replace')}"``
+    (``tortoise/__main__.py``), and a UTF-16LE / mis-decoded body is
+    ``g\\x00h\\x00p\\x00_\\x00…`` — every credential character NUL-separated.
+    ``bound_detail`` must normalize control characters BEFORE
+    ``redact_secrets`` scans, so the scan sees the bytes the transport will
+    actually emit (the NUL removed and the fragment re-joined), not the
+    interrupted prefix no rule matches.
+
+    Mutation: normalize AFTER redacting (the pre-fix order) — the renderer
+    emits the NUL-interrupted detail, bash strips the NUL, and the re-formed
+    ``ghp_`` + 36 chars appears in the injected stdout; this REDs."""
+    token = "ghp_" + "a" * 36
+    # The reviewer's exact reproduction: a NUL inside the credential body.
+    detail = "import failed (HTTP 503): token ghp_\u0000" + "a" * 36
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    _mock_tortoise(bindir, tmp_path / "calls.log")
+    _python3_shim(bindir)
+    _seed_breadcrumb(home, **_capture_failure(detail=detail))
+
+    proc = _run_hook(home, path=f"{bindir}:/usr/bin:/bin", src=REPO)
+
+    assert proc.returncode == 0, proc.stderr
+    assert token not in proc.stdout, (
+        f"a NUL-interrupted credential was RE-FORMED by the shell transport "
+        f"and injected in cleartext: {proc.stdout!r}")
+    lines = proc.stdout.splitlines()
+    assert len(lines) == 4, proc.stdout
+    assert "[REDACTED:github_token]" in lines[2], proc.stdout
+
+
 # ── the Python renderer, directly ────────────────────────────────────────
 
 #: The ONLY kind the Python renderer answers for. ``install-inert`` is owned by
@@ -785,6 +843,24 @@ def test_render_refuses_any_kind_but_capture_failure():
         f"code:     {_EXPECT_KIND}")
 
 
+def test_a_missing_harness_falls_back_to_unknown():
+    """``harness`` is interpolated into the ``what:`` line.  A record written
+    without one — or with an empty string — must render the documented
+    ``"unknown"`` fallback, not an empty `` capture is affected.`` claim that
+    names no harness at all.
+
+    Mutation: ``record.get("harness")`` (drop ``or "unknown"``) — the field
+    renders empty and this REDs."""
+    from tortoise.capture_breadcrumb import render
+
+    out = render({"kind": "capture-failure", "detail": "d"})
+    assert "unknown capture is affected" in out, out
+
+    # An empty string is the same missing-value case and takes the fallback too.
+    out = render({"kind": "capture-failure", "detail": "d", "harness": ""})
+    assert "unknown capture is affected" in out, out
+
+
 def test_bound_detail_redacts_before_it_bounds():
     """The ordering property at the unit level, on the SAME straddling input
     the hook test uses. ``bound_detail`` is where the ordering lives, so a
@@ -800,6 +876,65 @@ def test_bound_detail_redacts_before_it_bounds():
     assert "ghp_" not in out, out
     assert "[REDACTED" in out, out
     assert len(out) <= MAX_DETAIL_CHARS + 1, len(out)
+
+
+def test_the_redaction_scan_sees_normalized_text(monkeypatch):
+    """Normalization runs BEFORE the ``redact_secrets`` scan, not after it.
+
+    That order is the fix for the NUL re-formation: the shell transport strips
+    NUL from its command substitution, so a credential whose body carries a NUL
+    must be seen by the scan in its post-normalization form (NUL removed and
+    the fragments re-joined) or the scan matches nothing and the transport
+    re-forms it in cleartext downstream.  Whitespace is normalized in the same
+    pass for the same reason — the scan must see the single-space line the
+    renderer emits, not the raw run.
+
+    The scan's INPUT is the observable here because the two orders are
+    otherwise indistinguishable on this input (the transport is what completes
+    the NUL story), so the spy is the tightest proof that the ORDER — not an
+    incidental later normalization — is what removes the control characters.
+
+    Mutation: redact first, then normalize — the captured input still carries
+    the NUL and the raw newline run and this REDs."""
+    import tortoise.capture_breadcrumb as cb
+
+    seen: list[str] = []
+    real = cb.redact_secrets
+
+    def spy(text: str):
+        seen.append(text)
+        return real(text)
+
+    monkeypatch.setattr(cb, "redact_secrets", spy)
+    cb.bound_detail("ghp_\u0000" + "a" * 36 + "\n\n\n  x")
+
+    assert seen, "the scan was never invoked"
+    scanned = seen[0]
+    assert "\u0000" not in scanned, repr(scanned)
+    assert "\n" not in scanned and "\t" not in scanned, repr(scanned)
+    assert "  " not in scanned, repr(scanned)
+
+
+@pytest.mark.parametrize("control", ["\u0000", "\u0001", "\u0007", "\u001b", "\u007f"])
+def test_a_control_split_credential_is_redacted_after_normalization(control):
+    """A control character INSIDE a credential body splits the vendor anchor.
+    The NUL is the reachable one (the shell transport strips it and re-joins
+    the fragments — see the end-to-end test), but the whole non-whitespace
+    C0/DEL class is normalized away for the same reason: the scan must see the
+    credential the renderer/transport will emit, not a prefix no rule matches.
+
+    Whitespace controls are NOT stripped — they collapse to a space with the
+    rest of the whitespace and the credential stays split — so this
+    parametrization deliberately uses only non-whitespace controls.
+
+    Mutation: normalize controls AFTER the redaction scan — the token survives
+    and this REDs."""
+    from tortoise.capture_breadcrumb import bound_detail
+
+    token = "ghp_" + "a" * 36
+    out = bound_detail("token " + "ghp_" + control + "a" * 36)
+    assert token not in out, out
+    assert "[REDACTED:github_token]" in out, out
 
 
 def test_a_very_large_detail_is_redacted_within_a_bounded_window():
@@ -886,8 +1021,7 @@ def test_the_structured_multi_delimiter_residual_at_the_window_edge():
     the window/margin relationship changes, and it is the evidence the
     ``_REDACT_MARGIN`` comment points to instead of claiming safety.
     """
-    from tortoise.capture_breadcrumb import (
-        MAX_DETAIL_CHARS, REDACT_WINDOW_CHARS, bound_detail)
+    from tortoise.capture_breadcrumb import MAX_DETAIL_CHARS, REDACT_WINDOW_CHARS, bound_detail
     from tortoise.security import redact_secrets
 
     # (1) Inside the window the whole xapp token redacts — the rule works.
@@ -908,6 +1042,35 @@ def test_the_structured_multi_delimiter_residual_at_the_window_edge():
     # whole redacts it — which is why REDACT_WINDOW_CHARS (not the rule) is the
     # thing the residual is attributed to.
     assert redact_secrets(huge)[1].get("slack_token") == 1
+
+
+def test_the_redaction_margin_carries_headroom_beyond_a_toy_token():
+    """``_REDACT_MARGIN``'s comment claims the window has "orders of
+    magnitude" of headroom past the rendered bound, but every other window test
+    only constrains the margin to be larger than the ~36-char token — a margin
+    of a few hundred would pass all of them.  The margin is what makes the
+    STRUCTURED MULTI-DELIMITER family fail CLOSED for a realistic token: a
+    Slack ``xapp-`` token whose interior is a few KiB long sits entirely inside
+    a 64 KiB margin (so the later delimiters are present and the rule matches),
+    but falls outside a 2 KiB one (so the cut leaves only the unmatched prefix —
+    the residual the comment names).
+
+    Mutation: ``_REDACT_MARGIN = 2048`` — the token's interior runs past the
+    window, no rule matches the prefix, ``xapp-1-`` renders in cleartext, and
+    this REDs."""
+    from tortoise.capture_breadcrumb import MAX_DETAIL_CHARS, bound_detail
+
+    token = "xapp-1-" + "A" * 8192 + "-1234-" + "B" * 100
+    # Both premises are LITERAL, not read from the module: the mutation under
+    # test changes the module's margin, and a premise that moved with it would
+    # fail on the premise instead of on the leak the margin causes.
+    assert len(token) > MAX_DETAIL_CHARS + 2048, (
+        "premise: the token's interior runs past a 2 KiB margin")
+    assert len(token) < MAX_DETAIL_CHARS + 64 * 1024, (
+        "premise: the token fits whole inside the documented 64 KiB window")
+    out = bound_detail(token)
+    assert "xapp-" not in out, out[:120]
+    assert "[REDACTED:slack_token]" in out, out[:120]
 
 
 @pytest.mark.parametrize("name, text", [
