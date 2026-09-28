@@ -708,6 +708,20 @@ TOOL_CARVEOUTS = (
     # Pinned by
     # test_ci_selection.test_run_with_eval_keys_tool_change_fails_closed_to_full.
     "tools/run-with-eval-keys.sh",
+    # #6139: the PR lead-time decomposition owns tests/test_pr_lead_time.py, whose
+    # 30 guards pin its accounting (the asserted bucket partition, the full-life
+    # share denominator, the rail polarity, D-vs-E). Same silent-drop class as the
+    # carve-outs above: the flat "tools/" prefix in NON_PYTHON_PREFIXES swallows
+    # `tools/pr_lead_time.py`, so a tool-only edit comes back as `changed=[]`,
+    # select() takes the docs-only early return — which bypasses the
+    # `if not matched: matched.add("core")` fallback entirely — and NOT ONE of
+    # those guards runs on the very change that can break them. An earlier
+    # attempt relied on the ci-surfaces.yml `core` registration alone and was
+    # wrong for exactly this reason (the registration covers the TEST file's own
+    # edits, not the tool's). No SOURCE_PATTERNS entry matches this path, so it
+    # lands in the unknown-path branch -> FULL matrix (fail closed).
+    # Pinned by test_ci_selection.test_pr_lead_time_tool_change_fails_closed_to_full.
+    "tools/pr_lead_time.py",
 )
 
 
