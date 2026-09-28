@@ -43,12 +43,19 @@ only if *every guarantee is accounted for*, "an explicit enumeration with a
 test, not a comment". This file is that enumeration; `tests/test_required_set_sync.py`
 is that test.
 
-WHAT IT DELIBERATELY DOES NOT DO
---------------------------------
-It does not read or edit branch protection, and it does not propose a
-partition of the test surface. Changing the required set is a branch-protection
-change and the partition depends on #6139. This guard only makes drift and
-mis-filing LOUD.
+WHAT IT DOES NOT DO
+-------------------
+It does not EDIT branch protection, and it does not propose a partition of the
+test surface. Changing the required set is a branch-protection change and the
+partition depends on #6139.
+
+It READS live branch protection only under `--live`, which is a manual owner/rail
+check and NOT part of CI: that read needs admin scope, which `GITHUB_TOKEN` does
+not have. So the WIRED assertion is the offline one. A name added to or removed
+from live protection ALONE — with no edit to `.mergify.yml` or the mirror — is
+caught by `--live` only, and therefore by nobody automatically. Stated here so a
+reader does not over-trust the CI step; the durable fix would be a scheduled job
+authorised to read protection.
 
 EXIT CODES
 ----------
@@ -271,47 +278,68 @@ def producible_on_pull_request(workflows_dir: Path | None = None) -> set[str]:
     return names
 
 
+def _settings_entries(path: Path | None) -> list[dict[str, Any]]:
+    """The `repository.branch-protection` entries, or [] when the file declares none."""
+    path = path or SETTINGS_PATH
+    if not path.exists():
+        return []
+    try:
+        doc = read_yaml(path)
+    except yaml.YAMLError as exc:
+        raise CannotMeasure(f"{path} unparsable: {exc}") from exc
+    try:
+        entries = doc["repository"]["branch-protection"]
+    except (KeyError, TypeError):
+        return []
+    return [e for e in (entries or []) if isinstance(e, dict)]
+
+
+def _is_main(entry: dict[str, Any]) -> bool:
+    """Does this entry speak for `main`? A MISSING branch is not `main`."""
+    return str(entry.get("branch", "")).strip() == "main"
+
+
 def declared_settings_contexts(path: Path | None = None) -> set[str] | None:
-    """Contexts declared by `.github/settings.yml`, or None when it declares none.
+    """Contexts declared for `main` by `.github/settings.yml`, or None when none.
 
     Note the file is INERT: probot-settings reads top-level `branches:`, while
     this file nests under `repository: -> branch-protection:`. That is precisely
     why it is dangerous — it reads as the branch-protection source of truth and
     is not. (The stale `strict: true` in it is the origin of #4764's premise.)
+
+    Only `branch: main` entries count. Unioning every entry would let the mirror
+    declare the RIGHT six contexts for the WRONG branch — the exact mis-filing
+    this guard exists to catch — and still pass.
     """
-    path = path or SETTINGS_PATH
-    if not path.exists():
-        return None
-    try:
-        doc = read_yaml(path)
-    except yaml.YAMLError as exc:
-        raise CannotMeasure(f"{path} unparsable: {exc}") from exc
-    try:
-        entries = doc["repository"]["branch-protection"]
-    except (KeyError, TypeError):
-        return None
     contexts: set[str] = set()
-    for entry in entries or []:
-        rsc = (entry or {}).get("required_status_checks") or {}
+    for entry in _settings_entries(path):
+        if not _is_main(entry):
+            continue
+        rsc = entry.get("required_status_checks") or {}
         contexts |= {str(c) for c in (rsc.get("contexts") or [])}
+    if not contexts and not _settings_entries(path):
+        return None
     return contexts
 
 
+def declared_settings_off_main(path: Path | None = None) -> list[str]:
+    """Branches other than `main` that the mirror declares contexts for."""
+    off: list[str] = []
+    for entry in _settings_entries(path):
+        if _is_main(entry):
+            continue
+        rsc = entry.get("required_status_checks") or {}
+        if rsc.get("contexts") or "strict" in rsc:
+            off.append(str(entry.get("branch", "<missing branch>")))
+    return off
+
+
 def declared_settings_strict(path: Path | None = None) -> bool | None:
-    """The mirror's `strict` flag, or None when it declares none."""
-    path = path or SETTINGS_PATH
-    if not path.exists():
-        return None
-    try:
-        doc = read_yaml(path)
-    except yaml.YAMLError as exc:
-        raise CannotMeasure(f"{path} unparsable: {exc}") from exc
-    try:
-        entries = doc["repository"]["branch-protection"]
-    except (KeyError, TypeError):
-        return None
-    for entry in entries or []:
-        rsc = (entry or {}).get("required_status_checks") or {}
+    """The mirror's `strict` flag for `main`, or None when it declares none."""
+    for entry in _settings_entries(path):
+        if not _is_main(entry):
+            continue
+        rsc = entry.get("required_status_checks") or {}
         if "strict" in rsc:
             return bool(rsc["strict"])
     return None
@@ -460,6 +488,17 @@ def check_gate_legs(needs: list[str], legs: set[str]) -> list[str]:
     return problems
 
 
+def check_settings_branches(off_main: list[str]) -> list[str]:
+    """The mirror is a mirror of `main`; contexts for another branch are mis-filed."""
+    if not off_main:
+        return []
+    return [
+        f".github/settings.yml declares required_status_checks for branch(es) {off_main} "
+        f"rather than `main` — a mirror of the wrong branch, which would silently "
+        f"check nothing that matters"
+    ]
+
+
 def check_settings(contexts: set[str] | None, expected: set[str]) -> list[str]:
     """The declarative mirror must agree, or not exist."""
     if contexts is None:
@@ -529,6 +568,7 @@ def run(live: bool = False) -> tuple[int, list[str], list[str]]:
         producible = producible_on_pull_request()
         settings = declared_settings_contexts()
         declared_strict = declared_settings_strict()
+        off_main = declared_settings_off_main()
         needs, legs = gate_legs()
         if live:
             live_contexts, live_strict = read_live_protection()
@@ -545,6 +585,7 @@ def run(live: bool = False) -> tuple[int, list[str], list[str]]:
         + check_deadlock(parsed["queue"], producible, "queue_conditions")
         + check_deadlock(parsed["merge"], producible, "merge_conditions")
         + check_settings(settings, expected)
+        + check_settings_branches(off_main)
         + check_declared_strict(live_strict, declared_strict)
         + check_gate_legs(needs, legs)
     )

@@ -123,6 +123,138 @@ def test_the_real_enumeration_partitions_every_name(guard):
         "queue branch actually reports on")
 
 
+# ── COMPOSITION: run() must actually CALL each check ───────────────────────
+#
+# The checks are pinned in isolation above, which is not enough: deleting a
+# check call from `run()` left all 30 tests green (measured by the reviewer).
+# These drive `run()` end-to-end through the env seams so the WIRING is pinned
+# too — a refactor that drops a check now reddens.
+
+
+def _write_minimal_gate(guard, needs: list[str], legs: list[str]) -> None:
+    """A consistent gate whose `needs:` and LEGS rows are given independently."""
+    guard.PYTHON_CI_PATH.write_text(
+        "jobs:\n  python-ci-gate:\n    needs: [" + ", ".join(needs) + "]\n"
+        "    steps:\n      - run: |\n          done <<'LEGS'\n"
+        + "".join(f"          {leg}|${{{{ needs.{leg}.result }}}}|-\n" for leg in legs)
+        + "          LEGS\n")
+
+
+def _write_minimal_mergify(guard, queue: list[str], merge: list[str]) -> None:
+    guard.MERGIFY_PATH.write_text(
+        "queue_rules:\n  - name: main\n    queue_conditions:\n"
+        + "".join(f"      - check-success={n}\n" for n in queue)
+        + "    merge_conditions:\n"
+        + "".join(f"      - check-success={n}\n" for n in merge))
+
+
+def _write_workflow(guard, name: str, trigger: str, jobs: list[str]) -> None:
+    guard.WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    (guard.WORKFLOWS_DIR / name).write_text(
+        f"on:\n  {trigger}:\njobs:\n"
+        + "".join(f"  {j}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n"
+                  for j in jobs))
+
+
+def test_run_flags_a_legs_mismatch_end_to_end(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: `run()` must call `check_gate_legs` (the #5219 door)."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["beta"])  # alpha has no row
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("alpha" in v and "skipped" in v for v in violations), violations
+
+
+def test_run_flags_an_unproducible_queue_condition_end_to_end(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: `run()` must call `check_deadlock` for the ENTRY bucket too."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "push.yml", "push", ["alpha"])  # alpha: push-only
+    _write_workflow(guard, "pr.yml", "pull_request", ["beta"])
+    _write_minimal_gate(guard, needs=["beta"], legs=["beta"])
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("ENTRY stalls" in v for v in violations), violations
+
+
+def test_run_flags_a_stale_mirror_end_to_end(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: `run()` must call `check_settings`."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        strict: false\n"
+        "        contexts:\n          - redis-guard\n")
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("stale declarative mirror" in v for v in violations), violations
+
+
+# ── the mirror must speak for `main` ───────────────────────────────────────
+
+
+def test_run_flags_a_mirror_that_also_speaks_for_another_branch(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: `run()` must call `check_settings_branches`.
+
+    The `main` entry here is CORRECT and complete, so `check_settings` does NOT
+    fire — only the off-main check can redden. That is what pins THIS call:
+    without it this test would be satisfied by the other mirror check.
+    """
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n"
+        "    - branch: main\n      required_status_checks:\n        strict: false\n"
+        "        contexts:\n          - alpha\n          - beta\n"
+        "    - branch: develop\n      required_status_checks:\n        strict: false\n"
+        "        contexts:\n          - ghost\n")
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("rather than `main`" in v for v in violations), violations
+
+
+def test_a_mirror_for_another_branch_is_a_violation(guard, tmp_guard_env):
+    """.github/settings.yml is a mirror of `main`; contexts for `develop` are mis-filed."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: develop\n"
+        "      required_status_checks:\n        strict: false\n"
+        "        contexts:\n          - docs\n          - python-ci-gate\n")
+    assert guard.declared_settings_contexts() == set()
+    assert guard.declared_settings_off_main() == ["develop"]
+    assert guard.check_settings_branches(["develop"]), "must be flagged"
+
+
+def test_a_second_entry_for_another_branch_contributes_no_contexts(guard, tmp_guard_env):
+    """The main entry is read; a sibling branch entry neither adds nor hides names."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n"
+        "    - branch: main\n      required_status_checks:\n        strict: false\n"
+        "        contexts:\n          - docs\n"
+        "    - branch: develop\n      required_status_checks:\n"
+        "        contexts:\n          - ghost\n")
+    assert guard.declared_settings_contexts() == {"docs"}
+    assert guard.declared_settings_off_main() == ["develop"]
+
+
+def test_an_entry_without_a_branch_is_not_treated_as_main(guard, tmp_guard_env):
+    """A missing `branch:` must not be silently accepted as `main`."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - required_status_checks:\n"
+        "        contexts:\n          - docs\n")
+    assert guard.declared_settings_contexts() == set()
+    assert guard.declared_settings_off_main() == ["<missing branch>"]
+
+
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
     """Every condition the queue waits on must exist on a PR-like ref — BOTH lists.
 
