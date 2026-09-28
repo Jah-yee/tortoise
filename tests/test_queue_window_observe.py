@@ -20,6 +20,13 @@ sys.path.insert(0, str(REPO / "tools"))
 
 import queue_window_observe as obs  # noqa: E402
 
+# The corpus below is built around this FIXED instant. Any test that feeds
+# `_corpus()` through `obs.main(...)` MUST also pass `--as-of _iso(NOW)`: without
+# the pin the CLI's window end defaults to wall-clock `datetime.now()`, so the
+# test's outcome drifts with real time as the corpus ages out of the window.
+# Three tests were defeated exactly this way (PR #5781's CI gate red went
+# fleet-wide because `python-ci-gate` is a required check evaluated on the merge
+# ref); see test_cli_writes_a_json_record for the canonical case.
 NOW = datetime(2026, 9, 27, 9, 0, tzinfo=UTC)
 
 
@@ -520,8 +527,13 @@ def test_cli_writes_a_json_record(tmp_path):
     runs = tmp_path / "runs.jsonl"
     runs.write_text("\n".join(json.dumps(r) for r in _corpus()))
     out = tmp_path / "record.json"
+    # `--as-of` is REQUIRED: `_corpus()` is built around the fixed `NOW`, so with
+    # no pin the window end is wall clock and both 5-branch waves eventually age
+    # out of the 24h window — `repeatable_wave_size` then finds only one wave and
+    # the record reads UNKNOWN, failing this test for a reason unrelated to the
+    # code under test (the PR #5781 red that blocked every PR's merge ref).
     assert obs.main(["--from-json", str(runs), "--window-hours", "24",
-                     "--out", str(out)]) == 0
+                     "--as-of", _iso(NOW), "--out", str(out)]) == 0
     record = json.loads(out.read_text())
     assert record["status"] == "OK"
     assert record["parallelism"]["effective_max_parallel_checks"] == 5
@@ -562,8 +574,10 @@ def test_from_json_replay_does_not_shell_out_for_a_main_sha(tmp_path, monkeypatc
     runs = tmp_path / "runs.jsonl"
     runs.write_text("\n".join(json.dumps(r) for r in _corpus()))
     out = tmp_path / "record.json"
+    # `--as-of` pins the window end to the corpus's own NOW — see the note on
+    # `NOW`; without it this test goes red as soon as the corpus ages out.
     assert obs.main(["--from-json", str(runs), "--window-hours", "24",
-                     "--out", str(out)]) == 0
+                     "--as-of", _iso(NOW), "--out", str(out)]) == 0
     record = json.loads(out.read_text())
     assert record["window"]["main_sha_source"].startswith("unresolved")
 
@@ -731,7 +745,10 @@ def test_cli_records_a_caller_supplied_main_sha_verbatim(tmp_path):
     runs = tmp_path / "runs.jsonl"
     runs.write_text("\n".join(json.dumps(r) for r in _corpus()))
     out = tmp_path / "record.json"
+    # `--as-of` pins the window end to the corpus's own NOW — see the note on
+    # `NOW`; without it this test goes red as soon as the corpus ages out.
     assert obs.main(["--from-json", str(runs), "--window-hours", "24",
+                     "--as-of", _iso(NOW),
                      "--main-sha", "5b6cb93", "--out", str(out)]) == 0
     window = json.loads(out.read_text())["window"]
     assert window["main_sha"] == "5b6cb93"
