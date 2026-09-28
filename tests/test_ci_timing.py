@@ -743,14 +743,30 @@ def test_refresh_durations_preserves_unknown_top_level_keys(tmp_path: Path) -> N
 
 
 def test_refresh_durations_on_the_real_manifest_of_record() -> None:
-    """The committed 688-entry map is refreshed without corruption: comments
-    survive, a sampled value changes, and the manifest gate stays green."""
+    """The committed durations map is refreshed without corruption: comments
+    survive, a sampled value changes, every OTHER key is carried forward, and
+    the manifest gate stays green.
+
+    The key total is DERIVED from the manifest under test, never frozen as a
+    literal. The map grows on valid input (the durations bridge, epic #5215),
+    and a hard-coded total turns a routine measurement into a red gate that no
+    PR can clear — 9037 tests passing and one stale integer failing the whole
+    lane is what #6143 looks like in the wild.
+    """
     manifest_path = REPO_ROOT / "config" / "ci-surfaces.yml"
     before = manifest_path.read_text()
+    _block, before_entries = ci_timing._locate_durations_block(before.split("\n"))
+    assert before_entries, "the durations block must exist in the manifest of record"
     new_text, stats = ci_timing.render_refreshed_manifest(
         before, {"test_bridge_table.py": 123.4}, "2026-09-28T00:00:00Z")
-    assert stats["manifest_keys"] == 688
-    assert stats["carried_forward"] == 687
+    assert stats["sampled_keys"] == 1
+    # The property the frozen total was a proxy for, checked on the OUTPUT: the
+    # refresh invents and drops no key. Comparing the emitted key set against the
+    # input's is not tautological (they are different texts); asserting a literal
+    # total was, and it re-reddened the lane every time the map legitimately grew.
+    _block2, after_entries = ci_timing._locate_durations_block(new_text.split("\n"))
+    assert set(after_entries) == set(before_entries)
+    assert stats["manifest_keys"] == stats["carried_forward"] + stats["sampled_keys"]
     assert "  test_bridge_table.py: 123.4" in new_text
     assert "# #3395: per-file CI wall time" in new_text
     assert ci_timing.validate_refreshed_manifest(new_text) == []
