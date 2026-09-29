@@ -20,6 +20,7 @@ import asyncio
 import base64
 import hashlib
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -401,6 +402,32 @@ class TestAuthorizePage:
         assert "setItem(key, value) {" in r.text
         assert "removeItem(key) {" in r.text
         assert "SIZE_GUARD" in r.text  # #1225 cookie-cap guard ported
+        # #3496: the browser auth client must name an EXACT version — a mutable
+        # range (`@2`, `@2.x`, `@latest`) silently ships whatever the CDN serves.
+        # The BEHAVIOURAL half of this contract (the specifier's version EQUALS
+        # the vendored bundle the page's harness executes) is pinned by
+        # tests/test_oauth_consent_pkce.py, which runs that bundle under node:vm;
+        # this assertion is deliberately the shape-only tripwire so a version
+        # bump has exactly one derived place to satisfy.
+        assert re.search(
+            r"@supabase/supabase-js@\d+\.\d+\.\d+/dist/umd/supabase\.min\.js", r.text)
+        # The negative adds coverage only when a SECOND reference coexists, so it
+        # pins the mutable shapes a numeric-only pattern misses: `@2.x` and
+        # `@latest` carry no bare digit run before the `/`. (Not "every mutable
+        # shape" — a caret/tilde range or a non-`latest` dist-tag such as `@next`
+        # is caught by the positive above, which requires three numeric
+        # components.) The numeric arm is bounded to at most two components plus an
+        # optional `.x`, so it does NOT match the pinned full semver — an unbounded
+        # `\d+(\.\d+){0,2}` swallows `2.112.2` itself and fails on the very page
+        # this guards.
+        assert not re.search(
+            r"@supabase/supabase-js@(?:latest|x|\d+(?:\.\d+)?(?:\.x)?)[/\"]", r.text)
+        # #3496: RFC 10017 §7.2 — the implicit grant MUST NOT be used by a
+        # browser-based client, so the flow type is explicit. The behaviour
+        # (code_challenge_method=s256, verifier routed off the cookie) is pinned
+        # by the harness above, which pairs it with an implicit control.
+        assert 'flowType: "pkce"' in r.text
+        assert "SIZE_CAP" in r.text  # #3496 item 6: derived cookie-cap refusal
 
     def test_consent_page_escapes_script_breakout(self, api_client):
         """P1 (PR #1264 review): a malicious state / client_name containing
@@ -436,8 +463,15 @@ class TestAuthorizePage:
         assert r.text.count('nonce="') == 2  # CDN + inline script tags
 
     # ═════ #1701 R1 — consent page team-chooser + hardening (static strings) ═══
-    # The page JS has no jsdom harness in this repo, so each hardening behavior
-    # is pinned by a static-string assertion on the server-rendered page.
+    # These are STATIC tripwires on the server-rendered markup. The behaviours
+    # added by #3496 — the PKCE grant type and challenge, the verifier's storage
+    # home, the terminal failure state, the item-6 write path and the return-target
+    # canonicalisation — are EXECUTED (node:vm against the vendored supabase bundle)
+    # by tests/test_oauth_consent_pkce.py. This file pins only their SHAPE:
+    # the exact CDN semver, `flowType: "pkce"`, `SIZE_GUARD` and `SIZE_CAP`.
+    # The #1701 behaviours are NOT in that harness: the multi-org picker
+    # (`org-select`), the refresh-first preview recovery, the absence of
+    # `signOut` and the in-flight guard stay static-only pins here.
 
     def _consent_html(self, api_client, *, client_name: str = "test-connector") -> str:
         tc, _ = api_client
