@@ -811,9 +811,19 @@ def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
 # An 8th review showed that a guard nobody deletes is a guard nobody is testing:
 # five were correct and completely unpinned. This block pins the branches that
 # change the EXIT CODE or the VERDICT, plus the four that could turn the
-# documented exit 2 into an unannotated traceback. It is NOT a blanket claim that
-# every branch is pinned: a 10th and 11th review each enumerated survivors, and
-# the survivors are named in the commit log rather than asserted away here.
+# documented exit 2 into an unannotated traceback.
+#
+# It is NOT a claim that every branch is pinned. The branches whose deletion leaves
+# this suite green are exactly these, and each is redundant rather than uncovered:
+#
+#   1. `_raw_settings_entries`' `except OSError` — `read_yaml`'s stat guard already
+#      converts that OSError to CannotMeasure, so only the message differs.
+#   2. `os.lstat`'s `NotADirectoryError` arm — a path whose PARENT is a file cannot
+#      be constructed portably in a test; the arm only decides absent-vs-
+#      unmeasurable for that shape.
+#
+# Anything not on that list reddens on deletion. Verified by mutating each branch
+# in turn and re-running this file.
 
 
 @pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
@@ -1153,6 +1163,45 @@ def test_a_live_payload_without_contexts_reads_as_empty(guard, monkeypatch):
     assert guard.read_live_protection() == (set(), False)
 
 
+def test_a_config_too_large_to_read_cannot_be_measured(guard, tmp_guard_env, monkeypatch):
+    """`read_text` allocates BEFORE the parser, so it needs its own MemoryError guard.
+
+    Guarding only `yaml.safe_load` left the >RAM case escaping as an unannotated
+    traceback (exit 1).
+    """
+    import pathlib
+
+    guard.SETTINGS_PATH.write_text("repository: {}\n")
+    real = pathlib.Path.read_text
+
+    def fake(self, *a, **k):
+        if self == guard.SETTINGS_PATH:
+            raise MemoryError("cannot allocate")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", fake)
+    with pytest.raises(guard.CannotMeasure, match="unreadable"):
+        guard.declared_settings_contexts()
+
+
+def test_a_live_run_reports_the_live_note(guard, tmp_guard_env, monkeypatch):
+    """The `live_contexts is not None` NOTES branch (not the violations one)."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        contexts:\n"
+        "          - alpha\n          - beta\n")
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    monkeypatch.setattr(guard, "read_live_protection", lambda: ({"alpha", "beta"}, False))
+    _, _, notes = guard.run(live=True)
+    assert any(n.startswith("LIVE required    :") and "alpha" in n for n in notes), notes
+    _, _, offline = guard.run(live=False)
+    assert any("not read (offline mode" in n for n in offline), offline
+
+
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
     """Every condition the queue waits on must exist on a PR-like ref — BOTH lists.
 
@@ -1381,11 +1430,16 @@ def test_missing_mergify_cannot_be_measured(guard, tmp_guard_env):
 
 
 def test_the_cli_exits_two_when_it_cannot_measure():
-    """End-to-end fail-closed: a nonexistent config must not exit 0."""
+    """End-to-end fail-closed: a nonexistent config must not exit 0.
+
+    Asserted on the ANNOTATION, not the bare text: `main()` prints every note
+    before the annotation loop, so `"CANNOT MEASURE" in stdout` was satisfied by
+    the note alone and deleting the `::error::` branch left the suite green.
+    """
     d = Path(tempfile.mkdtemp(prefix="required-set-missing-"))
     r = _run({"MERGIFY_CONFIG": str(d / "absent.yml")})
     assert r.returncode == 2, r.stdout + r.stderr
-    assert "CANNOT MEASURE" in r.stdout
+    assert "::error::CANNOT MEASURE" in r.stdout
 
 
 def test_the_cli_exits_zero_on_the_real_repo(guard, capsys):

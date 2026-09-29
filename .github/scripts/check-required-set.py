@@ -91,10 +91,12 @@ def _read_yaml_cached(path_str: str, mtime_ns: int, size: int) -> Any:
     del mtime_ns, size  # cache-key material only
     try:
         text = Path(path_str).read_text()
-    except (UnicodeDecodeError, OSError) as exc:
-        # An undecodable/unreadable file is UNPARSABLE, so it must reach the
-        # documented exit 2 with an annotation — not escape as a
-        # UnicodeDecodeError traceback with exit 1 and no `::error::`.
+    except (UnicodeDecodeError, OSError, MemoryError) as exc:
+        # An undecodable/unreadable/too-large file is UNPARSABLE, so it must reach
+        # the documented exit 2 with an annotation — not escape as a traceback with
+        # exit 1 and no `::error::`. MemoryError belongs HERE, not only on the
+        # parser below: `read_text` allocates the whole file BEFORE `safe_load`
+        # ever runs, so guarding only the parser left the >RAM case unguarded.
         raise CannotMeasure(
             f"{path_str}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") from exc
     try:
@@ -105,9 +107,6 @@ def _read_yaml_cached(path_str: str, mtime_ns: int, size: int) -> Any:
         # it escaped as an unannotated traceback at every seam.
         raise CannotMeasure(
             f"{path_str}: nesting too deep to parse — cannot measure") from exc
-    except MemoryError as exc:
-        raise CannotMeasure(
-            f"{path_str}: too large to parse — cannot measure") from exc
     # ONLY None (an empty document) becomes {}. The previous `or {}` coerced EVERY
     # falsy parse — so a top-level `[]`, `false` or `0` became `{}`, which then
     # reads as "the file declares nothing" and SKIPS its check. A fail-open whose
