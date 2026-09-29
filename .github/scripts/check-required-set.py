@@ -786,8 +786,8 @@ def read_live_protection() -> tuple[set[str], bool | None]:
         raise CannotMeasure(
             f"branch protection payload must be an object, got {type(payload).__name__}")
     # Validate the payload's shape. A malformed `gh` response used to reach
-    # `set(...)` and raise TypeError (exit 1, no annotation); the `--jq` normally
-    # yields an array, so this is the last unguarded parsed-payload access.
+    # `set(...)` and raise TypeError (exit 1, no annotation); this is the last
+    # unguarded parsed-payload access in the module.
     contexts = require_list(payload.get("contexts") or [], "branch protection contexts")
     for ctx in contexts:
         if not isinstance(ctx, str):

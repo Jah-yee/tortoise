@@ -690,7 +690,7 @@ def test_a_falsy_non_list_needs_cannot_be_measured(guard, tmp_guard_env, value):
 def test_a_non_list_steps_cannot_be_measured(guard, tmp_guard_env):
     # Anchored on the MESSAGE: a scalar `steps:` fixture cannot also carry a
     # heredoc, so an unanchored `pytest.raises(CannotMeasure)` was satisfied by
-    # the "no LEGS table" guard and stayed green when the steps guard was deleted.
+    # the "no LEGS table" guard once the steps guard's raise was neutralised.
     _write_gate_with_a_bad_shape(guard, steps="    steps: 5\n")
     with pytest.raises(guard.CannotMeasure, match="steps must be a list"):
         guard.gate_legs()
@@ -742,6 +742,73 @@ def test_a_malformed_live_payload_cannot_be_measured(guard, monkeypatch, payload
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: Done())
     with pytest.raises(guard.CannotMeasure):
         guard.read_live_protection()
+
+
+def test_a_non_mapping_jobs_in_python_ci_cannot_be_measured(guard, tmp_guard_env):
+    """The `jobs:` guard in `gate_legs`.
+
+    The near-identical guard in `producible_on_pull_request` was pinned; this one
+    was not, so deleting it left the whole suite green.
+    """
+    guard.PYTHON_CI_PATH.write_text("jobs: 5\n")
+    with pytest.raises(guard.CannotMeasure, match="`jobs:` must be a mapping"):
+        guard.gate_legs()
+
+
+@pytest.mark.parametrize("value", ["5", "[a, b]"])
+def test_a_non_mapping_matrix_cannot_be_measured(guard, tmp_guard_env, value):
+    """A scalar `strategy.matrix` used to reach `.get()` -> AttributeError."""
+    (tmp_guard_env / "workflows" / "bad.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  g:\n    name: 't (${{ matrix.a }})'\n"
+        f"    strategy:\n      matrix: {value}\n    runs-on: ubuntu-latest\n")
+    with pytest.raises(guard.CannotMeasure, match=r"strategy\.matrix must be a mapping"):
+        guard.producible_on_pull_request()
+
+
+@pytest.mark.parametrize("value", ["[5]", "[[a]]"])
+def test_a_non_mapping_branch_protection_entry_cannot_be_measured(guard, tmp_guard_env, value):
+    """An entry that is not a mapping used to reach `entry.get` -> AttributeError."""
+    guard.SETTINGS_PATH.write_text(f"repository:\n  branch-protection: {value}\n")
+    with pytest.raises(guard.CannotMeasure, match="entries must be mappings"):
+        guard.declared_settings_contexts()
+
+
+@pytest.mark.parametrize("value", ["5", "false"])
+def test_a_non_list_queue_rules_cannot_be_measured(guard, tmp_guard_env, value):
+    """A scalar `queue_rules` used to reach `enumerate(5)` -> TypeError."""
+    guard.MERGIFY_PATH.write_text(f"queue_rules: {value}\n")
+    with pytest.raises(guard.CannotMeasure, match="no queue_rules"):
+        guard.load_mergify()
+
+
+@pytest.mark.parametrize("live,missing,extra", [
+    ({"alpha"}, ["beta"], []),
+    ({"alpha", "beta", "gamma"}, [], ["gamma"]),
+])
+def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
+                                          live, missing, extra):
+    """COMPOSITION: `run(live=True)` must compare LIVE contexts to the enumeration.
+
+    The other live-path test returns contexts EQUAL to the enumeration, so
+    `missing`/`extra` were both empty there and this whole block was a no-op -
+    deleting it left the suite green.
+    """
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        contexts:\n"
+        "          - alpha\n          - beta\n")
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    monkeypatch.setattr(guard, "read_live_protection", lambda: (live, False))
+    code, violations, _ = guard.run(live=True)
+    assert code == 1, violations
+    for name in missing:
+        assert any("NOT required on main" in v and name in v for v in violations), violations
+    for name in extra:
+        assert any("unaccounted required check" in v and name in v for v in violations), violations
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
