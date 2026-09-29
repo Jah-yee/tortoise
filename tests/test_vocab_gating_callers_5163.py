@@ -258,6 +258,91 @@ class TestCaller2SdkV1Wiring:
         assert any("objectKind" in e for e in out["errors"]), out["errors"]
 
 
+class TestCaller2SdkV1GateOutage:
+    """#5339 review round 2 (P1) — the v1 sibling of the outage guard.
+
+    ``_commit_session_v1`` resolved ``_installed_namespaces_for_gate``
+    OUTSIDE any error handling, so the same bound-but-unreachable graph that
+    raised out of ``_commit_session_v2`` also raised out of the public
+    ``commit_session`` on BOTH v1 routes (a direct ``summary=`` and
+    ``extractor="v1"``). The base (``9c4788400``) had no resolver call in v1
+    at all, so this is a regression introduced by the #5339 fix, not a
+    pre-existing hole.
+
+    Fail-closed, same as v2: record the failure and return BEFORE the
+    extraction/validation that would need the gate, so the result is a
+    structured ``ok=False`` and nothing is POSTed. ``installed = None`` would
+    mean NO gate (the catalog union) and silently admit another pack's kinds,
+    so the guard must never degrade to it.
+
+    FAIL-ON: the resolver raise escapes both v1 routes.
+    REACHABLE: the graph handle IS bound (a real SDK), and the resolver is
+    patched to raise exactly as an unreachable graph does.
+    """
+
+    @staticmethod
+    def _outage_sdk(tmp_path):
+        from tortoise.sdk import TortoiseSDK
+        return TortoiseSDK(db_path=str(tmp_path / "g5339_v1.db"),
+                           namespace="test_g5339_v1")
+
+    @staticmethod
+    def _unreachable(monkeypatch):
+        import tortoise.pack_state as ps_mod
+
+        def _raise(*a, **k):
+            raise RuntimeError("graph unreachable (simulated outage)")
+        monkeypatch.setattr(ps_mod, "graph_installed_namespaces", _raise)
+
+    @staticmethod
+    def _no_post(monkeypatch):
+        from tortoise import sdk as sdk_mod
+        posted = []
+        monkeypatch.setattr(sdk_mod, "_post_commit",
+                            lambda *a, **k: posted.append(a) or {"ok": True})
+        return posted
+
+    def _assert_structured_outage(self, out, posted):
+        assert isinstance(out, dict), out
+        assert out["ok"] is False, out
+        assert any("gate resolution failed" in e for e in out["errors"]), \
+            out["errors"]
+        # Fail-CLOSED: the union fallback would have admitted this payload
+        # and reached the POST.
+        assert posted == [], "an unreadable gate must not POST a payload"
+
+    def test_v1_direct_summary_outage_returns_a_structured_result(
+            self, tmp_path, monkeypatch):
+        """Route 1: a caller-supplied ``summary=`` (the v1 direct path)."""
+        self._unreachable(monkeypatch)
+        posted = self._no_post(monkeypatch)
+        sdk = self._outage_sdk(tmp_path)
+        out = sdk.commit_session(
+            summary={"session": {"summary": "S"},
+                     "state": [{"name": "artifact",
+                                "objectKind": MARKETING_OBJECT}],
+                     "decisions": [], "logic": [], "issues": []},
+            base_url="http://unused", api_key="k")
+        self._assert_structured_outage(out, posted)
+
+    def test_v1_extractor_route_outage_returns_a_structured_result(
+            self, tmp_path, monkeypatch):
+        """Route 2: ``extractor="v1"`` over a raw conversation."""
+        from tests.test_extractor_v2 import MockModel
+
+        self._unreachable(monkeypatch)
+        posted = self._no_post(monkeypatch)
+        sdk = self._outage_sdk(tmp_path)
+        out = sdk.commit_session(
+            [{"role": "user", "content": "hi"}],
+            extractor="v1",
+            extractor_model=MockModel(
+                lambda system, user: '{"entities": [], "events": [], '
+                                    '"points": [], "operators": []}'),
+            base_url="http://unused", api_key="k")
+        self._assert_structured_outage(out, posted)
+
+
 class TestCaller2SdkV2GateOutage:
     """#5339 review (P2) — a graph outage must not RAISE out of the SDK's
     client-side Layer-1 pre-check, and must not WIDEN the gate either.
@@ -270,11 +355,17 @@ class TestCaller2SdkV2GateOutage:
     the public ``commit_session`` — breaking the method's own contract
     ("Errors are surfaced (ok=False) with the payload for inspection").
 
-    The fix follows the sibling resolver call in ``extract_session_v2``: on
-    failure it DISABLES the gated pass (there, ``classify_later = False``)
-    and records the error, never falling back to the ungated union. The
-    fail-closed direction matters — ``installed_namespaces=None`` means NO
-    gate and would silently admit another pack's kinds.
+    The fix's fail-closed property is local: the recorded error makes
+    ``errors`` non-empty, so the ``if errors or payload is None: return``
+    above ``_post_commit`` returns the structured ``ok=False`` and nothing is
+    sent. It is NOT mirrored from the sibling resolver call in
+    ``extract_session_v2``: that one sets ``classify_later = False`` and
+    continues the legacy pipeline, which ``extractor_v2.py`` labels an
+    explicit FAIL-OPEN (the legacy master is ``master or
+    build_master_list()`` — the WIDER vocabulary), not a fail-closed
+    direction. ``installed_namespaces=None`` here means NO gate and would
+    silently admit another pack's kinds, which is exactly what the guard
+    prevents.
 
     FAIL-ON: the resolver raise escapes ``_commit_session_v2`` (and
     ``commit_session``), so the call raises instead of returning a result.

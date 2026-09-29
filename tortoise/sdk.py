@@ -4380,12 +4380,16 @@ class TortoiseSDK:
             # (pack_state's documented posture — an outage must never read as
             # "no packs"). That must not escape this public entry point, and
             # it must not degrade to the ungated union either: ``None`` means
-            # NO gate, which WIDENS the allowed kind set. The sibling
-            # resolver call in ``extract_session_v2`` handles the same outage
-            # by DISABLING the gated pass (``classify_later = False``) and
-            # recording the error — same fail-closed direction here: skip the
-            # L1 pre-check and surface the failure in ``errors`` so the
-            # result is a structured ``ok=False`` and nothing is POSTed.
+            # NO gate, which WIDENS the allowed kind set. The fail-closed
+            # property is local — the recorded error makes ``errors``
+            # non-empty, so the ``if errors or payload is None: return``
+            # below runs BEFORE ``_post_commit`` and the caller gets a
+            # structured ``ok=False`` with nothing sent. (This is NOT
+            # mirroring the sibling resolver call in ``extract_session_v2``:
+            # that one sets ``classify_later = False`` and continues the
+            # legacy pipeline, which ``extractor_v2.py`` labels an explicit
+            # FAIL-OPEN onto the wider vocabulary — not the fail-closed
+            # direction taken here.)
             try:
                 gate = _installed_namespaces_for_gate(self)
             except Exception as e:  # noqa: BLE001, RUF100 — an outage must
@@ -4445,7 +4449,25 @@ class TortoiseSDK:
         from tortoise.value_extractor import construct_graph
         # #5163: the objectKind enforcer's set is graph-gated. Resolve ONCE —
         # both the extraction path and the direct-summary path below need it.
-        installed = _installed_namespaces_for_gate(self)
+        #
+        # #5339: the resolver RAISES on a bound-but-unreachable graph
+        # (pack_state's documented posture). Guard the call for the same
+        # reason as the v2 sibling above: the outage must not escape this
+        # public entry point, and it must not become ``installed = None``
+        # either — ``None`` means NO gate and would widen the objectKind set
+        # to the catalog union, silently admitting another pack's kinds.
+        # Fail-closed: record the failure and return BEFORE the extraction/
+        # validation that needs the gate, so nothing is POSTed and the caller
+        # gets a structured ``ok=False``.
+        try:
+            installed = _installed_namespaces_for_gate(self)
+        except Exception as e:  # noqa: BLE001, RUF100 — an outage must
+            # never raise out of a public method, and must never widen
+            # the gate to the catalog union (see above).
+            return {"session_id": session_id, "ok": False,
+                    "errors": [f"Layer-1 gate resolution failed: "
+                               f"{type(e).__name__}: {e}"],
+                    "payload": None}
         if summary is None and conversation is not None:
             model = extractor_model or _default_byok_model()
             # #4911: the v1 sibling of the v2 scrub below — same reason (this
