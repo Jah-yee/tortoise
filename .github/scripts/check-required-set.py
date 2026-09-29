@@ -332,7 +332,11 @@ def _render_matrix(template: str, matrix: dict[str, Any]) -> set[str]:
         # slot and yield names that do not exist.
         pattern = re.compile(r"\$\{\{\s*matrix\." + re.escape(key) + r"\s*\}\}")
         for value in values:
-            expand(pattern.sub(str(value), tmpl), keys[1:], acc)
+            # A CALLABLE replacement: passing `str(value)` directly makes the value
+            # a replacement TEMPLATE, so a matrix value containing `\1` or
+            # `\g<name>` raises re.error (exit 1, no annotation) and `\n`/`\t`
+            # silently becomes a control character in the check name.
+            expand(pattern.sub(lambda _m, v=value: str(v), tmpl), keys[1:], acc)
 
     acc: set[str] = set()
     expand(template, sorted(refs), acc)
@@ -400,9 +404,13 @@ def _raw_settings_entries(path: Path | None) -> Any:
     this guard exists to fail closed.
     """
     path = path or SETTINGS_PATH
-    if not path.exists():
-        # The ONLY "mirror absent" case. A PRESENT file declaring nothing is an
-        # EMPTY DECLARATION -> an empty set -> a violation, never a skip.
+    if not os.path.lexists(path):
+        # `os.path.lexists`, NOT `Path.exists()`: `exists()` also returns False for
+        # a BROKEN SYMLINK, so a dangling `settings.yml` was classified "no file"
+        # and the mirror check was skipped (exit 0) while the same shape at the
+        # other two seams was fail-closed exit 2. Only a path with NO directory
+        # entry at all is "the mirror does not exist"; a dangling link is a
+        # present-but-unreadable entry, which `read_yaml`'s stat guard then reports.
         return _KEY_ABSENT
     try:
         doc = read_yaml(path)
@@ -638,6 +646,14 @@ def gate_legs(path: Path | None = None) -> tuple[list[str], set[str]]:
             f"{path}: jobs.{GATE_JOB}.needs must be a string or list, got "
             f"{type(needs).__name__} — cannot measure")
 
+    for n in needs:
+        # Elements, not just the container: `needs: [{a: b}]` reached `set(needs)`
+        # and raised `TypeError: unhashable type: 'dict'` — exit 1, no annotation.
+        if not isinstance(n, str) or not n.strip():
+            raise CannotMeasure(
+                f"{path}: jobs.{GATE_JOB}.needs entries must be non-blank strings, "
+                f"got {type(n).__name__} — cannot measure")
+
     steps = gate.get("steps")
     if steps is None:
         steps = []
@@ -764,9 +780,26 @@ def read_live_protection() -> tuple[set[str], bool | None]:
 
     try:
         payload = json.loads(out.stdout)
-        return set(payload.get("contexts") or []), payload.get("strict")
-    except (json.JSONDecodeError, AttributeError) as exc:
+    except json.JSONDecodeError as exc:
         raise CannotMeasure(f"branch protection returned non-JSON: {out.stdout[:200]!r}") from exc
+    if not isinstance(payload, dict):
+        raise CannotMeasure(
+            f"branch protection payload must be an object, got {type(payload).__name__}")
+    # Validate the payload's shape. A malformed `gh` response used to reach
+    # `set(...)` and raise TypeError (exit 1, no annotation); the `--jq` normally
+    # yields an array, so this is the last unguarded parsed-payload access.
+    contexts = require_list(payload.get("contexts") or [], "branch protection contexts")
+    for ctx in contexts:
+        if not isinstance(ctx, str):
+            raise CannotMeasure(
+                f"branch protection contexts must be strings, got {type(ctx).__name__}"
+                " — cannot measure")
+    strict = payload.get("strict")
+    if strict is not None and not isinstance(strict, bool):
+        raise CannotMeasure(
+            f"branch protection strict must be a boolean, got {type(strict).__name__}"
+            " — cannot measure")
+    return set(contexts), strict
 
 
 def check_declared_strict(contexts_strict: bool | None, declared_strict: bool | None) -> list[str]:

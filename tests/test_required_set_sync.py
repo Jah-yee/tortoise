@@ -436,10 +436,40 @@ def test_a_non_mapping_workflow_top_level_cannot_be_measured(guard, tmp_guard_en
 
 
 def test_a_non_iterable_needs_cannot_be_measured(guard, tmp_guard_env):
-    (tmp_guard_env / "python-ci.yml").write_text(
-        "jobs:\n  python-ci-gate:\n    needs: 5\n    steps:\n      - run: echo hi\n")
-    with pytest.raises(guard.CannotMeasure):
+    # A VALID heredoc, so the ONLY defect is the `needs:` shape. Without it this
+    # test passed for the wrong reason (the "no LEGS table" guard fired), and
+    # deleting the needs guard left it green.
+    _write_gate_with_a_bad_shape(guard, needs="5")
+    with pytest.raises(guard.CannotMeasure, match="must be a string or list"):
         guard.gate_legs()
+
+
+@pytest.mark.parametrize("value", ["[{a: b}]", "[[a]]"])
+def test_unhashable_needs_elements_cannot_be_measured(guard, tmp_guard_env, value):
+    """A dict/list element used to reach `set(needs)` -> TypeError, exit 1, no annotation."""
+    _write_gate_with_a_bad_shape(guard, needs=value)
+    with pytest.raises(guard.CannotMeasure, match="entries must be non-blank strings"):
+        guard.gate_legs()
+
+
+def test_a_blank_needs_entry_cannot_be_measured(guard, tmp_guard_env):
+    _write_gate_with_a_bad_shape(guard, needs="['']")
+    with pytest.raises(guard.CannotMeasure, match="non-blank strings"):
+        guard.gate_legs()
+
+
+def test_a_dangling_symlink_at_the_mirror_path_is_not_read_as_absent(guard, tmp_guard_env):
+    """A BROKEN SYMLINK is a present directory entry, not a missing mirror.
+
+    `Path.exists()` is False for a dangling link, so this used to classify the
+    mirror as absent and SKIP the comparison (exit 0) — while the same shape at
+    the mergify/python-ci seams was fail-closed exit 2.
+    """
+    if guard.SETTINGS_PATH.exists() or guard.SETTINGS_PATH.is_symlink():
+        guard.SETTINGS_PATH.unlink()
+    guard.SETTINGS_PATH.symlink_to(tmp_guard_env / "nonexistent-target.yml")
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
 
 
 def test_a_non_mapping_strategy_cannot_be_measured(guard, tmp_guard_env):
@@ -658,8 +688,11 @@ def test_a_falsy_non_list_needs_cannot_be_measured(guard, tmp_guard_env, value):
 
 
 def test_a_non_list_steps_cannot_be_measured(guard, tmp_guard_env):
+    # Anchored on the MESSAGE: a scalar `steps:` fixture cannot also carry a
+    # heredoc, so an unanchored `pytest.raises(CannotMeasure)` was satisfied by
+    # the "no LEGS table" guard and stayed green when the steps guard was deleted.
     _write_gate_with_a_bad_shape(guard, steps="    steps: 5\n")
-    with pytest.raises(guard.CannotMeasure):
+    with pytest.raises(guard.CannotMeasure, match="steps must be a list"):
         guard.gate_legs()
 
 
@@ -675,6 +708,40 @@ def test_a_gate_without_needs_defaults_to_an_empty_list(guard, tmp_guard_env):
         "jobs:\n  python-ci-gate:\n    steps:\n      - run: |\n"
         "          done <<'LEGS'\n          alpha|success|-\n          LEGS\n")
     assert guard.gate_legs() == ([], {"alpha"})
+
+
+@pytest.mark.parametrize("value", [r"\\1", r"\\g<name>", r"\\d", r"\\n"])
+def test_a_matrix_value_with_a_backslash_is_not_a_replacement_template(guard, value):
+    """`pattern.sub(str(value), ...)` treats the value as a replacement TEMPLATE.
+
+    `\\1` / `\\g<name>` raised re.error (exit 1, no annotation); `\\n` silently
+    became a control character in the check name, a name that can never match.
+    """
+    assert guard._render_matrix("test (${{ matrix.a }})", {"a": [value]}) == {
+        f"test ({value})"
+    }
+
+
+@pytest.mark.parametrize("payload", [
+    {"contexts": 5, "strict": False},
+    {"contexts": [["a"]], "strict": False},
+    {"contexts": "docs", "strict": False},
+    {"contexts": ["a"], "strict": "false"},
+    ["not-an-object"],
+])
+def test_a_malformed_live_payload_cannot_be_measured(guard, monkeypatch, payload):
+    """The last unguarded parsed-payload access: `set(payload['contexts'])`."""
+    import json
+    import subprocess
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Done())
+    with pytest.raises(guard.CannotMeasure):
+        guard.read_live_protection()
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
