@@ -1140,9 +1140,16 @@ def test_a_bare_required_status_checks_is_not_iterated(guard, tmp_guard_env):
     assert guard.declared_settings_strict() is False
 
 
-def test_check_deadlock_defaults_to_the_merge_bucket(guard):
-    problems = guard.check_deadlock({"alpha"}, set())
+def test_check_deadlock_names_the_bucket_it_was_given(guard):
+    """`bucket` is REQUIRED — there is no default arm to fall through to.
+
+    The default used to be `"merge_conditions"`, unreachable from both call
+    sites, which is why it was deleted rather than kept as a fallback.
+    """
+    problems = guard.check_deadlock({"alpha"}, set(), "merge_conditions")
     assert any("merge_conditions" in p for p in problems), problems
+    entry = guard.check_deadlock({"alpha"}, set(), "queue_conditions")
+    assert any("queue_conditions" in p for p in entry), entry
 
 
 def test_an_unreadable_mirror_is_not_read_as_absent(guard, tmp_guard_env, monkeypatch):
@@ -1546,6 +1553,20 @@ def test_a_second_queue_rule_is_also_measured(guard, tmp_guard_env):
     assert len(problems) == 1 and "queue_rules[1]" in problems[0], problems
 
 
+def test_a_non_list_queue_rules_cannot_be_measured_by_every_reader(guard, tmp_guard_env):
+    """`read_injection_modes` owns a non-list guard too, and it is not dead.
+
+    `load_mergify` fails closed first in `run()`, but this function is callable on
+    its own — and without its own guard a non-iterable `queue_rules` raises
+    TypeError from the comprehension, which is an UNANNOTATED traceback and a
+    non-2 exit. The documented exit-2 contract is the thing being protected here,
+    so the guard stays and is pinned rather than deleted as unreachable.
+    """
+    for bad in ("queue_rules: 0\n", "queue_rules: {}\n", "queue_rules: nothing\n"):
+        guard.MERGIFY_PATH.write_text(bad)
+        assert guard.read_injection_modes() == []
+
+
 def test_no_queue_rule_at_all_is_a_violation(guard):
     """The mode justifies every `injected` name, so it cannot simply be assumed."""
     assert guard.check_injection_mode([]) != []
@@ -1614,6 +1635,8 @@ def test_the_injection_mode_is_checked_through_run(guard, tmp_guard_env, monkeyp
     "null",
     "0",
     0,
+    0.0,              # YAML `if: 0.0` arrives as a FLOAT, not the string "0.0"
+    -0.0,
     "",
     '""',             # two characters — a DIFFERENT input from the empty string
     "''",
@@ -1793,7 +1816,8 @@ def test_a_merge_condition_only_a_push_workflow_produces_is_a_deadlock(guard, tm
         "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
     producible = guard.producible_on_pull_request()
     assert "push-only-gate" not in producible
-    violations = guard.check_deadlock({"push-only-gate"}, producible)
+    violations = guard.check_deadlock({"push-only-gate"}, producible,
+                                      "merge_conditions")
     assert any("DEADLOCK" in v for v in violations), violations
 
 
@@ -1815,7 +1839,8 @@ def test_a_pull_request_check_is_not_a_deadlock(guard, tmp_guard_env):
         "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
     producible = guard.producible_on_pull_request()
     assert "pr-gate" in producible
-    assert guard.check_deadlock({"pr-gate"}, producible) == []
+    assert guard.check_deadlock({"pr-gate"}, producible,
+                                "merge_conditions") == []
 
 
 def test_a_workflow_parse_uses_the_boolean_on_key(guard, tmp_guard_env):

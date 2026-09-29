@@ -424,7 +424,7 @@ def _triggers(workflow: dict[str, Any]) -> set[str]:
 _PR_IS_OTHER_EVENT = re.compile(
     r"github\.event_name\s*==\s*['\"](?!pull_request(?:_target)?['\"])[A-Za-z_]+['\"]")
 _PR_IS_NOT_PULL_REQUEST = re.compile(
-    r"github\.event_name\s*(?:!=|<>)\s*['\"]pull_request(?:_target)?['\"]")
+    r"github\.event_name\s*!=\s*['\"]pull_request(?:_target)?['\"]")
 _PR_IS_PULL_REQUEST = re.compile(
     r"github\.event_name\s*==\s*['\"]pull_request(?:_target)?['\"]")
 
@@ -919,7 +919,7 @@ def check_injected_producible(injected: set[str], producible: set[str]) -> list[
 
 
 def check_deadlock(names: set[str], producible: set[str],
-                   bucket: str = "merge_conditions") -> list[str]:
+                   bucket: str) -> list[str]:
     """Every condition must be producible on a PR-like ref — in BOTH lists.
 
     `merge_conditions` gate the MERGE, evaluated against the queue branch; the
@@ -933,10 +933,14 @@ def check_deadlock(names: set[str], producible: set[str],
     condition can never become true and entry stalls for every PR. Checking only
     the merge list leaves that half unguarded.
     """
+    # `bucket` has no default and no fallback entry: it is a REQUIRED argument with
+    # exactly two call sites, both of which pass one of these keys. A default arm
+    # could never fire, so it was documentation pretending to be a guard — same
+    # reason `_PR_IS_PUSH` and `_triggers`' raw-None branch were deleted.
     consequence = {
         "merge_conditions": "the queue branch never reports it, so the queue DEADLOCKS for every PR",
         "queue_conditions": "so the condition can never become true and queue ENTRY stalls for every PR",
-    }.get(bucket, "so the queue can never satisfy it")
+    }[bucket]
     return [
         f"{name!r} is in {bucket} but NO pull_request-triggered workflow "
         f"produces it — {consequence}"
