@@ -320,6 +320,15 @@ class FakeGh:
         return []
 
     def page(self, url, **kw):
+        # The real Gh.page returns the raw body, so a check-runs read through it
+        # yields the {"check_runs": [...]} OBJECT, not a list. Unreachable today
+        # (check_runs() only reaches obj_paged) — but a fake that answers the
+        # wrong SHAPE would mask a future switch to .page, so it matches the real
+        # contract rather than the current call path. Found by review.
+        if "check-runs" in url:
+            self.calls += 1
+            self.asked.append(url)
+            return {"total_count": len(self.runs), "check_runs": self.runs}
         return self._route(url)
 
     def paged(self, url, **kw):

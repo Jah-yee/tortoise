@@ -928,7 +928,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cache-dir", type=Path, default=None)
     ap.add_argument("--now", default=None, help="ISO instant pinning 'now' (determinism)")
     ap.add_argument("--prune-after", type=int, default=None,
-                    help="dev only: keep only the N most recently closed human PRs")
+                    help="dev only: keep only the N most recently closed human PRs. "
+                         "NOTE it narrows the POPULATION itself, so every count and "
+                         "share in the report is over the pruned set, and neither "
+                         "the rendered report nor --json-out restates that N was "
+                         "applied — a result produced with it is not comparable to "
+                         "one produced without it.")
     ap.add_argument("--repo-root", type=Path,
                     default=Path(__file__).resolve().parent.parent)
     args = ap.parse_args(argv)
