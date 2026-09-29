@@ -448,9 +448,13 @@ def _is_a_zero_number(text: str) -> bool:
     leaves as STRINGS.
 
     GitHub's number literals are "any number format supported by JSON", which
-    accepts `0e0`, `0.0e0` and `0e+0`. YAML 1.1 does not resolve those (its float
-    pattern wants a dot or a SIGNED exponent), so PyYAML hands them over as `str`
-    and the `isinstance(..., (int, float))` arm never sees them — which left
+    accepts `0e0`, `0.0e0` and `0e+0`. YAML 1.1 resolves none of them, and the
+    reason is worth stating precisely because it is not "a dot or a signed
+    exponent": PyYAML's float pattern REQUIRES a dot, and its optional exponent
+    group is itself sign-REQUIRING (`[eE][-+][0-9]+`). So `0e+0` has the sign and
+    no dot, `0.0e0` has the dot and no sign, and neither resolves. PyYAML hands
+    all of them over as `str`, the `isinstance(..., (int, float))` arm never sees
+    them — which left
     `if: 0e0` classified PRODUCIBLE, a false GREEN in the one direction the
     deadlock checks must never fail in. `float()` closes it: it accepts every JSON
     number form.

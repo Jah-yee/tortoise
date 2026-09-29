@@ -1656,9 +1656,11 @@ def test_the_injection_mode_is_checked_through_run(guard, tmp_guard_env, monkeyp
     "-0",
     "0.0",
     # Exponent forms. GitHub numbers are "any number format supported by JSON", so
-    # these are ALL the number zero — but YAML 1.1 does not resolve them (its float
-    # pattern wants a dot or a SIGNED exponent), so PyYAML hands them over as `str`
-    # and the numeric arm never sees them. Undecoded, each was called PRODUCIBLE.
+    # these are ALL the number zero — but YAML 1.1 resolves none of them, because
+    # PyYAML's float pattern REQUIRES a dot and its optional exponent group is itself
+    # sign-REQUIRING (`[eE][-+][0-9]+`): `0e+0` has the sign and no dot, `0.0e0` has
+    # the dot and no sign. PyYAML hands every one over as `str`, so the numeric arm
+    # never sees them, and undecoded each was called PRODUCIBLE.
     # These rows are the ONLY thing pinning `_is_a_zero_number`: deleting it leaves
     # them green, because every OTHER falsy row is caught by `_FALSY_IF_STRINGS` or
     # by the `(int, float)` arm without it.
