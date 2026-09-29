@@ -993,6 +993,18 @@ def wipe_server(proj, scope: set[str] | None = None, drop: bool = False) -> None
     # snapshot — and swept. Resolving after enumeration also picks up a peer
     # session that started while we were listing.
     graphs = list(proj.db.list_graphs() or [])
+    # The caller's OWN graph must always be a sweep candidate, even when
+    # GRAPH.LIST cannot see it: GRAPH.LIST enumerates graphs that HAVE KEYS, so
+    # a graph this session already emptied (or has just selected) is absent
+    # from it and the session-end sweep would silently skip the one graph it is
+    # unambiguously entitled to wipe. That skip is a fail-open on a destructive
+    # operation — the caller cannot tell "nothing to wipe" from "never looked
+    # at my own graph" — and it is the residue behind the four test_wipe_server
+    # failures on a shared server (test_ws_wipe_target left non-empty after
+    # wipe_server).
+    _own = getattr(getattr(proj, "g", None), "name", None)
+    if _own and _own not in graphs:
+        graphs.append(_own)
     peer_journals = _live_peer_journal_files() if is_global else []
     for g in graphs:
         if scope is not None and g not in scope:
@@ -1024,8 +1036,8 @@ def wipe_server(proj, scope: set[str] | None = None, drop: bool = False) -> None
         # residual: ownership lives in a local file written by another
         # process, and the delete is a server command on a different channel,
         # with no conditional/transactional delete spanning the two.
-        if peer_journals and g in _peer_journaled_graphs(peer_journals):
-            continue  # a live PEER session owns this graph
+        if g != _own and peer_journals and g in _peer_journaled_graphs(peer_journals):
+            continue  # a live PEER session owns this graph (our own graph is never a peer's)
         try:
             proj.db.select_graph(g).query("MATCH (n) DETACH DELETE n")
         except Exception as e:  # P2-7: collect + re-raise, never pass silently
