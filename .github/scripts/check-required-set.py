@@ -168,6 +168,12 @@ def load_mergify(path: Path | None = None) -> dict[str, set[str]]:
         cfg = read_yaml(path)
     except yaml.YAMLError as exc:
         raise CannotMeasure(f"mergify config unparsable: {path}: {exc}") from exc
+    if not isinstance(cfg, dict):
+        # A top-level LIST/scalar is unusable, and an unguarded `.get` here would
+        # surface as an AttributeError traceback with a NON-2 exit and no
+        # `::error::` annotation — contradicting this module's exit contract.
+        raise CannotMeasure(
+            f"{path}: top level is not a mapping, got {type(cfg).__name__} — cannot measure")
 
     rules = cfg.get("queue_rules")
     if not isinstance(rules, list) or not rules:
@@ -209,6 +215,33 @@ def _triggers(workflow: dict[str, Any]) -> set[str]:
     if isinstance(raw, dict):
         return {str(k) for k in raw}
     return set()
+
+
+# A job that can only run on a push event. The decisive shape is the one this
+# repo actually uses (`canary-streak`: `if: always() && github.event_name == 'push'`).
+_PUSH_ONLY_IF = re.compile(r"github\.event_name\s*==\s*['\"]push['\"]")
+
+
+def _gated_off_pr_refs(job: dict[str, Any]) -> bool:
+    """Can this job never report on a PR-like ref, because of its own `if:`?
+
+    A workflow can be `on: pull_request` while a JOB inside it is gated to push
+    only. Such a job is not a producible check on the PR head or the queue
+    branch, so counting it as producible is a false negative in the deadlock
+    check — exactly the hazard this guard exists to catch.
+
+    LIMIT, stated so it is not over-trusted: only the DECISIVE push-only shape is
+    treated as unproducible. Anything else — including an `if:` we cannot
+    classify — counts as producible, because the opposite default would turn an
+    unrecognised expression into a false DEADLOCK on a check that is fine, which
+    is a worse failure than the one being closed.
+    """
+    condition = job.get("if")
+    if not isinstance(condition, str):
+        return False
+    if "pull_request" in condition:
+        return False  # mentions PR events; treat as potentially live on a PR
+    return bool(_PUSH_ONLY_IF.search(condition))
 
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_]+)\s*\}\}")
@@ -263,8 +296,14 @@ def producible_on_pull_request(workflows_dir: Path | None = None) -> set[str]:
             continue
         if not (_triggers(workflow) & {"pull_request", "pull_request_target"}):
             continue
-        for job_id, job in (workflow.get("jobs") or {}).items():
+        jobs = workflow.get("jobs")
+        if not isinstance(jobs, dict):
+            # `jobs:` as a list or scalar is unusable; `.items()` would raise.
+            continue
+        for job_id, job in jobs.items():
             if not isinstance(job, dict):
+                continue
+            if _gated_off_pr_refs(job):
                 continue
             template = job.get("name")
             if isinstance(template, str) and template.strip():
@@ -327,6 +366,22 @@ def _settings_entries(path: Path | None) -> list[dict[str, Any]]:
     return raw
 
 
+def _required_status_checks(entry: dict[str, Any]) -> dict[str, Any]:
+    """`entry['required_status_checks']` as a mapping, or {} when absent.
+
+    A present-but-non-mapping value is unusable and raises, rather than being
+    silently treated as empty.
+    """
+    rsc = entry.get("required_status_checks")
+    if rsc is None:
+        return {}
+    if not isinstance(rsc, dict):
+        raise CannotMeasure(
+            f"required_status_checks must be a mapping, got {type(rsc).__name__} — "
+            "cannot measure")
+    return rsc
+
+
 def _is_main(entry: dict[str, Any]) -> bool:
     """Does this entry speak for `main`? A MISSING branch is not `main`."""
     return str(entry.get("branch", "")).strip() == "main"
@@ -353,7 +408,7 @@ def declared_settings_contexts(path: Path | None = None) -> set[str] | None:
     for entry in _settings_entries(path):
         if not _is_main(entry):
             continue
-        rsc = entry.get("required_status_checks") or {}
+        rsc = _required_status_checks(entry)
         contexts |= {str(c) for c in (rsc.get("contexts") or [])}
     return contexts
 
@@ -364,7 +419,7 @@ def declared_settings_off_main(path: Path | None = None) -> list[str]:
     for entry in _settings_entries(path):
         if _is_main(entry):
             continue
-        rsc = entry.get("required_status_checks") or {}
+        rsc = _required_status_checks(entry)
         if rsc.get("contexts") or "strict" in rsc:
             off.append(str(entry.get("branch", "<missing branch>")))
     return off
@@ -375,7 +430,7 @@ def declared_settings_strict(path: Path | None = None) -> bool | None:
     for entry in _settings_entries(path):
         if not _is_main(entry):
             continue
-        rsc = entry.get("required_status_checks") or {}
+        rsc = _required_status_checks(entry)
         if "strict" in rsc:
             return bool(rsc["strict"])
     return None

@@ -355,6 +355,79 @@ def test_an_off_main_entry_declaring_only_strict_is_still_mis_filed(guard, tmp_g
     assert guard.declared_settings_off_main() == ["develop"]
 
 
+def test_a_job_gated_to_push_inside_a_pr_workflow_is_not_producible(guard, tmp_guard_env):
+    """A `pull_request` workflow can still hold a job that only ever runs on push.
+
+    Counting that job as producible is a false negative in the deadlock check —
+    the condition can never become true on the PR head or the queue branch.
+    """
+    (tmp_guard_env / "workflows" / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n"
+        "  always-ok:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n"
+        "  push-only:\n    if: always() && github.event_name == 'push'\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    producible = guard.producible_on_pull_request()
+    assert "always-ok" in producible
+    assert "push-only" not in producible
+    assert guard.check_deadlock({"push-only"}, producible, "merge_conditions") != []
+
+
+def test_a_job_with_an_unclassifiable_if_is_treated_as_producible(guard, tmp_guard_env):
+    """THE LIMIT, pinned deliberately.
+
+    An `if:` we cannot classify must count as producible: the opposite default
+    would turn an unrecognised expression into a false DEADLOCK on a check that
+    is fine, which is worse than the false negative being closed.
+    """
+    (tmp_guard_env / "workflows" / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  weird:\n"
+        "    if: needs.changes.outputs.python == 'true'\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    assert "weird" in guard.producible_on_pull_request()
+
+
+def test_run_flags_a_required_check_gated_to_push_inside_a_pr_workflow(
+        guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: the push-gated job must reach a violation through run()."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    guard.WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    (guard.WORKFLOWS_DIR / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n"
+        "  alpha:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n"
+        "  beta:\n    if: always() && github.event_name == 'push'\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    _write_minimal_gate(guard, needs=["alpha"], legs=["alpha"])
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("DEADLOCK" in v for v in violations), violations
+
+
+# ── shape guards: unusable YAML is exit 2, never a traceback ───────────────
+
+
+def test_a_non_mapping_mergify_top_level_cannot_be_measured(guard, tmp_guard_env):
+    """A top-level list must exit 2, not raise AttributeError with no ::error::."""
+    guard.MERGIFY_PATH.write_text("- check-success=docs\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.load_mergify()
+
+
+def test_a_workflow_with_jobs_as_a_scalar_is_skipped_not_crashed(guard, tmp_guard_env):
+    (tmp_guard_env / "workflows" / "bad.yml").write_text(
+        "on:\n  pull_request:\njobs: hello\n")
+    assert guard.producible_on_pull_request() == set()
+
+
+def test_a_non_mapping_required_status_checks_cannot_be_measured(guard, tmp_guard_env):
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks: nope\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
+
+
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
     """Every condition the queue waits on must exist on a PR-like ref — BOTH lists.
 
