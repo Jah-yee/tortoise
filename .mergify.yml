@@ -240,15 +240,29 @@ queue_rules:
 #   auto-merge off removes the automatic ENTRY; it removes no check.
 #
 # THE FALSIFIER — how you will know this lever did not take
-#   Within a few minutes of this landing on `main`, a PR that satisfies
-#   `queue_conditions` must STOP being auto-queued, and Mergify should instead
-#   offer its "Queue this pull request" control. If auto-queueing CONTINUES
-#   with the field absent, then the value is NOT read from this file (a
-#   dashboard-side override) — that is the one outcome that would refute the
-#   premise above, and it is cheap to check: `tools/merge_throughput.py check
-#   queue-entry --pr <n> --require-fresh` reads the Mergify check-run's
-#   `Entered queue` line and reports its trigger (`auto_merge_conditions` vs a
-#   human `@mergifyio queue`).
+#   Watch the AUTO path, not the queue: a human can still queue a PR by hand
+#   (`@mergifyio queue`), so the question is only whether batches keep being
+#   created with no human involved. The observable needs nothing beyond `gh`,
+#   and it is the same quantity the WHY block above measures — the rate of new
+#   runs on `mergify/merge-queue/*`:
+#       gh run list --repo <owner>/<repo> --limit 200 \
+#         --json headBranch,createdAt \
+#         | jq '[.[] | select(.headBranch | startswith("mergify/"))] | length'
+#   Baseline with auto-merge on: 99 created in 20 minutes. If that rate is
+#   unchanged a few minutes after this lands on `main`, the value is NOT read
+#   from this file (a dashboard-side override) — the one outcome that refutes
+#   the premise above. Do NOT cite `tools/merge_throughput.py check queue-entry`
+#   for this: it consumes a caller-supplied payload, no producer of one exists
+#   in the repo, so it returns UNKNOWN rather than an answer.
+#
+# ⚠️ SUSPENDED BY THIS CHANGE
+#   #5215's criterion S2 ("a green PR auto-queues unaided") is now
+#   UNSATISFIABLE BY DESIGN, and stays so until this field is restored; the
+#   queue-population criteria (S5/S6) measure that same auto-entry and are
+#   suspended with it. Nothing in CI consumes them — `.github/` runs only
+#   `mergify_config_guard.py --static` and `ci_selection.py --integrity` — so
+#   this reds no check, but a lane reading #5215 must not read the gap as an
+#   outstanding failure.
 #
 # DO NOT RESTATE THE REASONING HERE
 #   Reasoning belongs where it can be maintained and cited, not duplicated into a
