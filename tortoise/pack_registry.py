@@ -1142,8 +1142,8 @@ class PackRegistry:
                         f"extraction.relationTemplates[{i}].predicate "
                         f"'{template_pred}' must be camelCase"
                     )
-                if "fromKind" in tpl or "toKind" in tpl:
-                    if "fromKind" not in tpl or "toKind" not in tpl:
+                if ("fromKind" in tpl or "toKind" in tpl) and (
+                        "fromKind" not in tpl or "toKind" not in tpl):
                         errors.append(
                             f"extraction.relationTemplates[{i}]: both fromKind "
                             f"and toKind are required when either is given "
