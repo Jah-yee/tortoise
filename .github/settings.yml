@@ -15,9 +15,13 @@
 # was — a guard that believed it blocked the merge and did not.
 #
 # Manual equivalent (if you are ever here to set this by hand):
-#   Settings -> Branches -> main -> Require status checks -> the six below.
+#   Settings -> Branches -> main -> Require status checks -> the SEVEN below.
 # Keep this list equal to live `.required_status_checks.contexts` and to
-# `.mergify.yml`'s union; `check-required-set.py --live` is the assertion.
+# `check-required-set.py`'s enumeration; `check-required-set.py --live` is the
+# assertion. Live protection has SEVEN contexts: the six the queue names
+# explicitly, plus `ai-review-gate`, which Mergify enforces at the merge by
+# branch-protection injection and which is deliberately NOT in
+# `queue_conditions` (naming it there would make it an ENTRY gate too).
 repository:
   branch-protection:
     - branch: main
@@ -34,4 +38,5 @@ repository:
           - license-surface
           - legal-e2e
           - python-ci-gate
+          - ai-review-gate
       required_pull_request_reviews: null

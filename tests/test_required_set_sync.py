@@ -32,6 +32,7 @@ Exit contract (fail-closed): 0 clean, 1 violation, 2 could-not-measure —
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import subprocess
@@ -43,6 +44,38 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / ".github" / "scripts" / "check-required-set.py"
+
+# The repository's OWN inputs, as they are on disk when this module is imported.
+# `_no_test_writes_a_real_file` below re-hashes them after every test.
+_REAL_INPUTS = [
+    REPO_ROOT / ".mergify.yml",
+    REPO_ROOT / ".github" / "settings.yml",
+    *sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml")),
+]
+_REAL_HASHES = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in _REAL_INPUTS}
+
+
+@pytest.fixture(autouse=True)
+def _no_test_writes_a_real_file():
+    """No test may modify the repository's own inputs.
+
+    A GUARD, not a comment, and it exists because the accident already happened
+    once in this file: a parametrised test lacked `tmp_guard_env` and so wrote its
+    fixture `{mode: True}` into the REAL `.mergify.yml`, truncating 228 lines to
+    3. Three unrelated tests then failed with a confusing "no check-success=*
+    conditions in any queue rule" error, which named the symptom and not the
+    cause. This names the file, at the test that did it.
+
+    Cheap: hashes a handful of files that a unit test must never touch.
+    """
+    yield
+    for path, expected in _REAL_HASHES.items():
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert actual == expected, (
+            f"a test modified the repository's own {path.relative_to(REPO_ROOT)} — "
+            f"every test must point the seams at `tmp_guard_env`, never at the real "
+            f"tree, because writing here corrupts the checkout and makes unrelated "
+            f"tests fail for an unrelated reason")
 
 # Ambient seams a developer might have exported — popped for full hermeticity.
 _AMBIENT = ("MERGIFY_CONFIG", "BRANCH_PROTECTION_DECLARATION", "WORKFLOWS_DIR",
@@ -108,14 +141,27 @@ def test_the_real_gate_observes_exactly_the_legs_its_table_names(guard):
 def test_the_real_enumeration_partitions_every_name(guard):
     """Exactly one bucket per name, and no name without a recorded guarantee."""
     queue, merge = guard.declared_lists()
+    injected = guard.injected_names()
     assert not (queue & merge)
+    assert not (injected & (queue | merge)), (
+        "an `injected` name must not also be filed in a named bucket — the "
+        "enumeration gives each name exactly ONE enforcement route")
     assert queue and merge
     for name, (where, why) in guard.REQUIRED_SET.items():
-        assert where in ("queue", "merge"), f"{name}: unknown bucket {where!r}"
+        assert where in ("queue", "merge", "injected"), f"{name}: unknown bucket {where!r}"
         assert why.strip(), f"{name}: coverage accounting is empty"
     assert "python-ci-gate" in merge, (
         "the aggregate must be the one merge condition — it is the check the "
         "queue branch actually reports on")
+    # The live-required name that is enforced by INJECTION, not by a list entry.
+    # Pinned so a later "tidy-up" cannot drop it and restore the six-context lie.
+    assert injected == {"ai-review-gate"}, (
+        "`ai-review-gate` is required on main and must stay enumerated; it is "
+        "enforced at merge by branch-protection injection, so it belongs in "
+        "NEITHER .mergify.yml list")
+    assert set(guard.REQUIRED_SET) == queue | merge | injected, (
+        "the enumeration is the LIVE-required set — every entry must be in one "
+        "of the three buckets and every bucket entry in the enumeration")
 
 
 # ── COMPOSITION: run() must actually CALL each check ───────────────────────
@@ -137,7 +183,12 @@ def _write_minimal_gate(guard, needs: list[str], legs: list[str]) -> None:
 
 def _write_minimal_mergify(guard, queue: list[str], merge: list[str]) -> None:
     guard.MERGIFY_PATH.write_text(
-        "queue_rules:\n  - name: main\n    queue_conditions:\n"
+        "queue_rules:\n  - name: main\n"
+        # The real file sets this, and `check_injection_mode` asserts it — a
+        # fixture that omitted it would make every composition test fail for a
+        # reason unrelated to what it tests.
+        "    branch_protection_injection_mode: merge\n"
+        "    queue_conditions:\n"
         + "".join(f"      - check-success={n}\n" for n in queue)
         + "    merge_conditions:\n"
         + "".join(f"      - check-success={n}\n" for n in merge))
@@ -1436,6 +1487,79 @@ def test_an_absent_mirror_is_reported_as_not_compared(guard, tmp_guard_env, monk
     assert any("ABSENT" in n and "not compared" in n for n in notes), notes
 
 
+@pytest.mark.parametrize("mode,flagged", [
+    ("merge", False),
+    ("queue", True),      # the default: injected contexts gate ENTRY too
+    (None, True),         # absent == Mergify's `queue` default
+    ("sort", True),      # a typo is not a recognised mode
+    (True, True),
+])
+def test_the_injection_mode_must_be_merge(guard, tmp_guard_env, mode, flagged):
+    """`queue`/absent makes an `injected` name an ENTRY gate — a false claim.
+
+    `tmp_guard_env` is REQUIRED here, not decoration: without it this test writes
+    its fixture into the real `.mergify.yml` (see the autouse
+    `_no_test_writes_a_real_file` guard, which now catches that).
+    """
+    if mode is None:
+        guard.MERGIFY_PATH.write_text("queue_rules:\n  - name: main\n")
+    else:
+        guard.MERGIFY_PATH.write_text(
+            "queue_rules:\n  - name: main\n"
+            f"    branch_protection_injection_mode: {mode!r}\n")
+    assert bool(guard.check_injection_mode(guard.read_injection_mode())) is flagged
+
+
+def test_an_injected_name_named_in_mergify_is_a_violation(guard, tmp_guard_env, monkeypatch):
+    """Naming an `injected` name in a list turns it into an ENTRY gate too."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta", "gamma"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta", "gamma"])
+    _write_minimal_gate(guard, needs=["alpha"], legs=["alpha"])
+    guard.SETTINGS_PATH.unlink(missing_ok=True)
+    monkeypatch.setattr(guard, "REQUIRED_SET", {
+        "alpha": ("queue", "x"), "beta": ("merge", "y"),
+        "gamma": ("injected", "enforced by injection only")})
+    code, violations, _ = guard.run()
+    assert code == 1
+    assert any("declared 'injected' but IS named" in v for v in violations), violations
+
+
+def test_an_unproducible_injected_name_is_a_deadlock_through_the_injection_door(
+        guard, tmp_guard_env, monkeypatch):
+    """A live-required check no PR-like workflow produces deadlocks the merge.
+
+    It is never named in `.mergify.yml`, so `check_deadlock` never sees it — this
+    is the only guard that can catch it.
+    """
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha"], legs=["alpha"])
+    guard.SETTINGS_PATH.unlink(missing_ok=True)
+    monkeypatch.setattr(guard, "REQUIRED_SET", {
+        "alpha": ("queue", "x"), "beta": ("merge", "y"),
+        "ghost": ("injected", "required on main, enforced by injection")})
+    code, violations, _ = guard.run()
+    assert code == 1
+    assert any("deadlock through the injection door" in v for v in violations), violations
+
+
+def test_the_injection_mode_is_checked_through_run(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: `run()` must actually CALL check_injection_mode."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
+    guard.SETTINGS_PATH.unlink(missing_ok=True)
+    # Flip the mode to the default in the fixture file itself.
+    guard.MERGIFY_PATH.write_text(
+        guard.MERGIFY_PATH.read_text().replace(
+            "    branch_protection_injection_mode: merge\n", ""))
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("branch_protection_injection_mode" in v for v in violations), violations
+
+
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
     """Every condition the queue waits on must exist on a PR-like ref — BOTH lists.
 
@@ -1450,10 +1574,14 @@ def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
 
 
 def test_the_real_declarative_mirror_is_not_stale(guard):
-    """`.github/settings.yml` must agree with the enumeration (or not exist)."""
-    queue, merge = guard.declared_lists()
+    """`.github/settings.yml` must agree with the enumeration (or not exist).
+
+    Compared against the ENUMERATION, not `queue | merge`: the mirror is a mirror
+    of live branch protection, which includes the `injected` name.
+    """
     contexts = guard.declared_settings_contexts()
-    assert guard.check_settings(contexts, queue | merge) == []
+    assert guard.check_settings(contexts, set(guard.REQUIRED_SET)) == []
+    assert contexts is not None and "ai-review-gate" in contexts
 
 
 # ── partition mutations: a dropped or mis-filed name must fail ─────────────

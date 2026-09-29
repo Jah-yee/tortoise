@@ -164,14 +164,24 @@ GATE_LEGS_HEREDOC = "<<'LEGS'"
 CHECK_SUCCESS_PREFIX = "check-success="
 
 # ── THE ENUMERATION (design decision 2) ───────────────────────────────────────
-# Every required status check, the ONE mergify list it belongs in, and the
+# Every LIVE-required status check, HOW the merge queue enforces it, and the
 # pre-merge guarantee it actually provides. Adding a name here without a
 # matching `.mergify.yml` entry fails; adding one to `.mergify.yml` without an
 # entry here fails. That is the whole anti-silent-drop property.
 #
-# `queue` = gated at ENTRY, against the PR head.
-# `merge` = re-asserted at MERGE, against the queue branch — so the check MUST
-#           be one the queue branch actually reports (see check_deadlock).
+# `queue`    = gated at ENTRY, against the PR head.
+# `merge`    = re-asserted at MERGE, against the queue branch — so the check MUST
+#              be one the queue branch actually reports (see check_deadlock).
+# `injected` = required on main but enforced at MERGE by Mergify's OWN
+#              branch-protection injection (`branch_protection_injection_mode`),
+#              so it is deliberately NOT named in either list. Naming an
+#              `injected` name in `queue_conditions` would ALSO make it an ENTRY
+#              gate — a queue BEHAVIOUR change, which is why the enumeration
+#              records it instead of editing the queue. Two things keep the
+#              category honest: the injected name must be PRODUCIBLE on a
+#              PR-like ref (else injection deadlocks the merge — see
+#              check_injected_producible), and the injection mode must actually
+#              be `merge` (see check_injection_mode).
 REQUIRED_SET: dict[str, tuple[str, str]] = {
     "pricing-artifact": (
         "queue",
@@ -197,6 +207,15 @@ REQUIRED_SET: dict[str, tuple[str, str]] = {
         "merge",
         "the whole Python CI aggregate: its `needs:` list is its entire claim "
         "(see the python-ci.yml block above the job and tests/test_ci_selection.py)",
+    ),
+    "ai-review-gate": (
+        "injected",
+        "the AI review gate. Required on `main` and enforced at the MERGE by "
+        "Mergify's injected branch-protection conditions, and deliberately NOT "
+        "named in `queue_conditions`: naming it there would make an LLM review an "
+        "ENTRY gate for every PR, which is a queue behaviour change and an owner "
+        "decision, not a sync fix. Live protection lists SEVEN contexts and this "
+        "is the seventh (#6144)",
     ),
 }
 
@@ -290,10 +309,46 @@ def load_mergify(path: Path | None = None) -> dict[str, set[str]]:
 
 
 def declared_lists() -> tuple[set[str], set[str]]:
-    """The two declared buckets, from the enumeration above."""
+    """The two NAMED-IN-.mergify.yml buckets, from the enumeration above."""
     queue = {n for n, (where, _) in REQUIRED_SET.items() if where == "queue"}
     merge = {n for n, (where, _) in REQUIRED_SET.items() if where == "merge"}
     return queue, merge
+
+
+def injected_names() -> set[str]:
+    """The enumeration's `injected` bucket: live-required, enforced BY INJECTION.
+
+    Kept out of `declared_lists()` on purpose — that function is compared against
+    `.mergify.yml`'s actual `*_conditions` lists, and an `injected` name is by
+    definition in NEITHER, so folding it in would make every comparison report a
+    spurious "dropped condition".
+    """
+    return {n for n, (where, _) in REQUIRED_SET.items() if where == "injected"}
+
+
+def read_injection_mode(path: Path | None = None) -> Any:
+    """`.mergify.yml`'s `branch_protection_injection_mode` from the queue rule.
+
+    Returned as the RAW value so an absent key and a wrong key stay
+    distinguishable: absent -> None, which `check_injection_mode` treats as
+    Mergify's default (`queue`) and therefore as a violation of this repo's
+    documented `merge` setting.
+    """
+    path = path or MERGIFY_PATH
+    try:
+        cfg = read_yaml(path)
+    except yaml.YAMLError as exc:
+        raise CannotMeasure(f"mergify config unparsable: {path}: {exc}") from exc
+    if not isinstance(cfg, dict):
+        raise CannotMeasure(
+            f"{path}: top level is not a mapping, got {type(cfg).__name__} — cannot measure")
+    rules = cfg.get("queue_rules")
+    if not isinstance(rules, list):
+        return None
+    for rule in rules:
+        if isinstance(rule, dict) and "branch_protection_injection_mode" in rule:
+            return rule["branch_protection_injection_mode"]
+    return None
 
 
 def _triggers(workflow: dict[str, Any]) -> set[str]:
@@ -398,9 +453,22 @@ def _render_matrix(template: str, matrix: dict[str, Any]) -> set[str]:
 def producible_on_pull_request(workflows_dir: Path | None = None) -> set[str]:
     """Check names producible by any workflow that runs on a pull-request ref.
 
-    The queue branch (`mergify/merge-queue/<sha>`) is a PR-like ref, so a check
-    produced only by a `push:`-triggered workflow can never report there. Naming
-    one in `merge_conditions` is the deadlock `.mergify.yml` warns about.
+    The queue branch (`mergify/merge-queue/<sha>`) is a PR-like ref. A check
+    produced only by a `push:` workflow whose BRANCH FILTER excludes the queue
+    branch — the common case, e.g. `on: push: branches: [main]` — can never report
+    there, and naming one in `merge_conditions` is the deadlock `.mergify.yml`
+    warns about.
+
+    KNOWN OVER-APPROXIMATION, stated so the verdict is not over-trusted: an
+    UNFILTERED `on: push:` workflow DOES report on the queue branch (the queue
+    branch produces ordinary `push` check runs — `.mergify.yml` says so itself),
+    but this function treats EVERY workflow without a `pull_request`*
+    trigger as unproducible. So a check produced ONLY by an unfiltered `push:`
+    workflow is reported unproducible when it is not, and a `merge_conditions`
+    entry naming it would be a FALSE RED. That direction is chosen deliberately: a
+    false RED is visible and costs a review; a false GREEN is the outage. Names of
+    `pull_request`-triggered workflows are the ground truth here, and no name in a
+    list today depends on the over-approximation.
     """
     workflows_dir = workflows_dir or WORKFLOWS_DIR
     try:
@@ -683,10 +751,23 @@ def check_partition(parsed: dict[str, set[str]]) -> list[str]:
         )
 
     for name, (where, why) in REQUIRED_SET.items():
-        if where not in ("queue", "merge"):
+        if where not in ("queue", "merge", "injected"):
             problems.append(f"{name!r}: unknown bucket {where!r}")
         if not (why or "").strip():
             problems.append(f"{name!r}: no recorded guarantee — coverage accounting is empty")
+
+    # An `injected` name must stay OUT of both fused lists. If it is named there,
+    # the enumeration's justification for it ("deliberately not an entry gate")
+    # is false — naming it IS an entry gate. The generic `actual - declared`
+    # comparison above also fires, but with a message that reads as a filing
+    # error rather than the BEHAVIOUR change it actually is.
+    for name in sorted(injected_names()):
+        if name in parsed["queue"] or name in parsed["merge"]:
+            problems.append(
+                f"{name!r} is declared 'injected' but IS named in .mergify.yml — "
+                "naming it also makes it an ENTRY gate, which contradicts the "
+                "category and changes queue behaviour"
+            )
 
     if not dq:
         problems.append("the enumeration declares an EMPTY queue bucket — fail-closed")
@@ -695,13 +776,57 @@ def check_partition(parsed: dict[str, set[str]]) -> list[str]:
     return problems
 
 
+def check_injection_mode(mode: Any) -> list[str]:
+    """.mergify.yml must set `branch_protection_injection_mode: merge`.
+
+    Not decoration. Under `merge` (set in `.mergify.yml`, contract point 4) the
+    injected branch-protection contexts gate the MERGE only, which is what makes
+    an `injected` name's absence from `queue_conditions` a deliberate choice
+    WITHOUT weakening enforcement. Under `queue` — Mergify's DEFAULT, so an ABSENT
+    key means `queue` — those same contexts are injected for QUEUING too, and the
+    enumeration's claim about an `injected` name stops being true. The failure
+    this catches, named concretely: the key is deleted or flipped to `queue`, and
+    the comment justifying `ai-review-gate`'s absence silently becomes false.
+    """
+    if mode != "merge":
+        return [
+            f".mergify.yml branch_protection_injection_mode is {mode!r}, not 'merge' "
+            f"(an absent key means Mergify's default, 'queue') — under 'queue' the "
+            f"injected branch-protection contexts gate ENTRY as well, so an "
+            f"'injected' name is no longer 'deliberately not an entry gate' and the "
+            f"enumeration's reason for it is false (#6144)"
+        ]
+    return []
+
+
+def check_injected_producible(injected: set[str], producible: set[str]) -> list[str]:
+    """Every `injected` name must be PRODUCIBLE on a PR-like ref.
+
+    An `injected` name is never named in `.mergify.yml`, so `check_deadlock` never
+    sees it — but Mergify injects it as a MERGE condition from branch protection,
+    evaluated against the queue branch. A required check that no PR-like workflow
+    produces can never go green there and the merge waits forever: the SAME
+    deadlock, reached through the injection door instead of a list. The failure
+    this catches, named concretely: a live-required check whose only producer is
+    `push:`-filtered to `main`.
+    """
+    return [
+        f"{name!r} is required on main and enforced by branch-protection injection, "
+        f"but NO pull_request-like workflow produces it — the merge would wait "
+        f"forever (a deadlock through the injection door)"
+        for name in sorted(injected - producible)
+    ]
+
+
 def check_deadlock(names: set[str], producible: set[str],
                    bucket: str = "merge_conditions") -> list[str]:
     """Every condition must be producible on a PR-like ref — in BOTH lists.
 
     `merge_conditions` gate the MERGE, evaluated against the queue branch; the
-    queue branch is PR-like, so a check only a `push:`-triggered workflow
-    produces can never report there and the merge waits forever.
+    queue branch is PR-like, so a check only a `push:` workflow FILTERED AWAY from
+    the queue branch produces can never report there and the merge waits forever.
+    (See `producible_on_pull_request` for why an unfiltered `push:` workflow is
+    over-approximated as unproducible, and why that direction is the safe one.)
 
     `queue_conditions` gate ENTRY, evaluated against the PR HEAD — also PR-like,
     so the same property is required. An unproducible entry condition means the
@@ -953,11 +1078,16 @@ def run(live: bool = False) -> tuple[int, list[str], list[str]]:
             live_contexts, live_strict = read_live_protection()
         else:
             live_contexts, live_strict = None, None
+        injection_mode = read_injection_mode()
     except CannotMeasure as exc:
         return 2, [], [f"CANNOT MEASURE: {exc}"]
 
     dq, dm = declared_lists()
-    expected = dq | dm
+    injected = injected_names()
+    # The enumeration is the LIVE-required set, so it — not `dq | dm` — is the
+    # expected total. `dq | dm` omitted every `injected` name, which is how a
+    # SEVEN-context live protection could read as "six" and still pass.
+    expected = set(REQUIRED_SET)
 
     violations = (
         check_partition(parsed)
@@ -966,6 +1096,8 @@ def run(live: bool = False) -> tuple[int, list[str], list[str]]:
         + check_settings(settings, expected)
         + check_settings_branches(off_main)
         + check_declared_strict(live_strict, declared_strict)
+        + check_injection_mode(injection_mode)
+        + check_injected_producible(injected, producible)
         + check_gate_legs(needs, legs)
     )
     if live_contexts is not None:
@@ -985,7 +1117,7 @@ def run(live: bool = False) -> tuple[int, list[str], list[str]]:
     notes.append(f"queue_conditions : {sorted(parsed['queue'])}")
     notes.append(f"merge_conditions : {sorted(parsed['merge'])}")
     notes.append(f"declared total   : {len(expected)} name(s) "
-                 f"(queue={len(dq)}, merge={len(dm)})")
+                 f"(queue={len(dq)}, merge={len(dm)}, injected={len(injected)})")
     # Record the mirror's state explicitly. Without this, an ABSENT mirror left no
     # note at all and `main()` still printed a success line claiming the mirror
     # AGREED — asserting a comparison that never happened.
