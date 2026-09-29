@@ -3,7 +3,7 @@
 #
 # ⚠️ THIS IS NOT A REQUIRED STATUS CHECK. This comment used to claim "must BLOCK
 # merge (branch protection requires it)" — that was false, and had been for a
-# long time: the live `main` protection has six contexts and `redis-guard` is
+# long time: the live `main` protection has SEVEN contexts and `redis-guard` is
 # none of them, and it is in neither of `.mergify.yml`'s `queue_conditions` /
 # `merge_conditions` lists. So a red run here reports, and does NOT block a
 # merge — a guard that believed it gated the merge and did not (#6144).

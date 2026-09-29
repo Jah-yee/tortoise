@@ -1245,7 +1245,13 @@ def test_a_padded_branch_is_still_main(guard, tmp_guard_env):
 
 
 def test_a_live_payload_without_contexts_reads_as_empty(guard, monkeypatch):
-    """`payload.get("contexts") or []` — an absent field means 'no live contexts'."""
+    """`[] if ... is None else ...` — an ABSENT field means 'no live contexts'.
+
+    The real expression is `[] if payload.get("contexts") is None else
+    payload["contexts"]`, NOT `payload.get("contexts") or []`: the latter coerced
+    `0`/`false`/`""` to an empty required set, which is the fail-open that
+    `test_a_falsy_non_list_live_contexts_cannot_be_measured` exists to prevent.
+    """
     import json
     import subprocess
 
@@ -1477,11 +1483,12 @@ def test_an_unreadable_config_path_cannot_be_measured(guard, tmp_guard_env, monk
 def test_an_absent_mirror_is_reported_as_not_compared(guard, tmp_guard_env, monkeypatch):
     """An absent mirror must not be reported as having AGREED."""
     _write_minimal_mergify(guard, ["alpha"], ["beta"])
-    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta", "gamma"])
     _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
     guard.SETTINGS_PATH.unlink(missing_ok=True)
     monkeypatch.setattr(guard, "REQUIRED_SET",
-                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y"),
+                         "gamma": ("injected", "enforced by branch-protection injection")})
     code, _, notes = guard.run()
     assert code == 0, notes
     assert any("ABSENT" in n and "not compared" in n for n in notes), notes
@@ -1558,6 +1565,68 @@ def test_the_injection_mode_is_checked_through_run(guard, tmp_guard_env, monkeyp
     code, violations, _ = guard.run()
     assert code == 1, violations
     assert any("branch_protection_injection_mode" in v for v in violations), violations
+
+
+@pytest.mark.parametrize("cond", [
+    False,          # YAML `if: false`
+    "false",        # string spelling GitHub evaluates as falsy
+    "FALSE",
+    "${{ false }}",
+    "0",
+    0,
+])
+def test_a_literally_falsy_if_is_gated_off(guard, cond):
+    """A LITERAL falsy `if:` is the ONE decidable case: the job can never run.
+
+    It used to fall into the `not isinstance(condition, str)` early-return and be
+    counted PRODUCIBLE, so a required check whose only producer was `if: false`
+    read as arriving forever — a false GREEN in the direction the deadlock checks
+    must never fail in.
+    """
+    assert guard._gated_off_pr_refs({"if": cond}) is True, cond
+
+
+@pytest.mark.parametrize("cond", [None, True, "always()", "${{ true }}", 1])
+def test_a_non_falsy_or_absent_if_stays_producible(guard, cond):
+    """The documented direction holds: an absent/unclassifiable `if:` is producible.
+
+    `None` MUST stay producible — an absent `if:` means the job RUNS, so treating
+    it as gated off would manufacture a false DEADLOCK on every normal job.
+    """
+    assert guard._gated_off_pr_refs({"if": cond}) is False, cond
+
+
+def test_a_never_running_job_is_not_producible(guard, tmp_guard_env):
+    """COMPOSITION: `if: false` must remove the name from the producible set."""
+    guard.WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    (guard.WORKFLOWS_DIR / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n"
+        "  alive:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n"
+        "  dead:\n    if: false\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - run: 'true'\n")
+    names = guard.producible_on_pull_request()
+    assert "alive" in names
+    assert "dead" not in names, (
+        "a job gated `if: false` never produces a check run, so counting it "
+        "producible is a false GREEN in the deadlock checks")
+
+
+def test_an_empty_injected_bucket_is_fail_closed(guard, tmp_guard_env, monkeypatch):
+    """The `injected` bucket has no second file, so empty must fail closed.
+
+    Unlike `queue`/`merge`, nothing outside the guard records that a
+    live-required name is enforced by injection, so an emptied bucket is
+    UNVERIFIABLE offline rather than merely unusual.
+    """
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha"], legs=["alpha"])
+    guard.SETTINGS_PATH.unlink(missing_ok=True)
+    monkeypatch.setattr(guard, "REQUIRED_SET", {
+        "alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("EMPTY injected bucket" in v for v in violations), violations
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):

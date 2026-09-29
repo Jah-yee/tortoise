@@ -163,6 +163,10 @@ GATE_LEGS_HEREDOC = "<<'LEGS'"
 
 CHECK_SUCCESS_PREFIX = "check-success="
 
+# LITERAL spellings of a falsy `if:` that GitHub evaluates as false. See
+# `_is_literally_off` — these are decidable, unlike a real expression.
+_FALSY_IF_STRINGS = frozenset({"false", "0", "${{ false }}"})
+
 # ── THE ENUMERATION (design decision 2) ───────────────────────────────────────
 # Every LIVE-required status check, HOW the merge queue enforces it, and the
 # pre-merge guarantee it actually provides. Adding a name here without a
@@ -384,6 +388,25 @@ _PR_IS_PULL_REQUEST = re.compile(
     r"github\.event_name\s*==\s*['\"]pull_request(?:_target)?['\"]")
 
 
+def _is_literally_off(condition: Any) -> bool:
+    """A LITERAL falsy `if:` — decidable as "this job can never run".
+
+    `if: false` is not an expression we "cannot classify"; it is a constant GitHub
+    evaluates as falsy and skips. Counting it PRODUCIBLE would be a false GREEN in
+    the one direction the deadlock checks must never fail in: a required check whose
+    only producer is such a job would read as arriving forever while the merge waits
+    for it. `None` is deliberately NOT falsy here — an absent (or explicitly null)
+    `if:` means the job RUNS.
+    """
+    if condition is False:
+        return True
+    if isinstance(condition, str):
+        return condition.strip().lower() in _FALSY_IF_STRINGS
+    if isinstance(condition, (int, float)):
+        return not condition
+    return False
+
+
 def _gated_off_pr_refs(job: dict[str, Any]) -> bool:
     """Can this job never report on a PR-like ref, because of its own `if:`?
 
@@ -403,8 +426,14 @@ def _gated_off_pr_refs(job: dict[str, Any]) -> bool:
     because the opposite default would turn an unrecognised expression into a
     false DEADLOCK on a healthy check, which is a worse failure than an unclosed
     false negative.
+
+    A LITERAL falsy `if:` is NOT in that unclassifiable category: it is decidable
+    and is handled first (`_is_literally_off`), because "this job never runs" is a
+    fact, not a guess.
     """
     condition = job.get("if")
+    if _is_literally_off(condition):
+        return True  # decidable: the job never runs, so it produces no check
     if not isinstance(condition, str):
         return False
     if _PR_IS_PULL_REQUEST.search(condition):
@@ -773,6 +802,14 @@ def check_partition(parsed: dict[str, set[str]]) -> list[str]:
         problems.append("the enumeration declares an EMPTY queue bucket — fail-closed")
     if not dm:
         problems.append("the enumeration declares an EMPTY merge bucket — fail-closed")
+    if not injected_names():
+        # The two buckets above are cross-checked against `.mergify.yml`, so an
+        # empty one is caught there too. The `injected` bucket has NO second file:
+        # nothing outside this guard records that a live-required name is enforced
+        # by injection. So an empty bucket is UNVERIFIABLE offline — drop a name
+        # from it while the mirror is absent and `run()` printed exit 0 over a live
+        # set that still required it. Fail closed, like the other two.
+        problems.append("the enumeration declares an EMPTY injected bucket — fail-closed")
     return problems
 
 
