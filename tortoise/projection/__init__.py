@@ -6183,8 +6183,15 @@ class FalkorProjection(
         Cypher-native DDL replaces it (`CREATE FULLTEXT INDEX FOR (n:L) ON (n.a,
         n.b)`), and that is the same substitution #1359 made for vectors.
 
-        Which API won is recorded on `_fts_index_api` for the query path, so a
-        future divergence is diagnosable rather than silent.
+        Which API won is recorded on `_fts_index_api` for DIAGNOSIS ONLY. Unlike
+        `_vector_index_api`, nothing consumes it, and that is not an oversight:
+        the FTS *query* statement (`db.idx.fulltext.queryNodes`) is version-
+        invariant — it is accepted by both 4.20.4 and 6.0.0, verified live on
+        both — so there is no second API for a reader to select between. The
+        attribute exists so that "which creation path did this engine take" is
+        answerable from a running instance instead of only from its version.
+        Do not claim it changes behaviour; it does not, and this sentence used
+        to say it did.
 
         "already indexed" is NOT a failure: both APIs raise it for a pre-existing
         index, and the caller uses that branch to drive its one-time migrations.
