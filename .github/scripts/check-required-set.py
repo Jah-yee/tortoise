@@ -172,9 +172,19 @@ CHECK_SUCCESS_PREFIX = "check-success="
 # `if: ''` and `if: ""` parse to `""` (zero characters), NOT to the two-character
 # string `'""'`. Listing only the two-character forms left `if: ''` PRODUCIBLE —
 # a false GREEN — while looking like the empty case was covered.
+#
+# The bare names of the constants are listed for the QUOTED spellings only
+# (`if: "null"`), because the unquoted `if: null` arrives as `None` and is handled
+# by `_is_literally_off` before this set is consulted.
 _FALSY_IF_STRINGS = frozenset({
     "false", "0", "-0", "0.0", "null", "", '\"\"', "''",
 })
+
+# Sentinel: the `if:` KEY IS ABSENT. Distinct from the key being present with a
+# null value, which PyYAML renders as the same `None` — `job.get("if")` cannot tell
+# them apart, and an absent `if:` means the job RUNS while a falsy constant means it
+# does not. Collapsing the two made the natural `if: null` spelling producible.
+_IF_ABSENT = object()
 
 
 def _normalise_if(condition: str) -> str:
@@ -422,15 +432,24 @@ def _is_literally_off(condition: Any) -> bool:
     evaluates as falsy and skips. Counting it PRODUCIBLE would be a false GREEN in
     the one direction the deadlock checks must never fail in: a required check whose
     only producer is such a job would read as arriving forever while the merge waits
-    for it. `None` is deliberately NOT falsy here — an absent (or explicitly null)
-    `if:` means the job RUNS.
+    for it.
+
+    An explicit YAML `null` lands here too, and that is deliberate. It used to fall
+    through to "producible" while `_FALSY_IF_STRINGS` simultaneously contained
+    `"null"` — so the guard called the null constant falsy when written `${{ null }}`
+    and truthy when written `if: null`, an internal contradiction where the natural
+    spelling took the unsafe branch. The null CONSTANT is falsy in GitHub's
+    expression language, so all spellings of it now agree. A bare `if:` (key present,
+    no value) parses to the same `None` and is therefore classified the same way;
+    that is the fail-closed reading of an ambiguous input, and the caller
+    distinguishes a truly ABSENT key, which still means the job runs.
 
     LIMIT, so this is not over-trusted: this classifies CONSTANTS. `if: ${{ 3-3 }}`
     is an expression that evaluates falsy and is deliberately NOT recognised —
     classifying arbitrary expressions is the trade `_gated_off_pr_refs` documents,
     and guessing there would manufacture false deadlocks.
     """
-    if condition is False:
+    if condition is None or condition is False:
         return True
     if isinstance(condition, str):
         return _normalise_if(condition) in _FALSY_IF_STRINGS
@@ -463,7 +482,9 @@ def _gated_off_pr_refs(job: dict[str, Any]) -> bool:
     and is handled first (`_is_literally_off`), because "this job never runs" is a
     fact, not a guess.
     """
-    condition = job.get("if")
+    condition = job.get("if", _IF_ABSENT)
+    if condition is _IF_ABSENT:
+        return False  # no `if:` AT ALL -> the job runs, so it is producible
     if _is_literally_off(condition):
         return True  # decidable: the job never runs, so it produces no check
     if not isinstance(condition, str):

@@ -53,6 +53,12 @@ _REAL_INPUTS = [
     *sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml")),
 ]
 _REAL_HASHES = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in _REAL_INPUTS}
+# The LISTING as well as the bytes: a test that CREATES a new workflow file leaves
+# the known files untouched, so a hash-only guard stays silent while the checkout
+# gains a file. (That is the same class of accident as the truncation this guard
+# was added for — a write the guard cannot see is a write it will not report.)
+_REAL_WORKFLOW_NAMES = frozenset(
+    p.name for p in (REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +82,11 @@ def _no_test_writes_a_real_file():
             f"every test must point the seams at `tmp_guard_env`, never at the real "
             f"tree, because writing here corrupts the checkout and makes unrelated "
             f"tests fail for an unrelated reason")
+    now = frozenset(p.name for p in (REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
+    assert now == _REAL_WORKFLOW_NAMES, (
+        f"a test created or deleted a workflow in the repository: "
+        f"{sorted(now ^ _REAL_WORKFLOW_NAMES)} — a hash check over the files that "
+        f"already existed cannot see a NEW one")
 
 # Ambient seams a developer might have exported — popped for full hermeticity.
 _AMBIENT = ("MERGIFY_CONFIG", "BRANCH_PROTECTION_DECLARATION", "WORKFLOWS_DIR",
@@ -1624,16 +1635,37 @@ def test_a_literally_falsy_if_is_gated_off(guard, cond):
     assert guard._gated_off_pr_refs({"if": cond}) is True, cond
 
 
-@pytest.mark.parametrize("cond", [None, True, "always()", "${{ true }}", 1,
-                                  "${{ 1 }}", "${{ !cancelled() }}"])
-def test_a_non_falsy_or_absent_if_stays_producible(guard, cond):
-    """The documented direction holds: an absent/unclassifiable `if:` is producible.
+@pytest.mark.parametrize("job", [
+    {},                      # the `if:` KEY IS ABSENT -> the job runs
+    {"if": True},
+    {"if": "always()"},
+    {"if": "${{ true }}"},
+    {"if": 1},
+    {"if": "${{ 1 }}"},
+    {"if": "${{ !cancelled() }}"},
+])
+def test_an_absent_or_truthy_if_is_producible(guard, job):
+    """`{}` and truthy conditions are producible; an ABSENT `if:` means the job runs.
 
-    `None` MUST stay producible — an absent `if:` means the job RUNS, so treating
-    it as gated off would manufacture a false DEADLOCK on every normal job. The
-    `${{ }}` rows check that normalising does not over-reach into the truthy side.
+    The first row is the one that matters: `{}` has NO `if` key. A row passing
+    `{"if": None}` does NOT exercise absence — it is a key present with a null
+    value, which is the falsy CONSTANT and is asserted gated off elsewhere. The
+    merged `job.get("if")` could not tell those apart, so the old row pinned the
+    wrong behaviour under an absence rationale.
     """
-    assert guard._gated_off_pr_refs({"if": cond}) is False, cond
+    assert guard._gated_off_pr_refs(job) is False, job
+
+
+@pytest.mark.parametrize("job", [{"if": None}, {"if": "null"},
+                                  {"if": "${{ null }}"}])
+def test_an_explicit_null_if_is_gated_off(guard, job):
+    """The null CONSTANT is falsy in every spelling, including the bare one.
+
+    `if: null` used to be counted producible (it arrives as `None`) while
+    `${{ null }}` was gated off — the guard contradicting itself on one constant,
+    with the NATURAL spelling taking the unsafe branch.
+    """
+    assert guard._gated_off_pr_refs(job) is True, job
 
 
 def test_an_empty_string_if_is_gated_off_through_yaml(guard, tmp_guard_env):
