@@ -414,10 +414,11 @@ def test_a_non_mapping_mergify_top_level_cannot_be_measured(guard, tmp_guard_env
         guard.load_mergify()
 
 
-def test_a_workflow_with_jobs_as_a_scalar_is_skipped_not_crashed(guard, tmp_guard_env):
+def test_a_workflow_with_jobs_as_a_scalar_cannot_be_measured(guard, tmp_guard_env):
     (tmp_guard_env / "workflows" / "bad.yml").write_text(
         "on:\n  pull_request:\njobs: hello\n")
-    assert guard.producible_on_pull_request() == set()
+    with pytest.raises(guard.CannotMeasure):
+        guard.producible_on_pull_request()
 
 
 def test_a_non_mapping_required_status_checks_cannot_be_measured(guard, tmp_guard_env):
@@ -426,6 +427,122 @@ def test_a_non_mapping_required_status_checks_cannot_be_measured(guard, tmp_guar
         "      required_status_checks: nope\n")
     with pytest.raises(guard.CannotMeasure):
         guard.declared_settings_contexts()
+
+
+def test_a_non_mapping_workflow_top_level_cannot_be_measured(guard, tmp_guard_env):
+    (tmp_guard_env / "python-ci.yml").write_text("- a\n- b\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.gate_legs()
+
+
+def test_a_non_iterable_needs_cannot_be_measured(guard, tmp_guard_env):
+    (tmp_guard_env / "python-ci.yml").write_text(
+        "jobs:\n  python-ci-gate:\n    needs: 5\n    steps:\n      - run: echo hi\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.gate_legs()
+
+
+def test_a_non_mapping_jobs_cannot_be_measured(guard, tmp_guard_env):
+    (tmp_guard_env / "workflows" / "bad.yml").write_text(
+        "on:\n  pull_request:\njobs: hello\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.producible_on_pull_request()
+
+
+def test_a_non_mapping_strategy_cannot_be_measured(guard, tmp_guard_env):
+    (tmp_guard_env / "workflows" / "bad.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  g:\n    name: my-check\n"
+        "    strategy: [a, b]\n    runs-on: ubuntu-latest\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.producible_on_pull_request()
+
+
+def test_a_non_iterable_queue_conditions_cannot_be_measured(guard, tmp_guard_env):
+    guard.MERGIFY_PATH.write_text(
+        "queue_rules:\n  - name: main\n    queue_conditions: 5\n"
+        "    merge_conditions:\n      - check-success=python-ci-gate\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.load_mergify()
+
+
+@pytest.mark.parametrize("body", [
+    "repository: [a, b]\n",
+    "repository: hello\n",
+    "repository: 5\n",
+])
+def test_a_non_mapping_repository_is_not_treated_as_absent(guard, tmp_guard_env, body):
+    """PRESENT-but-unusable `repository:` must not silently disable the mirror.
+
+    Returning "absent" here makes `declared_settings_contexts()` None, which
+    `check_settings` SKIPS — an exit 0 with one of the three surfaces uncompared.
+    """
+    guard.SETTINGS_PATH.write_text(body)
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
+
+
+@pytest.mark.parametrize("body", [
+    "repository:\n  branch-protection: 5\n",
+    "repository:\n  branch-protection: hello\n",
+])
+def test_a_non_list_branch_protection_cannot_be_measured(guard, tmp_guard_env, body):
+    guard.SETTINGS_PATH.write_text(body)
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
+
+
+def test_a_non_iterable_contexts_cannot_be_measured(guard, tmp_guard_env):
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        contexts: 5\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
+
+
+def test_a_string_contexts_is_refused_not_iterated(guard, tmp_guard_env):
+    """`contexts: docs` must not silently become {'d','o','c','s'}."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        contexts: docs\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
+
+
+@pytest.mark.parametrize("cond,gated_off", [
+    ("always() && github.event_name == 'push'", True),
+    ('github.event_name == "push"', True),
+    ("github.event_name=='push'", True),
+    ("github.event_name != 'pull_request'", True),
+    ("github.event_name != 'pull_request_target'", True),
+    ("github.event_name == 'push' || github.event_name == 'pull_request'", False),
+    ("github.event_name == 'pull_request'", False),
+    ("needs.changes.outputs.python == 'true'", False),
+])
+def test_the_push_gate_classification(guard, cond, gated_off):
+    """Classify the COMPARISON, not a substring.
+
+    A brute `"pull_request" in condition` test swallowed the NEGATED form too, so
+    a job gated `!= 'pull_request'` — just as push-only as `== 'push'` — was
+    counted as producible, and the stall went undetected.
+    """
+    assert guard._gated_off_pr_refs({"if": cond}) is gated_off, cond
+
+
+def test_run_flags_a_job_gated_by_a_negated_pull_request(guard, tmp_guard_env, monkeypatch):
+    """COMPOSITION: the negated push-only gate must reach a violation through run()."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    guard.WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    (guard.WORKFLOWS_DIR / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n"
+        "  alpha:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n"
+        "  beta:\n    if: github.event_name != 'pull_request'\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    _write_minimal_gate(guard, needs=["alpha"], legs=["alpha"])
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, violations, _ = guard.run()
+    assert code == 1, violations
+    assert any("DEADLOCK" in v for v in violations), violations
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):

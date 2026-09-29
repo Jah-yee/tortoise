@@ -154,6 +154,32 @@ class CannotMeasure(Exception):
     """Raised when a surface cannot be read — never silently treated as a pass."""
 
 
+def require_mapping(value: Any, what: str) -> dict[str, Any]:
+    """A parsed YAML value that must be a mapping. Unusable -> exit 2.
+
+    Centralised because patching these one call site at a time kept leaving a
+    sibling unguarded, and an unguarded `.get`/`.items()` surfaces as an
+    AttributeError traceback with a NON-2 exit and no `::error::` annotation —
+    which reads like a violation but names nothing.
+    """
+    if not isinstance(value, dict):
+        raise CannotMeasure(
+            f"{what} must be a mapping, got {type(value).__name__} — cannot measure")
+    return value
+
+
+def require_list(value: Any, what: str) -> list[Any]:
+    """A parsed YAML value that must be a LIST. Unusable -> exit 2.
+
+    A bare string is REFUSED rather than iterated: `contexts: docs` would
+    otherwise silently become {'d','o','c','s'} — a wrong answer that looks fine.
+    """
+    if not isinstance(value, list):
+        raise CannotMeasure(
+            f"{what} must be a list, got {type(value).__name__} — cannot measure")
+    return value
+
+
 # ── parsing ───────────────────────────────────────────────────────────────────
 
 
@@ -180,11 +206,13 @@ def load_mergify(path: Path | None = None) -> dict[str, set[str]]:
         raise CannotMeasure(f"{path}: no queue_rules — nothing to compare is not a pass")
 
     out: dict[str, set[str]] = {"queue": set(), "merge": set()}
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
+    for index, rule in enumerate(rules):
+        require_mapping(rule, f"{path}: queue_rules[{index}]")
         for key, bucket in (("queue_conditions", "queue"), ("merge_conditions", "merge")):
-            for cond in rule.get(key) or []:
+            conds = rule.get(key)
+            if conds is None:
+                continue
+            for cond in require_list(conds, f"{path}: queue_rules[{index}].{key}"):
                 if isinstance(cond, str) and cond.startswith(CHECK_SUCCESS_PREFIX):
                     out[bucket].add(cond[len(CHECK_SUCCESS_PREFIX) :])
 
@@ -217,9 +245,11 @@ def _triggers(workflow: dict[str, Any]) -> set[str]:
     return set()
 
 
-# A job that can only run on a push event. The decisive shape is the one this
-# repo actually uses (`canary-streak`: `if: always() && github.event_name == 'push'`).
-_PUSH_ONLY_IF = re.compile(r"github\.event_name\s*==\s*['\"]push['\"]")
+_PR_IS_PUSH = re.compile(r"github\.event_name\s*==\s*['\"]push['\"]")
+_PR_IS_NOT_PULL_REQUEST = re.compile(
+    r"github\.event_name\s*(?:!=|<>)\s*['\"]pull_request(?:_target)?['\"]")
+_PR_IS_PULL_REQUEST = re.compile(
+    r"github\.event_name\s*==\s*['\"]pull_request(?:_target)?['\"]")
 
 
 def _gated_off_pr_refs(job: dict[str, Any]) -> bool:
@@ -230,18 +260,24 @@ def _gated_off_pr_refs(job: dict[str, Any]) -> bool:
     branch, so counting it as producible is a false negative in the deadlock
     check — exactly the hazard this guard exists to catch.
 
-    LIMIT, stated so it is not over-trusted: only the DECISIVE push-only shape is
+    The event-name COMPARISON is classified, not substring-matched: a brute
+    `"pull_request" in condition` test also swallowed the NEGATED form
+    (`!= 'pull_request'`), which is just as push-only as `== 'push'`.
+
+    LIMIT, stated so it is not over-trusted: only these DECISIVE shapes are
     treated as unproducible. Anything else — including an `if:` we cannot
     classify — counts as producible, because the opposite default would turn an
-    unrecognised expression into a false DEADLOCK on a check that is fine, which
-    is a worse failure than the one being closed.
+    unrecognised expression into a false DEADLOCK on a healthy check, which is a
+    worse failure than the false negative being closed.
     """
     condition = job.get("if")
     if not isinstance(condition, str):
         return False
-    if "pull_request" in condition:
-        return False  # mentions PR events; treat as potentially live on a PR
-    return bool(_PUSH_ONLY_IF.search(condition))
+    if _PR_IS_PULL_REQUEST.search(condition):
+        return False  # names a PR event positively; it CAN run on a PR ref
+    if _PR_IS_PUSH.search(condition):
+        return True
+    return bool(_PR_IS_NOT_PULL_REQUEST.search(condition))
 
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_]+)\s*\}\}")
@@ -297,21 +333,23 @@ def producible_on_pull_request(workflows_dir: Path | None = None) -> set[str]:
         if not (_triggers(workflow) & {"pull_request", "pull_request_target"}):
             continue
         jobs = workflow.get("jobs")
-        if not isinstance(jobs, dict):
-            # `jobs:` as a list or scalar is unusable; `.items()` would raise.
-            continue
+        require_mapping(jobs, f"{path}: `jobs:`")
         for job_id, job in jobs.items():
-            if not isinstance(job, dict):
-                continue
+            require_mapping(job, f"{path}: jobs.{job_id}")
             if _gated_off_pr_refs(job):
                 continue
             template = job.get("name")
             if isinstance(template, str) and template.strip():
-                matrix = ((job.get("strategy") or {}).get("matrix")) or {}
-                if isinstance(matrix, dict):
-                    names |= _render_matrix(template.strip(), matrix)
-                else:
+                strategy = job.get("strategy")
+                if strategy is None:
+                    strategy = {}
+                require_mapping(strategy, f"{path}: jobs.{job_id}.strategy")
+                matrix = strategy.get("matrix")
+                if matrix is None:
                     names.add(template.strip())
+                else:
+                    require_mapping(matrix, f"{path}: jobs.{job_id}.strategy.matrix")
+                    names |= _render_matrix(template.strip(), matrix)
             else:
                 names.add(str(job_id))
     return names
@@ -338,8 +376,14 @@ def _raw_settings_entries(path: Path | None) -> Any:
         raise CannotMeasure(f"{path} unparsable: {exc}") from exc
     if not isinstance(doc, dict):
         raise CannotMeasure(f"{path}: top level is not a mapping")
-    repository = doc.get("repository")
-    if not isinstance(repository, dict) or "branch-protection" not in repository:
+    if "repository" not in doc or doc.get("repository") is None:
+        return _KEY_ABSENT
+    # PRESENT but not a mapping is UNUSABLE, not absent: returning _KEY_ABSENT
+    # here would make `declared_settings_contexts` answer None, which
+    # `check_settings` skips — silently disabling one of the three surfaces with
+    # an exit 0.
+    repository = require_mapping(doc["repository"], f"{path}: `repository`")
+    if "branch-protection" not in repository:
         return _KEY_ABSENT
     return repository["branch-protection"]
 
@@ -379,6 +423,8 @@ def _required_status_checks(entry: dict[str, Any]) -> dict[str, Any]:
         raise CannotMeasure(
             f"required_status_checks must be a mapping, got {type(rsc).__name__} — "
             "cannot measure")
+    if rsc.get("contexts") is not None:
+        require_list(rsc["contexts"], "required_status_checks.contexts")
     return rsc
 
 
@@ -518,12 +564,22 @@ def gate_legs(path: Path | None = None) -> tuple[list[str], set[str]]:
         workflow = read_yaml(path)
     except yaml.YAMLError as exc:
         raise CannotMeasure(f"{path} unparsable: {exc}") from exc
+    if not isinstance(workflow, dict):
+        raise CannotMeasure(
+            f"{path}: top level is not a mapping, got {type(workflow).__name__} — cannot measure")
     jobs = workflow.get("jobs") or {}
+    require_mapping(jobs, f"{path}: `jobs:`")
     if GATE_JOB not in jobs:
         raise CannotMeasure(f"{path}: no {GATE_JOB!r} job")
     gate = jobs[GATE_JOB] or {}
+    require_mapping(gate, f"{path}: jobs.{GATE_JOB}")
     needs = gate.get("needs") or []
-    needs = [needs] if isinstance(needs, str) else list(needs)
+    if isinstance(needs, str):
+        needs = [needs]
+    elif not isinstance(needs, list):
+        raise CannotMeasure(
+            f"{path}: jobs.{GATE_JOB}.needs must be a string or list, got "
+            f"{type(needs).__name__} — cannot measure")
 
     runs = [s.get("run") or "" for s in (gate.get("steps") or []) if isinstance(s, dict)]
     legs: set[str] = set()
