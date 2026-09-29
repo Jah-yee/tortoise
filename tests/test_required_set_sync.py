@@ -813,17 +813,11 @@ def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
 # change the EXIT CODE or the VERDICT, plus the four that could turn the
 # documented exit 2 into an unannotated traceback.
 #
-# It is NOT a claim that every branch is pinned. Exactly ONE branch survives
-# deletion, and it is redundant rather than uncovered:
-#
-#   `_raw_settings_entries`' `except OSError` — `read_yaml`'s stat guard already
-#   converts that OSError to CannotMeasure, so only the message differs.
-#
-# Anything not on that list reddens on deletion. Two branches previously listed
-# here were removed from the list by PINNING them instead: `yaml.safe_load`'s
-# MemoryError, and `os.lstat`'s `NotADirectoryError` arm (which an earlier version
-# of this comment wrongly called unconstructible — a path whose parent is a FILE
-# raises it on POSIX and Windows alike).
+# It is NOT a claim that every branch is pinned, and NO survivor list is asserted
+# here: three separate attempts to enumerate one were each falsified (by a 12th,
+# 13th and 14th review). A coverage claim that keeps re-staling is DELETED, not
+# re-derived. The mutation evidence lives in the commit log; this file pins
+# BEHAVIOUR.
 
 
 @pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
@@ -1228,6 +1222,45 @@ def test_a_mirror_path_whose_parent_is_a_file_is_absent(guard, tmp_guard_env, mo
     blocker.write_text("not a directory\n")
     monkeypatch.setattr(guard, "SETTINGS_PATH", blocker / "settings.yml")
     assert guard.declared_settings_contexts() is None
+
+
+def test_a_malformed_but_decodable_workflow_is_skipped(guard, tmp_guard_env):
+    """The `yaml.YAMLError` arm of `producible_on_pull_request`'s except.
+
+    Documented as a deliberate skip: a broken workflow can only make a name look
+    unproducible (a false RED), never manufacture a false GREEN.
+    """
+    for leftover in (tmp_guard_env / "workflows").glob("*"):
+        leftover.unlink()
+    (tmp_guard_env / "workflows" / "broken.yml").write_text("on: [pull_request\n")
+    (tmp_guard_env / "workflows" / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  mycheck:\n    name: my-check\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    assert guard.producible_on_pull_request() == {"my-check"}
+
+
+def test_a_directory_where_a_config_file_belongs_cannot_be_measured(guard, tmp_guard_env):
+    """The `OSError` arm of `_read_yaml_cached`'s read guard.
+
+    `stat()` succeeds on a directory, so the failure lands on `read_text`.
+    """
+    target = tmp_guard_env / "python-ci.yml"
+    target.unlink(missing_ok=True)
+    target.mkdir()
+    with pytest.raises(guard.CannotMeasure, match="unreadable"):
+        guard.gate_legs()
+
+
+def test_a_gh_timeout_cannot_be_measured(guard, monkeypatch):
+    """The `subprocess.SubprocessError` arm — a 60 s timeout raises TimeoutExpired."""
+    import subprocess
+
+    def fake(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="gh", timeout=60)
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    with pytest.raises(guard.CannotMeasure, match="could not run gh"):
+        guard.read_live_protection()
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
