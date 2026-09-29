@@ -75,6 +75,7 @@ EXIT CODES
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import functools
 import os
 import re
@@ -238,7 +239,15 @@ def load_mergify(path: Path | None = None) -> dict[str, set[str]]:
     # Resolve at CALL time, not def time: a default argument would freeze the
     # env seam at import and ignore both the env and a monkeypatch.
     path = path or MERGIFY_PATH
-    if not path.exists():
+    try:
+        exists = path.exists()
+    except OSError as exc:
+        # `Path.exists()` re-raises EACCES on 3.12; it only swallows
+        # ENOENT/ENOTDIR/EBADF/ELOOP. Unguarded, this FIRST filesystem touch in
+        # `run()` escaped as a traceback (exit 1, no annotation).
+        raise CannotMeasure(
+            f"{path}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") from exc
+    if not exists:
         raise CannotMeasure(f"mergify config not found: {path}")
     try:
         cfg = read_yaml(path)
@@ -384,10 +393,28 @@ def producible_on_pull_request(workflows_dir: Path | None = None) -> set[str]:
     one in `merge_conditions` is the deadlock `.mergify.yml` warns about.
     """
     workflows_dir = workflows_dir or WORKFLOWS_DIR
-    if not workflows_dir.is_dir():
+    try:
+        is_dir = workflows_dir.is_dir()
+    except OSError as exc:
+        # `is_dir()` re-raises EACCES; it only ignores ENOENT/ENOTDIR/EBADF/ELOOP.
+        raise CannotMeasure(
+            f"{workflows_dir}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") \
+            from exc
+    if not is_dir:
         raise CannotMeasure(f"workflows dir not found: {workflows_dir}")
     names: set[str] = set()
-    for path in sorted(workflows_dir.glob("*.y*ml")):
+    # `os.listdir`, NOT `glob`: `Path.glob` SILENTLY SWALLOWS EACCES and yields no
+    # names, so an unreadable workflows directory looked like an EMPTY one and the
+    # guard FABRICATED a measurement — it reported "NO pull_request-triggered
+    # workflow produces it" for every required check (six false deadlock
+    # violations, exit 1) instead of the honest exit 2.
+    try:
+        entries = sorted(os.listdir(workflows_dir))
+    except OSError as exc:
+        raise CannotMeasure(
+            f"{workflows_dir}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") \
+            from exc
+    for path in [workflows_dir / n for n in entries if fnmatch.fnmatch(n, "*.y*ml")]:
         try:
             workflow = read_yaml(path)
         except (yaml.YAMLError, CannotMeasure):
@@ -664,7 +691,12 @@ def gate_legs(path: Path | None = None) -> tuple[list[str], set[str]]:
     a non-`success` result MEANS for each. They must describe the same set.
     """
     path = path or PYTHON_CI_PATH
-    if not path.exists():
+    try:
+        exists = path.exists()
+    except OSError as exc:
+        raise CannotMeasure(
+            f"{path}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") from exc
+    if not exists:
         raise CannotMeasure(f"workflow not found: {path}")
     try:
         workflow = read_yaml(path)
@@ -839,7 +871,9 @@ def read_live_protection() -> tuple[set[str], bool | None]:
     # Validate the payload's shape. A malformed `gh` response used to reach
     # `set(...)` and raise TypeError (exit 1, no annotation); this is the last
     # unguarded parsed-payload access in the module.
-    contexts = require_list(payload.get("contexts") or [], "branch protection contexts")
+    contexts = require_list(
+        [] if payload.get("contexts") is None else payload["contexts"],
+        "branch protection contexts")
     for ctx in contexts:
         if not isinstance(ctx, str):
             raise CannotMeasure(
@@ -916,6 +950,13 @@ def run(live: bool = False) -> tuple[int, list[str], list[str]]:
     notes.append(f"merge_conditions : {sorted(parsed['merge'])}")
     notes.append(f"declared total   : {len(expected)} name(s) "
                  f"(queue={len(dq)}, merge={len(dm)})")
+    # Record the mirror's state explicitly. Without this, an ABSENT mirror left no
+    # note at all and `main()` still printed a success line claiming the mirror
+    # AGREED — asserting a comparison that never happened.
+    notes.append(
+        "declarative mirror : ABSENT — not compared (the file is optional)"
+        if settings is None
+        else f"declarative mirror : {len(settings)} context(s) declared for main")
     notes.append(f"producible on PR refs: {len(producible)} check name(s) across "
                  f"{len(list(WORKFLOWS_DIR.glob('*.y*ml')))} workflow file(s)")
     notes.append(f"{GATE_JOB}: {len(needs)} need(s), {len(legs)} LEGS row(s) — "
@@ -941,8 +982,9 @@ def main(argv: list[str] | None = None) -> int:
     for note in notes:
         print(f"  {note}")
     if code == 0:
-        print("✅ required-set sync: the queue lists, the enumeration and the "
-              "declarative mirror agree; every merge condition is producible on a PR ref")
+        print("✅ required-set sync: no drift between the queue lists, the "
+              "enumeration and the surfaces actually read (see the notes above); "
+              "every merge condition is producible on a PR ref")
         return 0
     if code == 2:
         for note in notes:

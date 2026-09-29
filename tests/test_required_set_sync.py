@@ -705,12 +705,17 @@ def test_a_gate_without_needs_defaults_to_an_empty_list(guard, tmp_guard_env):
     assert guard.gate_legs() == ([], {"alpha"})
 
 
-@pytest.mark.parametrize("value", [r"\\1", r"\\g<name>", r"\\d", r"\\n"])
+@pytest.mark.parametrize("value", [r"\\1", r"\\g<name>", r"\\d", r"\\n", "\\1", "\\g<name>"])
 def test_a_matrix_value_with_a_backslash_is_not_a_replacement_template(guard, value):
-    """`pattern.sub(str(value), ...)` treats the value as a replacement TEMPLATE.
+    r"""A matrix value must not be treated as a regex replacement TEMPLATE.
 
-    `\\1` / `\\g<name>` raised re.error (exit 1, no annotation); `\\n` silently
-    became a control character in the check name, a name that can never match.
+    The failure modes differ by input, and BOTH are covered:
+      * a DOUBLE-backslash value is emitted literally by the buggy template path,
+        silently producing a wrong check name (no exception at all);
+      * a SINGLE-backslash value makes the buggy path RAISE — `re.error: invalid
+        group reference` for `\1`, and `IndexError: unknown group name` for
+        `\g<name>` on CPython 3.12.
+    Either way the value must come back unchanged.
     """
     assert guard._render_matrix("test (${{ matrix.a }})", {"a": [value]}) == {
         f"test ({value})"
@@ -1300,6 +1305,90 @@ def test_undecodable_gh_output_cannot_be_measured(guard, monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(guard.CannotMeasure, match="could not run gh"):
         guard.read_live_protection()
+
+
+@pytest.mark.parametrize("value", [False, 0, ""])
+def test_a_falsy_non_list_live_contexts_cannot_be_measured(guard, monkeypatch, value):
+    """PRESENT-but-falsy must not be coerced to `[]`, as at `needs:` and `read_yaml`."""
+    import json
+    import subprocess
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"contexts": value, "strict": False})
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Done())
+    with pytest.raises(guard.CannotMeasure, match="must be a list"):
+        guard.read_live_protection()
+
+
+def test_an_unreadable_workflows_dir_cannot_be_measured(guard, tmp_guard_env):
+    """An unreadable workflows directory must NOT read as an EMPTY one.
+
+    `Path.glob` silently swallows EACCES and yields no names, so this used to
+    FABRICATE a measurement: "NO pull_request-triggered workflow produces it" for
+    every required check — six false deadlock violations, exit 1 — instead of 2.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    locked = tmp_guard_env / "lockedwf"
+    locked.mkdir()
+    (locked / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  mycheck:\n    name: my-check\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(guard.CannotMeasure):
+            guard.producible_on_pull_request(locked)
+    finally:
+        locked.chmod(0o700)
+
+
+def test_an_unreadable_parent_dir_cannot_be_measured(guard, tmp_guard_env):
+    """`is_dir()` re-raises EACCES — it must not escape as a traceback."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    locked = tmp_guard_env / "lockedparent"
+    (locked / "workflows").mkdir(parents=True)
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(guard.CannotMeasure):
+            guard.producible_on_pull_request(locked / "workflows")
+    finally:
+        locked.chmod(0o700)
+
+
+def test_an_unreadable_config_path_cannot_be_measured(guard, tmp_guard_env, monkeypatch):
+    """`Path.exists()` re-raises EACCES; this is `run()`'s FIRST filesystem touch."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    locked = tmp_guard_env / "lockedcfg"
+    locked.mkdir()
+    (locked / ".mergify.yml").write_text("queue_rules: []\n")
+    locked.chmod(0o000)
+    try:
+        monkeypatch.setattr(guard, "MERGIFY_PATH", locked / ".mergify.yml")
+        with pytest.raises(guard.CannotMeasure):
+            guard.load_mergify()
+        monkeypatch.setattr(guard, "PYTHON_CI_PATH", locked / "python-ci.yml")
+        with pytest.raises(guard.CannotMeasure):
+            guard.gate_legs()
+    finally:
+        locked.chmod(0o700)
+
+
+def test_an_absent_mirror_is_reported_as_not_compared(guard, tmp_guard_env, monkeypatch):
+    """An absent mirror must not be reported as having AGREED."""
+    _write_minimal_mergify(guard, ["alpha"], ["beta"])
+    _write_workflow(guard, "pr.yml", "pull_request", ["alpha", "beta"])
+    _write_minimal_gate(guard, needs=["alpha", "beta"], legs=["alpha", "beta"])
+    guard.SETTINGS_PATH.unlink(missing_ok=True)
+    monkeypatch.setattr(guard, "REQUIRED_SET",
+                        {"alpha": ("queue", "x"), "beta": ("merge", "y")})
+    code, _, notes = guard.run()
+    assert code == 0, notes
+    assert any("ABSENT" in n and "not compared" in n for n in notes), notes
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
