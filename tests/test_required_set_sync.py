@@ -442,13 +442,6 @@ def test_a_non_iterable_needs_cannot_be_measured(guard, tmp_guard_env):
         guard.gate_legs()
 
 
-def test_a_non_mapping_jobs_cannot_be_measured(guard, tmp_guard_env):
-    (tmp_guard_env / "workflows" / "bad.yml").write_text(
-        "on:\n  pull_request:\njobs: hello\n")
-    with pytest.raises(guard.CannotMeasure):
-        guard.producible_on_pull_request()
-
-
 def test_a_non_mapping_strategy_cannot_be_measured(guard, tmp_guard_env):
     (tmp_guard_env / "workflows" / "bad.yml").write_text(
         "on:\n  pull_request:\njobs:\n  g:\n    name: my-check\n"
@@ -543,6 +536,86 @@ def test_run_flags_a_job_gated_by_a_negated_pull_request(guard, tmp_guard_env, m
     code, violations, _ = guard.run()
     assert code == 1, violations
     assert any("DEADLOCK" in v for v in violations), violations
+
+
+@pytest.mark.parametrize("body", ["[]\n", "[a, b]\n", "false\n", "0\n", "hello\n"])
+def test_a_falsy_but_non_mapping_top_level_is_not_read_as_absent(guard, tmp_guard_env, body):
+    """THE CARDINAL SIN: exit 0 while the mirror was never compared.
+
+    `read_yaml` used to coerce EVERY falsy parse to `{}` via `or {}`, so
+    `settings.yml = []` became `{}` -> "no `repository` key" -> `_KEY_ABSENT` ->
+    `check_settings` SKIPPED -> exit 0. The SAME shape made truthy (`[a, b]`)
+    exited 2 — a fail-open that depended on the value's truthiness.
+    """
+    guard.SETTINGS_PATH.write_text(body)
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
+
+
+@pytest.mark.parametrize("body", [
+    "",                       # empty file
+    "null\n",                 # explicit null document
+    "{}\n",                   # empty mapping
+    "# only a comment\n",
+    "repository:\n",          # bare repository key
+    "repository: null\n",
+    "repository:\n  branch-protection:\n",
+    "repository:\n  branch-protection: null\n",
+])
+def test_a_present_file_declaring_nothing_is_a_violation_not_a_skip(guard, tmp_guard_env, body):
+    """A PRESENT but empty declaration must FLAG, not skip.
+
+    Only a MISSING file is "the mirror does not exist". Otherwise an empty (or
+    `null`) settings.yml — or a bare `[]` BEFORE the `or {}` fix — disabled the
+    mirror check and exited 0 with one of the three surfaces never compared.
+    """
+    guard.SETTINGS_PATH.write_text(body)
+    contexts = guard.declared_settings_contexts()
+    assert contexts is not None, "a present file must not read as 'absent'"
+    assert contexts == set()
+    assert guard.check_settings(contexts, {"alpha"}) != []
+
+
+def test_a_missing_file_is_still_absent(guard, tmp_guard_env):
+    """The ONE legitimate skip: the mirror file does not exist."""
+    guard.SETTINGS_PATH.unlink(missing_ok=True)
+    assert guard.declared_settings_contexts() is None
+
+
+@pytest.mark.parametrize("value", ['"false"', "5", "[]", "null"])
+def test_a_non_boolean_strict_is_not_coerced(guard, tmp_guard_env, value):
+    """`strict: "false"` is a STRING, and `bool("false")` is True.
+
+    Coercing it would manufacture a spurious #4764 mismatch against a live
+    `strict=false` — a false red on a correct mirror.
+    """
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        f"      required_status_checks:\n        strict: {value}\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_strict()
+
+
+def test_an_undecodable_config_is_exit_2_not_a_traceback(guard, tmp_guard_env):
+    """An undecodable file is UNPARSABLE, so it must reach the exit-2 contract."""
+    guard.MERGIFY_PATH.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(guard.CannotMeasure):
+        guard.load_mergify()
+
+
+def test_an_undecodable_settings_file_is_exit_2(guard, tmp_guard_env):
+    guard.SETTINGS_PATH.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(guard.CannotMeasure):
+        guard.declared_settings_contexts()
+
+
+def test_an_undecodable_workflow_is_skipped_not_fatal(guard, tmp_guard_env):
+    """A broken workflow may only ever cause a false RED, never a false GREEN."""
+    (tmp_guard_env / "workflows" / "binary.yml").write_bytes(b"\xff\xfe\x00bad")
+    (tmp_guard_env / "workflows" / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  mycheck:\n    name: my-check\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    assert guard.producible_on_pull_request() == {"my-check"}
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):

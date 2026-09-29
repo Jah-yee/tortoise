@@ -82,7 +82,20 @@ import yaml
 @functools.lru_cache(maxsize=64)
 def _read_yaml_cached(path_str: str, mtime_ns: int, size: int) -> Any:
     del mtime_ns, size  # cache-key material only
-    return yaml.safe_load(Path(path_str).read_text()) or {}
+    try:
+        text = Path(path_str).read_text()
+    except (UnicodeDecodeError, OSError) as exc:
+        # An undecodable/unreadable file is UNPARSABLE, so it must reach the
+        # documented exit 2 with an annotation — not escape as a
+        # UnicodeDecodeError traceback with exit 1 and no `::error::`.
+        raise CannotMeasure(
+            f"{path_str}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") from exc
+    doc = yaml.safe_load(text)
+    # ONLY None (an empty document) becomes {}. The previous `or {}` coerced EVERY
+    # falsy parse — so a top-level `[]`, `false` or `0` became `{}`, which then
+    # reads as "the file declares nothing" and SKIPS its check. A fail-open whose
+    # presence depended on the shape: `[a, b]` was caught, `[]` was not.
+    return {} if doc is None else doc
 
 
 def read_yaml(path: Path) -> Any:
@@ -326,8 +339,12 @@ def producible_on_pull_request(workflows_dir: Path | None = None) -> set[str]:
     for path in sorted(workflows_dir.glob("*.y*ml")):
         try:
             workflow = read_yaml(path)
-        except yaml.YAMLError:
-            continue  # a malformed workflow is other gates' business
+        except (yaml.YAMLError, CannotMeasure):
+            # Deliberate: a broken workflow is other gates' business. Skipping it
+            # can only make a NAME look unproducible, which reds the deadlock
+            # check — a false RED. It can never manufacture a false GREEN, so this
+            # stays a `continue` even for an unreadable file.
+            continue
         if not isinstance(workflow, dict):
             continue
         if not (_triggers(workflow) & {"pull_request", "pull_request_target"}):
@@ -359,32 +376,41 @@ _KEY_ABSENT = object()
 
 
 def _raw_settings_entries(path: Path | None) -> Any:
-    """The `repository.branch-protection` VALUE, or `_KEY_ABSENT` if the key is absent.
+    """The `repository.branch-protection` VALUE, `_KEY_ABSENT` when there is NO FILE.
 
-    The distinction matters and is load-bearing. "The key is absent" means the
-    mirror does not exist (not a violation). "The key is present but declares
-    nothing" is a real defect and must reach `check_settings` as an EMPTY set,
-    not as None — otherwise an emptied declaration passes vacuously, which is a
-    fail-open in the one place this guard exists to fail closed.
+    `_KEY_ABSENT` means NO FILE — the mirror does not exist, so `check_settings`
+    skips it. A file that exists but declares nothing returns `[]` (an empty
+    declaration), which `check_settings` then flags. The distinction is
+    load-bearing: an emptied declaration must reach `check_settings` as an EMPTY
+    set, not as None — otherwise it passes vacuously, a fail-open in the one place
+    this guard exists to fail closed.
     """
     path = path or SETTINGS_PATH
     if not path.exists():
+        # The ONLY "mirror absent" case. A PRESENT file declaring nothing is an
+        # EMPTY DECLARATION -> an empty set -> a violation, never a skip.
         return _KEY_ABSENT
     try:
         doc = read_yaml(path)
     except yaml.YAMLError as exc:
         raise CannotMeasure(f"{path} unparsable: {exc}") from exc
     if not isinstance(doc, dict):
-        raise CannotMeasure(f"{path}: top level is not a mapping")
-    if "repository" not in doc or doc.get("repository") is None:
-        return _KEY_ABSENT
+        # `[]`, `false`, `0`, a scalar — unusable input. `read_yaml` must NOT
+        # coerce these to `{}`: doing so turned each into "declares nothing"
+        # (exit 0) while the truthy version of the same shape exited 2.
+        raise CannotMeasure(
+            f"{path}: top level is not a mapping, got {type(doc).__name__} — cannot measure")
+    repository = doc.get("repository")
+    if repository is None:
+        # Absent OR explicitly null: a present file declaring no branch protection.
+        return []
     # PRESENT but not a mapping is UNUSABLE, not absent: returning _KEY_ABSENT
     # here would make `declared_settings_contexts` answer None, which
     # `check_settings` skips — silently disabling one of the three surfaces with
     # an exit 0.
-    repository = require_mapping(doc["repository"], f"{path}: `repository`")
-    if "branch-protection" not in repository:
-        return _KEY_ABSENT
+    repository = require_mapping(repository, f"{path}: `repository`")
+    if repository.get("branch-protection") is None:
+        return []
     return repository["branch-protection"]
 
 
@@ -478,7 +504,15 @@ def declared_settings_strict(path: Path | None = None) -> bool | None:
             continue
         rsc = _required_status_checks(entry)
         if "strict" in rsc:
-            return bool(rsc["strict"])
+            value = rsc["strict"]
+            # `strict: "false"` is a STRING and `bool("false")` is True — it
+            # would manufacture a spurious #4764 mismatch against a live
+            # `strict=false`. A non-boolean is unusable input, not a truthy one.
+            if not isinstance(value, bool):
+                raise CannotMeasure(
+                    f"required_status_checks.strict must be a boolean, got "
+                    f"{type(value).__name__} — cannot measure")
+            return value
     return None
 
 
