@@ -26,6 +26,8 @@ is not exercised.
 """
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -394,3 +396,65 @@ def test_measure_uses_the_filtered_approval_at_the_call_site():
     assert rows[0]["first_approval_at"] == human_at.isoformat(), (
         "the row must carry review_stats()'s FILTERED approval, not the raw "
         "earliest — which is the bot's")
+
+
+# --- the _TRUNCATIONS PRODUCERS ---------------------------------------------
+# Every other guard covers main()'s CONSUMER of the module list. If the producer
+# stopped recording, main() would stay green and a truncated sweep would read as
+# a complete one — the failure the list exists to make impossible. Gh.page shells
+# out to `gh api` via subprocess.run, so the producer is reachable with one patch.
+
+
+def _fake_gh_page(monkeypatch, body, argv_seen=None):
+    def fake_run(argv, **_kw):
+        if argv_seen is not None:
+            argv_seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(body), stderr="")
+    monkeypatch.setattr(plt.subprocess, "run", fake_run)
+    plt._TRUNCATIONS.clear()
+    return plt.Gh(cache_dir=None, min_interval=0)
+
+
+def test_paged_records_a_truncation_when_it_hits_the_page_cap(monkeypatch, capsys):
+    """A FULL page every time, so the loop never sees a short page and runs out of
+    pages instead. That is precisely a truncated population, and it must land in
+    _TRUNCATIONS — a stderr warning alone leaves main()'s exit code at 0."""
+    full = [{"id": i} for i in range(100)]
+    gh = _fake_gh_page(monkeypatch, full)
+    try:
+        out = gh.paged("repos/o/r/issues", per_page=100, max_pages=3)
+        assert len(out) == 300
+        assert plt._TRUNCATIONS, (
+            "a page-cap hit MUST be recorded in _TRUNCATIONS, not only warned "
+            "about on stderr")
+        assert "repos/o/r/issues" in plt._TRUNCATIONS[0]
+    finally:
+        plt._TRUNCATIONS.clear()
+
+
+def test_obj_paged_records_a_truncation_when_it_hits_the_page_cap(monkeypatch, capsys):
+    """The same producer on the object endpoint — the one that carries check-runs,
+    where a truncated read silently shortens a CI span or a gate lookup."""
+    body = {"total_count": 999, "check_runs": [{"id": i} for i in range(100)]}
+    gh = _fake_gh_page(monkeypatch, body)
+    try:
+        gh.obj_paged("repos/o/r/commits/x/check-runs", "check_runs",
+                     per_page=100, max_pages=2)
+        assert plt._TRUNCATIONS, (
+            "an obj_paged cap hit MUST be recorded, keyed by the merge key")
+        assert "check_runs" in plt._TRUNCATIONS[0]
+    finally:
+        plt._TRUNCATIONS.clear()
+
+
+def test_a_complete_sweep_records_no_truncation(monkeypatch, capsys):
+    """The discriminating half: a SHORT page ends the loop cleanly. If the producer
+    appended unconditionally, this fails — without it the two tests above could not
+    tell 'recorded a real cap hit' from 'always records'."""
+    gh = _fake_gh_page(monkeypatch, [{"id": 1}])
+    try:
+        out = gh.paged("repos/o/r/issues", per_page=100, max_pages=3)
+        assert out == [{"id": 1}]
+        assert not plt._TRUNCATIONS, "a complete sweep must record NOTHING"
+    finally:
+        plt._TRUNCATIONS.clear()
