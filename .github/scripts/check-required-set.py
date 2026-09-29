@@ -259,10 +259,13 @@ def declared_lists() -> tuple[set[str], set[str]]:
 
 
 def _triggers(workflow: dict[str, Any]) -> set[str]:
-    """Workflow trigger names. PyYAML resolves a bare `on:` key to the BOOLEAN True."""
+    """Workflow trigger names. PyYAML resolves a bare `on:` key to the BOOLEAN True.
+
+    The `isinstance` chain falls through to an empty set, so there is deliberately
+    no `if raw is None` early exit: the fallthrough IS the same answer, and a
+    redundant branch is an untestable one.
+    """
     raw = workflow.get("on", workflow.get(True))
-    if raw is None:
-        return set()
     if isinstance(raw, str):
         return {raw}
     if isinstance(raw, list):
@@ -559,10 +562,11 @@ def check_partition(parsed: dict[str, set[str]]) -> list[str]:
                 f"{bucket}_conditions — a dropped {bucket} condition"
             )
 
-    if dq & dm:
-        problems.append(
-            f"{sorted(dq & dm)} declared in BOTH lists — the invariant is EXACTLY ONE"
-        )
+    # NOTE: there is deliberately no `if dq & dm:` check here. `declared_lists()`
+    # partitions each name by its single `where`, so the two declared buckets are
+    # DISJOINT BY CONSTRUCTION — the branch could never fire, and a guard that
+    # cannot fire is documentation pretending to be enforcement. The real overlap
+    # risk (one name in BOTH .mergify.yml lists) is checked here:
     if parsed["queue"] & parsed["merge"]:
         problems.append(
             f"{sorted(parsed['queue'] & parsed['merge'])} appear in BOTH "

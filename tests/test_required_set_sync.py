@@ -80,11 +80,6 @@ def _run(env_extra: dict[str, str], args: list[str] | None = None) -> subprocess
                           capture_output=True, text=True, env=env, cwd=REPO_ROOT)
 
 
-def _empty_declaration(guard) -> None:
-    """Make every declared bucket empty, so a fixture's names are 'unaccounted'."""
-    guard.REQUIRED_SET.clear()
-
-
 # ── the real repo must pass (the durable pin) ──────────────────────────────
 
 
@@ -809,6 +804,177 @@ def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
         assert any("NOT required on main" in v and name in v for v in violations), violations
     for name in extra:
         assert any("unaccounted required check" in v and name in v for v in violations), violations
+
+
+# ── the remaining guard branches, pinned by OUTCOME ─────────────────────────
+#
+# An 8th review showed that a guard nobody deletes is a guard nobody is testing:
+# five were correct and completely unpinned. These cover the rest of the branches
+# so that deleting any one of them reddens the suite.
+
+
+@pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
+def test_malformed_yaml_at_each_seam_cannot_be_measured(guard, tmp_guard_env, seam):
+    """The three `except yaml.YAMLError -> CannotMeasure` guards (exit 2, per contract)."""
+    body = {"mergify": "queue_rules: [\n", "settings": "repository: [\n",
+            "python-ci": "jobs: [\n"}[seam]
+    path = {"mergify": guard.MERGIFY_PATH, "settings": guard.SETTINGS_PATH,
+            "python-ci": guard.PYTHON_CI_PATH}[seam]
+    call = {"mergify": guard.load_mergify, "settings": guard.declared_settings_contexts,
+            "python-ci": guard.gate_legs}[seam]
+    path.write_text(body)
+    with pytest.raises(guard.CannotMeasure, match="unparsable"):
+        call()
+
+
+@pytest.mark.parametrize("seam,needle", [
+    ("mergify", "mergify config not found"),
+    ("python-ci", "workflow not found"),
+])
+def test_a_missing_config_file_cannot_be_measured(guard, tmp_guard_env, seam, needle):
+    """Anchored on the MESSAGE: without it the `exists()` check is unpinned.
+
+    `read_yaml`'s stat guard raises CannotMeasure for a missing file too, so an
+    unanchored assertion was satisfied by the sibling guard and deleting this one
+    left the suite green.
+    """
+    path = {"mergify": guard.MERGIFY_PATH, "python-ci": guard.PYTHON_CI_PATH}[seam]
+    call = {"mergify": guard.load_mergify, "python-ci": guard.gate_legs}[seam]
+    path.unlink(missing_ok=True)
+    with pytest.raises(guard.CannotMeasure, match=needle):
+        call()
+
+
+def test_a_non_mapping_queue_rule_cannot_be_measured(guard, tmp_guard_env):
+    guard.MERGIFY_PATH.write_text("queue_rules: [5]\n")
+    with pytest.raises(guard.CannotMeasure, match=r"queue_rules\[0\] must be a mapping"):
+        guard.load_mergify()
+
+
+def test_a_non_mapping_job_in_a_workflow_cannot_be_measured(guard, tmp_guard_env):
+    (tmp_guard_env / "workflows" / "bad.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  g: 5\n")
+    with pytest.raises(guard.CannotMeasure, match=r"jobs\.g must be a mapping"):
+        guard.producible_on_pull_request()
+
+
+def test_a_non_mapping_workflow_file_is_skipped_not_fatal(guard, tmp_guard_env):
+    """A scalar top-level workflow contributes no names; it must not `.get` a scalar."""
+    (tmp_guard_env / "workflows" / "scalar.yml").write_text("hello\n")
+    (tmp_guard_env / "workflows" / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  mycheck:\n    name: my-check\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    assert guard.producible_on_pull_request() == {"my-check"}
+
+
+def test_a_non_mapping_gate_job_cannot_be_measured(guard, tmp_guard_env):
+    guard.PYTHON_CI_PATH.write_text("jobs:\n  python-ci-gate: 5\n")
+    with pytest.raises(guard.CannotMeasure, match=r"jobs\.python-ci-gate must be a mapping"):
+        guard.gate_legs()
+
+
+def test_a_gate_job_that_does_not_exist_cannot_be_measured(guard, tmp_guard_env):
+    guard.PYTHON_CI_PATH.write_text("jobs:\n  something-else:\n    runs-on: ubuntu-latest\n")
+    with pytest.raises(guard.CannotMeasure, match="no 'python-ci-gate' job"):
+        guard.gate_legs()
+
+
+def test_a_gate_job_without_steps_cannot_be_measured(guard, tmp_guard_env):
+    """No `steps:` means no LEGS table — `steps is None -> []` must not crash first."""
+    guard.PYTHON_CI_PATH.write_text("jobs:\n  python-ci-gate:\n    needs: [a]\n")
+    with pytest.raises(guard.CannotMeasure, match="no <<'LEGS' table"):
+        guard.gate_legs()
+
+
+def test_a_non_mapping_step_is_skipped(guard, tmp_guard_env):
+    """`steps: [5]` contributes nothing; it must be skipped, not `.get`-ed."""
+    guard.PYTHON_CI_PATH.write_text(
+        "jobs:\n  python-ci-gate:\n    needs: [alpha]\n    steps:\n      - 5\n"
+        "      - run: |\n          done <<'LEGS'\n          alpha|success|-\n          LEGS\n")
+    assert guard.gate_legs() == (["alpha"], {"alpha"})
+
+
+def test_a_blank_legs_row_is_skipped(guard, tmp_guard_env):
+    guard.PYTHON_CI_PATH.write_text(
+        "jobs:\n  python-ci-gate:\n    needs: [alpha, beta]\n    steps:\n      - run: |\n"
+        "          done <<'LEGS'\n          alpha|success|-\n\n"
+        "          beta|success|-\n          LEGS\n")
+    assert guard.gate_legs() == (["alpha", "beta"], {"alpha", "beta"})
+
+
+def test_a_missing_workflows_dir_cannot_be_measured(guard, tmp_guard_env):
+    for leftover in (tmp_guard_env / "workflows").glob("*"):
+        leftover.unlink()
+    (tmp_guard_env / "workflows").rmdir()
+    with pytest.raises(guard.CannotMeasure, match="workflows dir not found"):
+        guard.producible_on_pull_request()
+
+
+@pytest.mark.parametrize("on_block,expect_producible", [
+    ("on: push\n", False),                      # scalar trigger
+    ("on: pull_request\n", True),                # scalar PR trigger
+    ("on: [push, pull_request]\n", True),        # list trigger
+    ("", False),                                 # no trigger at all
+    ("on:\n  pull_request:\n", True),            # mapping trigger
+])
+def test_trigger_shapes_decide_producibility(guard, tmp_guard_env, on_block, expect_producible):
+    for leftover in (tmp_guard_env / "workflows").glob("*"):
+        leftover.unlink()
+    body = on_block + ("jobs:\n  mycheck:\n    name: my-check\n"
+                       "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    (tmp_guard_env / "workflows" / "pr.yml").write_text(body)
+    assert (guard.producible_on_pull_request() == {"my-check"}) is expect_producible
+
+
+def test_a_scalar_matrix_value_leaves_the_template_unrendered(guard):
+    """A non-list matrix value is returned AS-IS — a name that cannot match.
+
+    Fail-closed by design: the caller then holds a name that will not match, so a
+    required check it would have produced reads as unproducible.
+    """
+    assert guard._render_matrix("test (${{ matrix.a }})", {"a": 5}) == {
+        "test (${{ matrix.a }})"
+    }
+
+
+@pytest.mark.parametrize("declared,needle", [
+    ({"only-queue": ("queue", "x")}, "EMPTY merge bucket"),
+    ({"only-merge": ("merge", "x")}, "EMPTY queue bucket"),
+    ({"weird": ("bogus", "x")}, "unknown bucket"),
+    ({"blank": ("queue", "   ")}, "no recorded guarantee"),
+])
+def test_partition_flags_a_broken_enumeration(guard, monkeypatch, declared, needle):
+    """The empty-bucket / unknown-bucket / no-guarantee branches of `check_partition`."""
+    monkeypatch.setattr(guard, "REQUIRED_SET", declared)
+    problems = guard.check_partition({"queue": set(), "merge": set()})
+    assert any(needle in p for p in problems), problems
+
+
+@pytest.mark.parametrize("mode", ["raises", "returncode", "not-json"])
+def test_live_read_failures_cannot_be_measured(guard, monkeypatch, mode):
+    """The gh-invocation guards: a spawn failure, a non-zero exit, and non-JSON."""
+    import subprocess
+
+    class Done:
+        returncode = 0
+        stdout = "not json"
+        stderr = ""
+
+    if mode == "raises":
+        def fake(*a, **k):
+            raise OSError("gh not found")
+    elif mode == "returncode":
+        def fake(*a, **k):
+            class Fail(Done):
+                returncode = 1
+                stderr = "API rate limit exceeded"
+            return Fail()
+    else:
+        def fake(*a, **k):
+            return Done()
+    monkeypatch.setattr(subprocess, "run", fake)
+    with pytest.raises(guard.CannotMeasure):
+        guard.read_live_protection()
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
