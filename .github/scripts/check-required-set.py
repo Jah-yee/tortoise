@@ -410,13 +410,17 @@ def _triggers(workflow: dict[str, Any]) -> set[str]:
     return set()
 
 
-_PR_IS_PUSH = re.compile(r"github\.event_name\s*==\s*['\"]push['\"]")
 # A POSITIVE comparison against any NON-PR event is exactly as decisive as
 # `== 'push'`: a job gated `github.event_name == 'schedule'` can no more report on
 # a PR ref than a push-gated one. Matching only `push` left `schedule`,
 # `workflow_dispatch`, `issues`, ... classified PRODUCIBLE — a false GREEN in the
 # deadlock check, the one direction that guard must never fail in. The lookahead
 # excludes the PR events, which the check below already excludes anyway.
+#
+# There is deliberately no separate `_PR_IS_PUSH`: this pattern already covers
+# `== 'push'`, so a dedicated push regex was a branch whose deletion could not
+# change any verdict — the same reason `_triggers`' raw-None branch and
+# `check_partition`'s `dq & dm` test were removed.
 _PR_IS_OTHER_EVENT = re.compile(
     r"github\.event_name\s*==\s*['\"](?!pull_request(?:_target)?['\"])[A-Za-z_]+['\"]")
 _PR_IS_NOT_PULL_REQUEST = re.compile(
@@ -491,7 +495,7 @@ def _gated_off_pr_refs(job: dict[str, Any]) -> bool:
         return False
     if _PR_IS_PULL_REQUEST.search(condition):
         return False  # names a PR event positively; it CAN run on a PR ref
-    if _PR_IS_PUSH.search(condition) or _PR_IS_OTHER_EVENT.search(condition):
+    if _PR_IS_OTHER_EVENT.search(condition):
         return True
     return bool(_PR_IS_NOT_PULL_REQUEST.search(condition))
 

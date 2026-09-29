@@ -208,7 +208,9 @@ queue_rules:
 #     · #3016 — the base race this queue exists to remove
 #     · #5215 — merge throughput, and what the click actually cost
 #     · #5426 — `ai-review-gate` is red whenever no valid recorded review marker
-#       exists for the PR, and it is not a required context
+#       exists for the PR. It IS a required context (required on `main`), and it is
+#       enforced at the merge by the branch-protection injection relying on the
+#       `merge` mode above — see the reconciliation block earlier in this file
 #     · #5433 — the review record is enforced only by LOCAL tooling
 #       (`review-enforcer` and `scripts/atomic-land.sh`); Mergify merges
 #       server-side, so no step on that path reads it
