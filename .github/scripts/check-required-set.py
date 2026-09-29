@@ -97,7 +97,17 @@ def _read_yaml_cached(path_str: str, mtime_ns: int, size: int) -> Any:
         # UnicodeDecodeError traceback with exit 1 and no `::error::`.
         raise CannotMeasure(
             f"{path_str}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") from exc
-    doc = yaml.safe_load(text)
+    try:
+        doc = yaml.safe_load(text)
+    except RecursionError as exc:
+        # A deeply-nested document blows the parser's stack. RecursionError is
+        # neither YAMLError (caught by the callers) nor OSError (caught above), so
+        # it escaped as an unannotated traceback at every seam.
+        raise CannotMeasure(
+            f"{path_str}: nesting too deep to parse — cannot measure") from exc
+    except MemoryError as exc:
+        raise CannotMeasure(
+            f"{path_str}: too large to parse — cannot measure") from exc
     # ONLY None (an empty document) becomes {}. The previous `or {}` coerced EVERY
     # falsy parse — so a top-level `[]`, `false` or `0` became `{}`, which then
     # reads as "the file declares nothing" and SKIPS its check. A fail-open whose
@@ -427,10 +437,11 @@ def _raw_settings_entries(path: Path | None) -> Any:
     except (FileNotFoundError, NotADirectoryError):
         # NO directory entry at all: the mirror does not exist. This is the ONE
         # legitimate skip, and `os.lstat` (not `os.path.lexists`) is what makes it
-        # safe: `lexists` swallows every OSError, so a PRESENT-but-UNREADABLE
-        # mirror (EACCES on the file or a parent dir) was classified "absent",
-        # `check_settings` was skipped, and the guard exited 0 with a surface
-        # never compared.
+        # safe. `lexists` is `lstat` under the hood and swallows EVERY OSError, so
+        # a mirror behind an unsearchable PARENT directory (EACCES) was classified
+        # "absent", `check_settings` was skipped, and the guard exited 0 with a
+        # surface never compared. (A mode-000 FILE did not trigger this — `lstat`
+        # needs no read permission on the target, only search on the parents.)
         return _KEY_ABSENT
     except OSError as exc:
         raise CannotMeasure(

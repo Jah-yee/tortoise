@@ -809,12 +809,11 @@ def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
 # ── the remaining guard branches, pinned by OUTCOME ─────────────────────────
 #
 # An 8th review showed that a guard nobody deletes is a guard nobody is testing:
-# five were correct and completely unpinned. These cover most of the rest. NOT
-# all of them — a 10th review enumerated 14 branches whose deletion still leaves
-# this suite green, of which the four that could turn exit 2 into an unannotated
-# traceback are pinned below and the rest are noted as redundant or
-# verdict-neutral in `check-required-set.py`. The claim is deliberately narrow:
-# these pin the branches that change the EXIT CODE or the VERDICT.
+# five were correct and completely unpinned. This block pins the branches that
+# change the EXIT CODE or the VERDICT, plus the four that could turn the
+# documented exit 2 into an unannotated traceback. It is NOT a blanket claim that
+# every branch is pinned: a 10th and 11th review each enumerated survivors, and
+# the survivors are named in the commit log rather than asserted away here.
 
 
 @pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
@@ -1096,6 +1095,62 @@ def test_a_null_gate_job_cannot_be_measured(guard, tmp_guard_env):
     guard.PYTHON_CI_PATH.write_text("jobs:\n  python-ci-gate:\n")
     with pytest.raises(guard.CannotMeasure, match="no <<'LEGS' table"):
         guard.gate_legs()
+
+
+DEEP_NESTING = "[" * 3000 + "]" * 3000
+
+
+@pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
+def test_a_deeply_nested_config_cannot_be_measured(guard, tmp_guard_env, seam):
+    """A deep document makes PyYAML raise RecursionError — not YAMLError, not OSError.
+
+    Uncaught it escaped as an unannotated traceback (exit 1) at every seam.
+    """
+    path = {"mergify": guard.MERGIFY_PATH, "settings": guard.SETTINGS_PATH,
+            "python-ci": guard.PYTHON_CI_PATH}[seam]
+    call = {"mergify": guard.load_mergify, "settings": guard.declared_settings_contexts,
+            "python-ci": guard.gate_legs}[seam]
+    path.write_text(DEEP_NESTING)
+    with pytest.raises(guard.CannotMeasure, match="nesting too deep"):
+        call()
+
+
+def test_a_deeply_nested_workflow_cannot_be_measured(guard, tmp_guard_env):
+    deep = tmp_guard_env / "workflows" / "deep.yml"
+    deep.write_text(DEEP_NESTING)
+    with pytest.raises(guard.CannotMeasure, match="nesting too deep"):
+        guard.read_yaml(deep)
+
+
+def test_a_null_branch_is_not_main(guard, tmp_guard_env):
+    """`branch: null` must not traceback on `.strip()` — it simply is not `main`."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch:\n"
+        "      required_status_checks:\n        contexts:\n          - alpha\n")
+    assert guard.declared_settings_contexts() == set()
+    assert guard.declared_settings_off_main() == ["None"]
+
+
+def test_a_padded_branch_is_still_main(guard, tmp_guard_env):
+    """`branch: ' main '` is main — `.strip()` is load-bearing, not cosmetic."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: ' main '\n"
+        "      required_status_checks:\n        contexts:\n          - alpha\n")
+    assert guard.declared_settings_contexts() == {"alpha"}
+
+
+def test_a_live_payload_without_contexts_reads_as_empty(guard, monkeypatch):
+    """`payload.get("contexts") or []` — an absent field means 'no live contexts'."""
+    import json
+    import subprocess
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"strict": False})
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Done())
+    assert guard.read_live_protection() == (set(), False)
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
