@@ -1323,15 +1323,25 @@ def test_watchdog_is_per_shard_and_scales_with_the_shard():
     """#6135: the watchdog is PER-LEG. Inheriting the old 55m means a hung
     ~6-minute shard is detected ~8× later than it should be."""
     from tools.ci_selection import (WATCHDOG_CEILING_MIN, WATCHDOG_FLOOR_MIN,
-                                    shard_watchdog_minutes)
-    small = shard_watchdog_minutes(6.6 * 60)      # a 6.6-min shard at S=9
-    old_two = shard_watchdog_minutes(29.6 * 60)   # a 29.6-min shard at S=2
+                                    _duration_weight, _durations_map, fast_pool,
+                                    load_manifest, shard_watchdog_minutes)
+    small = shard_watchdog_minutes(6.81 * 60)     # a 6.81-min shard at S=9
+    old_two = shard_watchdog_minutes(30.62 * 60)  # a 30.62-min shard at S=2
     assert small == WATCHDOG_FLOOR_MIN == 15, small
     assert small < old_two, "the smaller shard must not inherit the old budget"
     assert old_two == WATCHDOG_CEILING_MIN == 55
-    # the floor must clear the #6133 floor (the largest single fast file,
-    # 310.7 s) with headroom, or the watchdog would kill a legally-loaded shard
-    assert small * 60 / 310.7 > 2.5
+    # the floor must clear the #6133 floor (the largest single fast file) with
+    # headroom, or the watchdog would kill a legally-loaded shard. DERIVED from
+    # the committed manifest — a frozen literal cannot notice a refresh (or a
+    # new file) raising the real floor past the watchdog.
+    manifest = dict(load_manifest())
+    durations = _durations_map(manifest)
+    largest = max(_duration_weight(durations.get(
+        f if f.endswith(".py") else f + ".py")) for f in fast_pool(manifest))
+    assert largest > 0
+    assert small * 60 / largest > 2.5, (
+        f"the watchdog floor ({small} min) has <2.5x headroom over the "
+        f"largest fast file ({largest:.1f}s) — #6133's floor")
     # a shard big enough to need more than the floor gets its own headroom
     assert shard_watchdog_minutes(20 * 60) == 40
     # malformed/absent estimates fall back to the floor, never to zero —

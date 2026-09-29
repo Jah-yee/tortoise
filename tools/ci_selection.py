@@ -55,9 +55,11 @@ MANIFEST = REPO / "config" / "ci-surfaces.yml"
 TESTS_DIR = REPO / "tests"
 WORKFLOW = REPO / ".github" / "workflows" / "python-ci.yml"
 
-# #1266: the test (a)/(b) halves must stay count-balanced within this delta.
-# A tilt beyond it means someone added files to one half without rebalancing
-# (the exact drift that pushed half (a) over the watchdog cap).
+# #1266/#6135: EVERY fast shard must stay count-balanced within this delta of
+# the others — the labels are positional letters (a, b, c, …), so this is no
+# longer just the (a)/(b) pair. A tilt beyond it means someone added files to
+# one shard without rebalancing (the exact drift that pushed shard (a) over the
+# watchdog cap).
 # #3400: this is now the FALLBACK invariant, used only when the manifest
 # carries no `durations` map at all. Once measured durations exist the
 # balance invariant is DURATION (below) — LPT packs by weight, and a correct
@@ -1251,7 +1253,7 @@ def shard_watchdog_minutes(est_seconds: float) -> int:
     packed estimate.
 
     Correctness, not tuning: the watchdog is per-leg, so inheriting the old
-    55m lets a hung 6.6-minute shard hold the REQUIRED aggregate red for 55
+    55m lets a hung ~7-minute shard hold the REQUIRED aggregate red for 55
     minutes. `WATCHDOG_HEADROOM` is the factor the old 55m budget already
     validated (55m for a ~30m shard), the floor keeps a small shard above the
     #6133 floor (the largest single file), and the ceiling keeps the validated
@@ -1342,8 +1344,11 @@ def build_shard_entries(files: list[str], durations: dict,
     """#6135: an LPT pack of `files` into `shards` labelled entries, each
     carrying its packed estimate and the per-shard watchdog derived from it.
 
-    Shared by the push matrix and the tier-2 `--split` path so the two can
-    never disagree about a shard's budget.
+    Used by the tier-2 `--split` path. `push_legs()` inlines the same pack (it
+    must round-robin `push_extra` across the shards in the same pass), so the
+    shared seam that keeps the two lanes' shard budgets in agreement is
+    `shard_watchdog_minutes()`, NOT this function — editing the packing here
+    changes only the tier-2 lane.
     """
     bins = split_fast_gate(files, durations, shards=shards)
     labels = shard_labels(len(bins))
@@ -1533,12 +1538,18 @@ def slow_file_issues(manifest: dict) -> list[str]:
 
 
 def parse_matrix_halves(workflow_text: str) -> dict[str, list[str]]:
-    """#1266: extract the test job's (a)/(b) matrix halves from python-ci.yml.
+    """#1266: extract LEGACY literal `- half:` / `files: >-` matrix rows from
+    python-ci.yml — the pre-#6135 `test`-job shape.
 
-    The halves are folded scalars (`files: >-`) with bare file names
-    (no .py) — the run step maps them to `tests/<name>.py` and `bench/*`.
-    Returns {"a": [...], "b": [...]} — empty when the parse fails so callers
-    can fail closed on "workflow changed shape" instead of silently passing.
+    #6135: the `test` job carries no literal rows any more (its matrix is
+    `fromJSON(...fast_matrix)`), so the only block this regex can still match
+    is the `test-slow` job's. It is reached ONLY by the `--integrity` failure
+    fallback — i.e. once `workflow_matrix_issues()` has ALREADY reported the
+    workflow drifted off the derived shape; the normal path feeds the derived
+    shards from `push_legs()` instead. The halves are folded scalars with bare
+    file names (no .py) — the run step maps them to `tests/<name>.py` and
+    `bench/*`. Returns {} when the parse fails so callers fail closed on
+    "workflow changed shape" instead of silently passing.
     """
     halves: dict[str, list[str]] = {}
     for m in re.finditer(r"- half: ([ab])\n\s+files: >-\n\s+([^\n]+)\n", workflow_text):
@@ -1685,7 +1696,10 @@ def split_fast_gate(files, durations: dict, shards: int = DEFAULT_FAST_SHARDS,
     NOT capped by the file count — a shard with no files is fine (it exits
     early), while a MISSING shard makes the event's job-name set a non-superset
     of the push lane's and the merge rail refuses NOT COMPARABLE. The only cap is
-    MAX_FAST_SHARDS (the a..z label space).
+    MAX_FAST_SHARDS (the a..z label space). Note the `--integrity` balance
+    check runs over the PUSH shards, not these: at any S <= MAX_FAST_SHARDS the
+    push pool is far larger, so the push shards are never empty and that
+    check's zero-weight arm is unreachable there.
     """
     if not isinstance(files, list):
         raise ValueError(f"split_fast_gate expects a list, got {type(files).__name__}")

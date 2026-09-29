@@ -391,7 +391,7 @@ jobs:
     # test_integration_search). Mirrors test-concurrency-falkor's service block.
     # NO job-level TORTOISE_DB_URI: the ~600 embedded tests need the redislite default;
     # the live tests' module probes set/restore their own env. ~2-3 min added runtime
-    # vs the 55m watchdog. The skip-fail guard step below fails closed if they skip.
+    # vs the per-shard watchdog. The skip-fail guard step below fails closed if they skip.
     services:
       falkordb:
         image: falkordb/falkordb-server:latest
@@ -562,7 +562,7 @@ jobs:
           echo "SWEEP_TEAM_STRAYS=$SWEEP_TEAM_STRAYS" >> "$GITHUB_ENV"
       - name: Generate coverage manifest (expected nodeids, epic #1647 Task 6/9)
         # Cycle-2 P2-12: the collect-only runs in its OWN step (off the
-        # pytest step's 55m watchdog budget — the collect-only wall can
+        # pytest step's watchdog budget (per shard: matrix.watchdog_minutes) — the collect-only wall can
         # never ride the run). The manifest keys off the SAME space-joined
         # $FILES the run step builds (identical construction below) x the
         # same `-m 'not track_b and not live and not integration'` filter
@@ -727,7 +727,7 @@ jobs:
           # Epic #1647 Task 6 (cycle-5 P2-5): capture the pytest-step wall
           # ($SECONDS = seconds since THIS step's bash shell started) — the
           # E2E-5 wall-regression signal (job wall alone can hide a step
-          # that silently rides the 55m watchdog). Recorded BOTH as the file
+          # that silently rides the shard's watchdog). Recorded BOTH as the file
           # /tmp/step_wall.txt (the artifact contract the P3 canary
           # classifier consumes — cycle-6 P1-7: artifacts only, never a
           # $GITHUB_OUTPUT across jobs) and as steps.pytest-run.outputs.
@@ -1882,9 +1882,9 @@ jobs:
   canary-streak:
     # Epic #1647 Task 9 Step 6 (D-3=A): the instrumented canary-drop streak.
     # Separate job (needs: [test] — the matrix jobs fan in; a step inside the
-    # matrix job cannot run after both halves — cycle-5 P1-7). POST-MERGE
+    # matrix job cannot run after every shard — cycle-5 P1-7). POST-MERGE
     # ONLY (push — PR runs never mutate the canary artifact).
-    # Downloads the half-b artifact set (junitxml + expected-nodeids +
+    # Downloads the producer shard's artifact set (junitxml + expected-nodeids +
     # step_wall + the canary-producer marker), finds the PREVIOUS streak
     # artifact, runs the deterministic classifier (tools/testdb_canary_classify
     # .py — artifacts only, never a $GITHUB_OUTPUT value; cycle-6 P1-7), and
@@ -1898,7 +1898,7 @@ jobs:
     # never reach the classifier and the streak would freeze instead of
     # resetting (review finding #1: every reset bucket would be dead code).
     # always() + the post-merge gate = the classifier receives red runs too
-    # (the half-b artifact upload is if: always() + continue-on-error, so
+    # (the producer shard's artifact upload is if: always() + continue-on-error, so
     # failed runs still ship their junitxml/manifest/step_wall evidence).
     if: always() && github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -1968,7 +1968,7 @@ jobs:
         # Deterministic scripted triage: junitxml + expected-nodeids + step_wall
         # + divergence-confirmation log + prev streak -> new streak. Artifacts
         # ONLY (never a steps output). The step-wall file is the MANDATORY
-        # E2E-5 input (cycle-4 P2-4: a run that silently rides the 55m
+        # E2E-5 input (cycle-4 P2-4: a run that silently rides the shard's
         # watchdog breaks the streak like any other failure).
         run: |
           python3 tools/testdb_canary_classify.py \
