@@ -267,3 +267,121 @@ def test_prune_after_does_not_zero_the_queue_population():
     assert "queue_prs[:0]" not in code, (
         "--prune-after must not empty the queue population; the report would "
         "read a fabricated 0 as a measured one")
+
+
+# --- measure(): the CALL SITES, which no helper test can reach ----------------
+# A fresh review round found that this suite asserted only helpers: deleting
+# `gate = clamp_gate(gate, created, merged_at)` from measure(), or replacing the
+# `first_approval_at` assignment with None, left every test green. A claim about
+# what the PROGRAM reports cannot be falsified by testing the function the claim
+# was drafted from. These three tests drive measure() itself.
+
+GATE_CTX = "fake-gate"
+SHA = "a" * 40
+
+
+def _pr(number=1, created=T0, merged=None, closed=None):
+    end = closed or merged
+    return {"number": number, "title": "t", "created_at": _iso(created),
+            "updated_at": _iso(end or created),
+            "closed_at": _iso(end) if end else None,
+            "merged_at": _iso(merged) if merged else None,
+            "draft": False, "user": {"login": "daniel-ospina", "type": "User"},
+            "head": {"sha": SHA}}
+
+
+def _gate_run(at):
+    return {"id": 1, "name": GATE_CTX, "app": {"slug": "github-actions"},
+            "status": "completed", "conclusion": "success",
+            "started_at": _iso(at), "completed_at": _iso(at)}
+
+
+class FakeGh:
+    """Answers measure()'s reads from canned payloads. Records every URL it was
+    asked for, so a shape mismatch is diagnosable instead of mysterious."""
+
+    def __init__(self, runs, commits, reviews=None):
+        self.runs, self.commits = runs, commits
+        self.reviews = reviews or []
+        self.calls = self.cache_hits = 0
+        self.asked: list[str] = []
+
+    def _route(self, url):
+        self.calls += 1
+        self.asked.append(url)
+        if "state=closed" in url:
+            return [_pr(merged=T0 + timedelta(hours=1))] if url.endswith("page=1") else []
+        if "check-runs" in url:
+            return self.runs
+        if "/commits?" in url:
+            return self.commits
+        if "/reviews?" in url:
+            return self.reviews
+        return []
+
+    def page(self, url, **kw):
+        return self._route(url)
+
+    def paged(self, url, **kw):
+        return self._route(url)
+
+    def obj_paged(self, url, **kw):
+        # a check-runs read returns an OBJECT keyed by `check_runs` over REST
+        if "check-runs" in url:
+            self.calls += 1
+            self.asked.append(url)
+            return {"total_count": len(self.runs), "check_runs": self.runs}
+        return self._route(url)
+
+
+def _measure(gh):
+    return plt.measure(gh, "o/r", [GATE_CTX], 7, T0 + timedelta(days=1))
+
+
+def _gate_before_creation_gh(**kw):
+    """PR #5137's shape: the gate was already green 3h BEFORE the PR existed."""
+    return FakeGh([_gate_run(T0 - timedelta(hours=3))],
+                  [{"sha": SHA, "commit": {"author": {"date": _iso(T0)}}}], **kw)
+
+
+def test_measure_clamps_a_pre_creation_gate_at_the_call_site():
+    """REPRODUCED by the review as the suite's worst gap: removing the clamp call
+    from measure() left all 19 tests green, because only clamp_gate() was
+    asserted. This drives measure() and requires seconds_a == 0.0, not negative."""
+    rows = _measure(_gate_before_creation_gh())["prs"]
+    assert len(rows) == 1
+    assert rows[0]["seconds_a"] == 0.0, (
+        "a gate earlier than created_at must be clamped at the CALL SITE in "
+        "measure(); otherwise seconds_a is negative and the run aborts")
+    # rows carry datetime.isoformat() (+00:00), while _iso() writes the GitHub
+    # spelling (Z) — the same instant, different spelling.
+    assert rows[0]["gate_success_at"] == T0.isoformat()
+
+
+def test_measure_itself_raises_on_a_negative_segment(monkeypatch):
+    """The other direction: measure()'s OWN guard must exist. `main()` passing on
+    a raise it was handed is not evidence that measure() raises — the earlier
+    test was satisfied by any SystemExit, including one from nowhere."""
+    gh = _gate_before_creation_gh()
+    monkeypatch.setattr(plt, "clamp_gate", lambda g, c, m: g)  # reintroduce the defect
+    with pytest.raises(SystemExit) as ei:
+        _measure(gh)
+    assert "NEGATIVE SEGMENT" in str(ei.value)
+
+
+def test_measure_uses_the_filtered_approval_at_the_call_site():
+    """The bot filter is only useful if its RESULT is what the row carries. Two
+    approvals, the bot's earlier: the row must report the human's. Fails both if
+    the filter is dropped (bot's earlier time wins) and if the assignment is
+    replaced by None (found as a second caller gap by the VGATE verifier)."""
+    human_at = T0 + timedelta(minutes=10)
+    reviews = [
+        {"state": "APPROVED", "submitted_at": _iso(T0 - timedelta(minutes=10)),
+         "user": {"login": "mergify[bot]", "type": "Bot"}},
+        {"state": "APPROVED", "submitted_at": _iso(human_at),
+         "user": {"login": "daniel-ospina", "type": "User"}},
+    ]
+    rows = _measure(_gate_before_creation_gh(reviews=reviews))["prs"]
+    assert rows[0]["first_approval_at"] == human_at.isoformat(), (
+        "the row must carry review_stats()'s FILTERED approval, not the raw "
+        "earliest — which is the bot's")
