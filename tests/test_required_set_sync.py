@@ -923,16 +923,13 @@ def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
 
 # ── the remaining guard branches, pinned by OUTCOME ─────────────────────────
 #
-# An 8th review showed that a guard nobody deletes is a guard nobody is testing:
-# five were correct and completely unpinned. This block pins the branches that
-# change the EXIT CODE or the VERDICT. It asserts no COUNT of unpinned traceback
-# branches — see the paragraph below.
+# A guard nobody deletes is a guard nobody is testing, so this block pins the
+# branches that change the EXIT CODE or the VERDICT.
 #
-# It is NOT a claim that every branch is pinned, and NO survivor list is asserted
-# here: three separate attempts to enumerate one were each falsified (by a 12th,
-# 13th and 14th review). A coverage claim that keeps re-staling is DELETED, not
-# re-derived. The mutation evidence lives in the commit log; this file pins
-# BEHAVIOUR.
+# It is NOT a claim that every branch is pinned, and it asserts NO survivor list:
+# an enumeration of unpinned branches is a claim about the code that goes stale on
+# every edit, and it was deleted rather than re-derived. The mutation evidence
+# lives in the commit log; this file pins BEHAVIOUR.
 
 
 @pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
@@ -1682,6 +1679,17 @@ def test_a_literally_falsy_if_is_gated_off(guard, cond):
     {"if": 1},
     {"if": "${{ 1 }}"},
     {"if": "${{ !cancelled() }}"},
+    # NON-zero numbers in exponent form must stay PRODUCIBLE. `float()` accepts every
+    # JSON number form, so the guard has to distinguish the VALUE from the spelling —
+    # the same reason `nan` and `inf` (which DO parse) stay producible below.
+    {"if": "1e0"},
+    {"if": "1e5"},
+    {"if": "2.5e-1"},
+    {"if": "nan"},
+    {"if": ".inf"},
+    # A YAML-1.1 octal zero is not a JSON number, so it is not decoded — the same
+    # deliberate reading as any expression this module cannot decide.
+    {"if": "0o0"},
 ])
 def test_an_absent_or_truthy_if_is_producible(guard, job):
     """`{}` and truthy conditions are producible; an ABSENT `if:` means the job runs.

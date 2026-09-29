@@ -443,6 +443,29 @@ _PR_IS_PULL_REQUEST = re.compile(
     r"github\.event_name\s*==\s*['\"]pull_request(?:_target)?['\"]")
 
 
+def _is_a_zero_number(text: str) -> bool:
+    """A numeric literal that is exactly zero — including exponent forms PyYAML
+    leaves as STRINGS.
+
+    GitHub's number literals are "any number format supported by JSON", which
+    accepts `0e0`, `0.0e0` and `0e+0`. YAML 1.1 does not resolve those (its float
+    pattern wants a dot or a SIGNED exponent), so PyYAML hands them over as `str`
+    and the `isinstance(..., (int, float))` arm never sees them — which left
+    `if: 0e0` classified PRODUCIBLE, a false GREEN in the one direction the
+    deadlock checks must never fail in. `float()` closes it: it accepts every JSON
+    number form.
+
+    Applied ONLY after the string membership test, and a parse failure stays
+    PRODUCIBLE — `0o0`, `nan` and any word are deliberately not decoded, the same
+    reading this module documents for expressions it cannot decide. (`nan` and
+    `inf` DO parse, and compare unequal to zero, so they stay producible too.)
+    """
+    try:
+        return float(text) == 0.0
+    except ValueError:
+        return False
+
+
 def _is_literally_off(condition: Any) -> bool:
     """A LITERAL falsy `if:` — decidable as "this job can never run".
 
@@ -462,15 +485,18 @@ def _is_literally_off(condition: Any) -> bool:
     that is the fail-closed reading of an ambiguous input, and the caller
     distinguishes a truly ABSENT key, which still means the job runs.
 
-    LIMIT, so this is not over-trusted: this classifies CONSTANTS. `if: ${{ 3-3 }}`
-    is an expression that evaluates falsy and is deliberately NOT recognised —
-    classifying arbitrary expressions is the trade `_gated_off_pr_refs` documents,
-    and guessing there would manufacture false deadlocks.
+    LIMIT, so this is not over-trusted: this classifies CONSTANTS — including
+    numeric literals in any JSON form, which is why `0e0` and `0.0e0` are decoded
+    rather than read as opaque text. `if: ${{ 3-3 }}` is an expression that
+    evaluates falsy and is deliberately NOT recognised — classifying arbitrary
+    expressions is the trade `_gated_off_pr_refs` documents, and guessing there
+    would manufacture false deadlocks.
     """
     if condition is None or condition is False:
         return True
     if isinstance(condition, str):
-        return _normalise_if(condition) in _FALSY_IF_STRINGS
+        text = _normalise_if(condition)
+        return text in _FALSY_IF_STRINGS or _is_a_zero_number(text)
     if isinstance(condition, (int, float)):
         return not condition
     return False
