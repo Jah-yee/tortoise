@@ -1035,6 +1035,16 @@ def run_vector_query(
                 # #561: latency warning only — keep the rows.
                 logger.warning("Vector query exceeded timeout: %.0fms > %dms", elapsed, timeout_ms)
             _breaker_record("vector", True)
+            # #3019 KNOWN RESIDUAL: this index-accelerated path preserves the
+            # engine's returned order, so two rows with EQUAL distances keep
+            # whatever order the engine gave them, and rank-based fusion can see
+            # a tie-order flip. It is deliberately NOT re-sorted here. Signature
+            # B's distance could be sorted losslessly, but signature A's score IS
+            # its row POSITION, and two existing tests pin this path's
+            # order-preservation (`test_docker_mode_signature_b_scores_clamped_to
+            # _non_negative`, `test_none_api_keeps_probe_behavior`) — so changing
+            # it is its own unit of work, not a mechanical edit. Tracked as a
+            # follow-up issue rather than papered over by the source pin.
             if sig == "B":
                 # #5583: the engine's value here is a DISTANCE (lower is
                 # better), NOT a similarity. `db.idx.vector.queryNodes`
@@ -1372,7 +1382,10 @@ def expand_structural_hops(
                else f" AND {_exclude_status_clause('n', excluded_statuses or TERMINAL_EXCLUDED_STATUSES)}")
             + " WITH n, min(length(path)) AS hops "
             "RETURN n.id AS id, hops "
-            "ORDER BY hops ASC "
+            # #3019: `hops ASC` alone leaves equal-hop candidates in engine row
+            # order, so with more candidates than `limit` both MEMBERSHIP and
+            # rank are DB-order dependent.
+            "ORDER BY hops ASC, n.id ASC "
             "LIMIT $limit"
         )
         rows = graph.query(
@@ -1453,6 +1466,15 @@ def rrf_fusion(
             # and a kwarg caller can pass one. Guarded at the ROOT so every entry
             # point is covered, not just the env parse.
             if not math.isfinite(w):
+                # #3019: `json.loads` accepts bare NaN/Infinity, and a NaN weight
+                # makes EVERY fused score NaN — the `(-score, id)` tie-break then
+                # compares False both ways and degrades to insertion order. Warn
+                # rather than substitute silently: the recorded default is not
+                # equal weighting (PRODUCTION DEFAULT, tortoise/sdk.py).
+                logger.warning(
+                    "non-finite RRF weight for %r (%r) — using 1.0",
+                    strategy_names[i] if i < len(strategy_names) else i, w,
+                )
                 w = 1.0
         for rank, (pid, _score) in enumerate(ranked):
             rrf_score = w / (k + rank + 1)

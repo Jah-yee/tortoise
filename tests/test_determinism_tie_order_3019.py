@@ -100,11 +100,9 @@ def test_infinite_weight_does_not_destroy_the_score_signal():
     THE FIXTURE REACHES IT: ``json.loads('{"vector": Infinity}')`` is accepted, so
     an env-supplied weight really can be infinite.
 
-    NOTE ON THE ISSUE'S FRAMING: an infinite weight does NOT degrade the ORDER the
-    way ``NaN`` does. ``inf == inf`` is True, so the ``(-score, id)`` tuple falls
-    through to the id and stays deterministic — measured: with the guard
-    neutralised this order assertion still passes. The defect ``inf`` actually
-    causes is the loss of the score signal, so that is what is pinned here.
+    NOTE ON THE ISSUE'S FRAMING: an infinite weight does not degrade the ORDER
+    the way ``NaN`` does — ``inf == inf`` is True, so the tuple falls through to
+    the id and stays deterministic. What it costs is the score signal.
     """
     leg_a = [("b", 0.9), ("a", 0.8)]
     leg_b = [("a", 0.9), ("b", 0.8)]
@@ -206,19 +204,23 @@ def test_structural_leg_orders_a_constant_scored_result_by_id(sdk):
 
 def test_every_leg_query_carries_a_secondary_sort_key():
     """A CONTRACT PIN, not behavioural coverage (the behaviour is proved above for
-    the two brute-force paths; the index-FTS and vector paths would each need a
-    live index to exercise here).
+    the three brute-force / index-FTS paths).
 
-    FAIL VALUE: any one of the four leg queries losing its tie key makes the
-    count 3 and the matching assertion fail. The count matters: an earlier
-    version pinned exactly 3, which silently ENSHRINED the structural leg's
-    missing ordering rather than catching it.
+    FAIL VALUE: any leg losing its tie key makes the matching assertion fail.
+    Asserted clause-by-clause rather than as a COUNT of matches, because a count
+    cannot see a NEW leg added later without one — it pins only what it is told
+    to pin, and a fixed number silently certifies an omission.
+
+    KNOWN RESIDUAL: the index-accelerated vector path preserves the engine's
+    returned order, so two rows with EQUAL distances keep the engine's order and
+    rank-based fusion can see a tie-order flip. Fixing it needs the distance from
+    signature A (whose score IS its row position) and a deliberate revision of
+    two tests that pin this path's order-preservation, so it is tracked as a
+    follow-up rather than asserted away by this pin.
     """
     src = inspect.getsource(search_engine)
     assert "ORDER BY score DESC, n.id ASC" in src, "operator leg lost its tie key"
     assert "ORDER BY score DESC, node.{id_field} ASC" in src, "index FTS leg lost its tie key"
     assert "ORDER BY score DESC, n.{id_field} ASC" in src, "vector leg lost its tie key"
     assert "ORDER BY n.{id_field} ASC" in src, "structural leg lost its ordering"
-    assert src.count("ORDER BY score DESC, ") == 3, (
-        "expected exactly 3 tie-keyed scored leg queries"
-    )
+    assert "ORDER BY hops ASC, n.id ASC" in src, "structural-hops leg lost its tie key"
