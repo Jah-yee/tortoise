@@ -810,8 +810,8 @@ def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
 #
 # An 8th review showed that a guard nobody deletes is a guard nobody is testing:
 # five were correct and completely unpinned. This block pins the branches that
-# change the EXIT CODE or the VERDICT, plus the four that could turn the
-# documented exit 2 into an unannotated traceback.
+# change the EXIT CODE or the VERDICT. It asserts no COUNT of unpinned traceback
+# branches — see the paragraph below.
 #
 # It is NOT a claim that every branch is pinned, and NO survivor list is asserted
 # here: three separate attempts to enumerate one were each falsified (by a 12th,
@@ -1257,6 +1257,45 @@ def test_a_gh_timeout_cannot_be_measured(guard, monkeypatch):
 
     def fake(*a, **k):
         raise subprocess.TimeoutExpired(cmd="gh", timeout=60)
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    with pytest.raises(guard.CannotMeasure, match="could not run gh"):
+        guard.read_live_protection()
+
+
+@pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
+def test_an_unbuildable_yaml_value_cannot_be_measured(guard, tmp_guard_env, seam):
+    """PyYAML raises ValueError for a resolved-but-unbuildable value.
+
+    `x: 2001-02-31` is a valid timestamp SHAPE but an impossible date. It is not a
+    YAMLError, so it escaped as an unannotated traceback, offline, in CI.
+    """
+    path = {"mergify": guard.MERGIFY_PATH, "settings": guard.SETTINGS_PATH,
+            "python-ci": guard.PYTHON_CI_PATH}[seam]
+    call = {"mergify": guard.load_mergify, "settings": guard.declared_settings_contexts,
+            "python-ci": guard.gate_legs}[seam]
+    path.write_text("last_reconciled: 2001-02-31\n")
+    with pytest.raises(guard.CannotMeasure, match="unparsable"):
+        call()
+
+
+def test_an_unbuildable_value_in_a_workflow_cannot_be_measured(guard, tmp_guard_env):
+    deep = tmp_guard_env / "workflows" / "bad-date.yml"
+    deep.write_text("on:\n  pull_request:\nlast_reconciled: 2001-02-31\n")
+    with pytest.raises(guard.CannotMeasure, match="unparsable"):
+        guard.read_yaml(deep)
+
+
+def test_undecodable_gh_output_cannot_be_measured(guard, monkeypatch):
+    """`text=True` decoded gh's output with the locale encoding.
+
+    A malformed byte raised UnicodeDecodeError inside `subprocess`, which is a
+    ValueError — caught by neither OSError nor SubprocessError.
+    """
+    import subprocess
+
+    def fake(*a, **k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
 
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(guard.CannotMeasure, match="could not run gh"):

@@ -113,6 +113,14 @@ def _read_yaml_cached(path_str: str, mtime_ns: int, size: int) -> Any:
         # can still PARSE into an object graph that does not fit.
         raise CannotMeasure(
             f"{path_str}: too large to parse — cannot measure") from exc
+    except ValueError as exc:
+        # PyYAML raises ValueError for a value it RESOLVES but cannot BUILD: an
+        # out-of-range timestamp (`x: 2001-02-31`) and, on 3.11+, an integer
+        # literal past the digit limit. It is not a YAMLError, so the callers'
+        # `except yaml.YAMLError` missed it and it escaped as an unannotated
+        # traceback at every seam — offline, in CI.
+        raise CannotMeasure(
+            f"{path_str}: unparsable ({type(exc).__name__}: {exc}) — cannot measure") from exc
     # ONLY None (an empty document) becomes {}. The previous `or {}` coerced EVERY
     # falsy parse — so a top-level `[]`, `false` or `0` became `{}`, which then
     # reads as "the file declares nothing" and SKIPS its check. A fail-open whose
@@ -806,8 +814,13 @@ def read_live_protection() -> tuple[set[str], bool | None]:
         "{contexts: .required_status_checks.contexts, strict: .required_status_checks.strict}",
     ]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError) as exc:
+        out = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                             errors="replace", timeout=60)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        # ValueError is in here for UnicodeDecodeError: decoding gh's output used
+        # the locale encoding and a malformed byte raised it inside `subprocess`,
+        # where neither OSError nor SubprocessError catches it. `errors="replace"`
+        # above is the belt to this brace.
         raise CannotMeasure(f"could not run gh: {exc}") from exc
     if out.returncode != 0:
         raise CannotMeasure(
