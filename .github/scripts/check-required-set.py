@@ -63,6 +63,13 @@ EXIT CODES
 1  a violation (drift, mis-filing, unaccounted name, unproducible check)
 2  could not measure (file missing/unparsable, nothing to compare, live read
    failed) — fail-closed: "nothing was compared" is never a pass.
+
+   ONE NAMED EXCEPTION: an ABSENT `.github/settings.yml` is exit 0, not 2. The
+   declarative mirror is OPTIONAL — a file that does not exist declares nothing
+   to compare, and requiring it would red every repo that does not keep one.
+   The moment the file EXISTS it must be usable: present-but-unparsable is 2,
+   and present-but-declaring-nothing is a violation (1). "Missing" and "empty"
+   are deliberately different verdicts; only the former is a skip.
 """
 
 from __future__ import annotations
@@ -107,7 +114,14 @@ def read_yaml(path: Path) -> Any:
     fixture is re-read rather than served stale. Callers must NOT mutate the
     result.
     """
-    stat = path.stat()
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        # The stat is itself a filesystem read: a BROKEN SYMLINK matching the
+        # workflows glob raises FileNotFoundError HERE, outside
+        # `_read_yaml_cached`'s guard, and would escape as a traceback.
+        raise CannotMeasure(
+            f"{path}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") from exc
     return _read_yaml_cached(str(path), stat.st_mtime_ns, stat.st_size)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -607,15 +621,45 @@ def gate_legs(path: Path | None = None) -> tuple[list[str], set[str]]:
         raise CannotMeasure(f"{path}: no {GATE_JOB!r} job")
     gate = jobs[GATE_JOB] or {}
     require_mapping(gate, f"{path}: jobs.{GATE_JOB}")
-    needs = gate.get("needs") or []
-    if isinstance(needs, str):
+    needs = gate.get("needs")
+    if needs is None:
+        needs = []
+    elif isinstance(needs, str):
+        if not needs.strip():
+            # `needs: ''` is a present-but-blank job id: unusable, not "no needs".
+            raise CannotMeasure(
+                f"{path}: jobs.{GATE_JOB}.needs is a blank string — cannot measure")
         needs = [needs]
     elif not isinstance(needs, list):
+        # `needs: 5` AND `needs: 0` / `false` / `''`: a truthiness-based `or []`
+        # silently accepted the falsy non-lists as "no needs", so the same shape
+        # exited 2 when truthy and 1 when falsy.
         raise CannotMeasure(
             f"{path}: jobs.{GATE_JOB}.needs must be a string or list, got "
             f"{type(needs).__name__} — cannot measure")
 
-    runs = [s.get("run") or "" for s in (gate.get("steps") or []) if isinstance(s, dict)]
+    steps = gate.get("steps")
+    if steps is None:
+        steps = []
+    if not isinstance(steps, list):
+        raise CannotMeasure(
+            f"{path}: jobs.{GATE_JOB}.steps must be a list, got "
+            f"{type(steps).__name__} — cannot measure")
+    runs: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        run = step.get("run")
+        if run is None:
+            continue
+        if not isinstance(run, str):
+            # `run: 5` / `true` / `[a, b]` — a `run or ""` only replaced FALSY
+            # values, so a truthy non-string reached `.splitlines()` and raised
+            # an AttributeError traceback (exit 1, no `::error::`).
+            raise CannotMeasure(
+                f"{path}: {GATE_JOB} step `run:` must be a string, got "
+                f"{type(run).__name__} — cannot measure")
+        runs.append(run)
     legs: set[str] = set()
     found_heredoc = False
     for run in runs:

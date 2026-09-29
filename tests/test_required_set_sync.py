@@ -618,6 +618,65 @@ def test_an_undecodable_workflow_is_skipped_not_fatal(guard, tmp_guard_env):
     assert guard.producible_on_pull_request() == {"my-check"}
 
 
+def test_a_broken_symlink_in_the_workflows_dir_cannot_be_measured(guard, tmp_guard_env):
+    """The stat in `read_yaml` is a filesystem read too — it must not traceback."""
+    link = tmp_guard_env / "workflows" / "zz-broken.yml"
+    link.symlink_to(tmp_guard_env / "nonexistent-target.yml")
+    with pytest.raises(guard.CannotMeasure):
+        guard.read_yaml(link)
+
+
+def _write_gate_with_a_bad_shape(guard, *, needs: str = "[alpha]", steps: str | None = None) -> None:
+    """A gate with a VALID LEGS table, so only `needs`/`steps` shape is under test.
+
+    Without the valid heredoc a shape test passes for the WRONG reason — it trips
+    the "no LEGS table" guard instead of the shape validation it names.
+    """
+    step_block = steps if steps is not None else (
+        "    steps:\n      - run: |\n          done <<'LEGS'\n"
+        "          alpha|success|-\n          LEGS\n")
+    guard.PYTHON_CI_PATH.write_text(
+        "jobs:\n  python-ci-gate:\n    needs: " + needs + "\n" + step_block)
+
+
+@pytest.mark.parametrize("value", ["5", "true", "[a, b]", "{a: b}"])
+def test_a_non_string_step_run_cannot_be_measured(guard, tmp_guard_env, value):
+    """A truthy non-string `run:` used to reach `.splitlines()` and traceback."""
+    _write_gate_with_a_bad_shape(guard, steps=(
+        f"    steps:\n      - run: {value}\n"
+        "      - run: |\n          done <<'LEGS'\n          alpha|success|-\n          LEGS\n"))
+    with pytest.raises(guard.CannotMeasure, match="run"):
+        guard.gate_legs()
+
+
+@pytest.mark.parametrize("value", ["0", "false", "''"])
+def test_a_falsy_non_list_needs_cannot_be_measured(guard, tmp_guard_env, value):
+    """`needs: 0` must not be read as `needs: []` — the same shape as `needs: 5`."""
+    _write_gate_with_a_bad_shape(guard, needs=value)
+    with pytest.raises(guard.CannotMeasure):
+        guard.gate_legs()
+
+
+def test_a_non_list_steps_cannot_be_measured(guard, tmp_guard_env):
+    _write_gate_with_a_bad_shape(guard, steps="    steps: 5\n")
+    with pytest.raises(guard.CannotMeasure):
+        guard.gate_legs()
+
+
+def test_a_scalar_needs_is_accepted(guard, tmp_guard_env):
+    """`needs: alpha` is the scalar form of a one-element list, not a shape error."""
+    _write_gate_with_a_bad_shape(guard, needs="alpha")
+    assert guard.gate_legs() == (["alpha"], {"alpha"})
+
+
+def test_a_gate_without_needs_defaults_to_an_empty_list(guard, tmp_guard_env):
+    """No `needs:` key at all means the gate depends on nothing — not unmeasurable."""
+    guard.PYTHON_CI_PATH.write_text(
+        "jobs:\n  python-ci-gate:\n    steps:\n      - run: |\n"
+        "          done <<'LEGS'\n          alpha|success|-\n          LEGS\n")
+    assert guard.gate_legs() == ([], {"alpha"})
+
+
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
     """Every condition the queue waits on must exist on a PR-like ref — BOTH lists.
 
