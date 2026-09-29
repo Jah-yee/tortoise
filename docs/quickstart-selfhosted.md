@@ -231,8 +231,9 @@ next:     Recovery: `tortoise session drain` retries filing from the local spool
 ```
 
 `code` is the machine-readable marker — the same `kind` the writers use
-(`capture-failure` from a filing that did not land; `install-inert` when the seam itself
-resolved no module dir). The wording is deliberately factual: memory is **not
+(`capture-failure` from a filing that did not land; `install-inert` when the seam could not
+run — either it resolved no module dir, or a module dir resolved but no `python3` was on
+`PATH`). The wording is deliberately factual: memory is **not
 filed**, never "failed", because the turns are still on the local spool — and
 `tortoise session drain` (also run in the background at every session start) is
 what files them. The recovery half is written as available actions rather than

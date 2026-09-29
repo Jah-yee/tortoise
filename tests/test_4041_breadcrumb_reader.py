@@ -625,7 +625,18 @@ def test_the_second_inert_branch_also_renders_the_breadcrumb(tmp_path):
     assert fields.get("code") == "install-inert", proc.stdout
     assert "resolved a tortoise module dir but found no python3" in \
         fields.get("why", ""), proc.stdout
-    assert fields.get("next", "").startswith("Recovery:"), proc.stdout
+    # ⛔ THE RECOVERY MUST MATCH THIS BRANCH'S CAUSE (#4041 review round 3, P2). The
+    # renderer used to hard-code branch 1's sentence, so this branch's payload
+    # contradicted ITSELF (`why:` said the module dir WAS resolved; `next:` said it was
+    # not) and prescribed `hooks upgrade` for a missing interpreter. Asserting only
+    # ``startswith("Recovery:")`` could not see that.
+    recovery = fields.get("next", "")
+    assert recovery.startswith("Recovery:"), proc.stdout
+    assert "no python3" not in recovery or "python3" in recovery, recovery
+    assert "python3" in recovery, recovery
+    assert "resolved no tortoise module dir" not in recovery, (
+        "this branch's next: must not repeat branch 1's cause — its why: says the "
+        f"module dir DID resolve: {recovery!r}")
 
     # The INERT RECORD this branch writes is what `session verify` reads, so it
     # must be pinned too — the stdout alone does not prove the write happened.
@@ -962,6 +973,25 @@ def test_invisible_format_controls_cannot_reorder_a_rendered_line():
         "these Cf code points survive normalization: "
         + ", ".join(hex(cp) for cp in survivors))
 
+    # ⛔ AND THE MARK CATEGORIES (round 3, P1). ``Cf`` was only half the class: a
+    # variation selector or a combining mark is neither whitespace nor ``Cc`` nor
+    # ``Cf``, so `ghp_<U+FE0F>` + body rendered the credential in cleartext exactly as
+    # the ``Cf`` bypass did. These are enumerated by category for the same reason.
+    mark_survivors = [cp for cp in range(0x110000)
+                      if unicodedata.category(chr(cp)) in ("Mn", "Me", "Mc")
+                      and chr(cp) in _normalize("a" + chr(cp) + "b")]
+    assert not mark_survivors, (
+        "these mark code points survive normalization: "
+        + ", ".join(hex(cp) for cp in mark_survivors))
+    for splitter in ("\ufe0f", "\u0301", "\u0903", "\u0488"):
+        detail = bound_detail("ghp_" + splitter + "a" * 36)
+        assert "[REDACTED:github_token]" in detail, repr(splitter)
+        assert "a" * 36 not in detail, repr(splitter)
+
+    # A gap must not leave the surrounding spaces behind (round 3, P3).
+    assert _normalize("a \u200b \u200b b") == "a b"
+    assert _normalize("a \x00 b") == "a b"
+
     # A zero-width space inside a credential must not hide it from the scan.
     assert "[REDACTED:github_token]" in bound_detail("ghp_\u200b" + "a" * 36)
     # The same for a soft hyphen, the code point the sample above never covered and
@@ -971,7 +1001,8 @@ def test_invisible_format_controls_cannot_reorder_a_rendered_line():
     # No value that normalizes to empty may render as an empty field, for ANY
     # composition — the Cf-SEPARATED-BY-WHITESPACE rows are the ones that survived
     # the first attempt at this (they collapse to a single space AFTER the Cf
-    # removal, so they were non-empty when the fallback was decided).
+    # removal, so they were non-empty when the fallback was decided). ``why:`` is
+    # included: it took no fallback at all until round 3.
     for empty_ish in ("\u200b", "\u2060", "\u00ad", "\ufeff", "\u202e",
                       "   ", "\t\n", "", None,
                       "\u200b \u200b", " \u200b ", "\u2060\t\u2060",
@@ -979,6 +1010,10 @@ def test_invisible_format_controls_cannot_reorder_a_rendered_line():
         line = render({"kind": "capture-failure", "harness": empty_ish,
                        "detail": "d"})
         assert "unknown capture is affected" in line, (empty_ish, line)
+        assert "no detail was recorded" in render(
+            {"kind": "capture-failure", "harness": "c", "detail": empty_ish}), (
+                empty_ish, render({"kind": "capture-failure", "harness": "c",
+                                   "detail": empty_ish}))
 
 
 def test_bound_detail_redacts_before_it_bounds():
@@ -1374,9 +1409,11 @@ def test_an_oversized_record_is_bounded_and_still_tells_the_agent(tmp_path):
 
 
 def test_a_newline_in_a_scalar_cannot_forge_an_extra_payload_line(tmp_path):
-    """The invariant is ONE four-line payload. ``harness``/``recorded_at`` are
-    not redacted, so a newline in either would forge a line that looks like a
-    genuine ``next:`` recovery clause. They are whitespace-collapsed.
+    """The invariant is ONE four-line payload. A newline in any scalar would
+    forge a line that looks like a genuine ``next:`` recovery clause. The scalars
+    are whitespace-COLLAPSED, which is what prevents that; they are also redacted
+    (``one_line`` funnels through ``bound_detail``), so this docstring's earlier
+    "not redacted" was stale and contradicted the sibling redaction test.
 
     Mutation: interpolate the scalars raw — the payload gains lines and this
     REDs."""

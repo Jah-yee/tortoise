@@ -160,34 +160,40 @@ _STRIP_CONTROLS: dict[int, None] = {
 #: same reason the C0/C1 controls are: one can split a credential-shaped run the
 #: scan would otherwise see whole (``ghp_`` + ZWSP + the body).
 #:
-#: ⛔ THE WHOLE ``Cf`` CATEGORY, BY CATEGORY (#4041 review round 2, P1). This was
-#: a hand-written list of the visible offenders, which covered 27 of the 170
-#: ``Cf`` code points in the installed tables (Unicode 15.0.0); the 143 survivors
-#: were BOTH a credential-redaction bypass — one ``Cf`` inserted inside a
+#: ⛔ THE WHOLE ``Cf`` CATEGORY AND THE MARK CATEGORIES, BY CATEGORY (#4041 review
+#: rounds 2 and 3, P1). This began as a hand-written list of the visible offenders,
+#: which covered 27 of the 170 ``Cf`` code points in the installed tables (Unicode
+#: 15.0.0); the 143 survivors were a credential-redaction bypass — one ``Cf`` inside a
 #: credential defeats the shape anchor of every rule in ``_SECRET_SHAPES``, so
-#: ``ghp_<U+00AD>`` + body rendered the secret in cleartext — AND a covert
-#: channel into the agent's context (the tags block ``U+E0020-U+E007F`` carried a
-#: hidden instruction through the injected ``why:`` value). A list of "the
-#: invisible characters" cannot be kept complete against a Unicode table that
-#: moves under it; the category is the property we actually mean, so the category
-#: is what is tested.
+#: ``ghp_<U+00AD>`` + body rendered the secret in cleartext — AND a covert channel into
+#: the agent's context (the tags block carried a hidden instruction). Round 3 found the
+#: same bypass through a MARK: ``ghp_<U+FE0F>`` (a variation selector) and
+#: ``ghp_<U+0301>`` (a combining acute) are neither whitespace nor ``Cc`` nor ``Cf``, so
+#: the credential body was emitted in cleartext again. A list of "the invisible
+#: characters" cannot be kept complete against a table that moves under it; the
+#: property we mean is "a character that can be interleaved into a token without
+#: showing", so the CATEGORIES are what is tested.
 #:
-#: Tested PER CHARACTER rather than via a built ``str.translate`` table, because
-#: building the table means enumerating all 1.1M code points (measured: 1.55 s —
-#: unacceptable on a hook's critical path). ``category()`` is only consulted for
-#: non-ASCII text, which the ``isascii`` fast path skips entirely (ASCII has no
-#: ``Cf`` code point).
+#: Tested PER CHARACTER rather than via a built ``str.translate`` table: building the
+#: table means enumerating all 1.1M code points (measured: 1.55 s — unacceptable on a
+#: hook's critical path). ``category()`` is only consulted for non-ASCII text, and no
+#: ``Cf``/``Mn``/``Me``/``Mc`` code point is ASCII, so the ``isascii`` fast path is exact.
 #:
-#: KNOWN COST, accepted: a legitimate ``U+200D`` (ZWJ) is removed, so an emoji ZWJ
-#: sequence renders as its component code points. A credential in cleartext and a
-#: hidden instruction in an agent's context are worse than a degraded glyph.
+#: KNOWN COST, accepted: a legitimate combining accent is decomposed (``e`` + U+0301 no
+#: longer renders as ``é``) and a ZWJ emoji sequence splits into its components. A
+#: credential in cleartext and a hidden instruction in an agent's context are worse than
+#: a degraded glyph — the same trade the ``Cf`` half already made.
+#: NOT COVERED, stated rather than implied: a blank ``Lo`` filler (e.g. U+3164) still
+#: splits a run. It cannot be reached by category without discarding letters.
+_STRIPPED_CATEGORIES = frozenset({"Cf", "Mn", "Me", "Mc"})
+
 
 def _strip_format(text: str) -> str:
-    """Remove every Unicode ``Cf`` (format) code point from ``text``."""
+    """Remove invisible/zero-width format and combining-mark code points."""
     if text.isascii():
         return text
     return "".join(
-        ch for ch in text if unicodedata.category(ch) != "Cf")
+        ch for ch in text if unicodedata.category(ch) not in _STRIPPED_CATEGORIES)
 
 
 def _normalize(text: str) -> str:
@@ -213,17 +219,17 @@ def _normalize(text: str) -> str:
     combined into one code point by ``json.loads`` before this runs, so only
     genuinely unpaired surrogates are replaced.
     """
-    normalized = " ".join(text.split())
-    normalized = _strip_format(normalized.translate(_STRIP_CONTROLS))
-    # ⛔ STRIP AGAIN AFTER REMOVING ``Cf`` (#4041 review round 2, P2 follow-up).
-    # Removing a format character can EXPOSE whitespace at the edges, so
-    # ``"\u200b \u200b"`` collapses to ``" "`` — non-empty after the first
-    # collapse, so the caller's ``or`` fallback did not fire and the field
-    # rendered EMPTY (``since .`` / a double space where the harness belongs).
-    # Stripping HERE, where the removal happens, makes "normalizes to empty" and
-    # "is empty" the SAME question for every input, instead of fixing the class
-    # the last review happened to name.
-    normalized = normalized.strip()
+    normalized = text.translate(_STRIP_CONTROLS)
+    normalized = _strip_format(normalized)
+    # ⛔ COLLAPSE WHITESPACE **AFTER** THE REMOVALS (#4041 review round 3, P3). Doing it
+    # first made the single-space property false: removing a token leaves its
+    # surrounding spaces, so `"a \u200b \u200b b"` came out as `"a   b"` and
+    # `"a \x00 b"` as `"a  b"`. Collapsing last is also what SUBSUMES the trailing
+    # strip that fixed the empty-field case (`"\u200b \u200b"` reduced to `" "` before
+    # the removal, and stayed truthy) — `str.split()` with no argument drops leading and
+    # trailing whitespace, so "normalizes to empty" and "is empty" are the same question
+    # for every input in one pass.
+    normalized = " ".join(normalized.split())
     return normalized.encode("utf-8", "replace").decode("utf-8")
 
 #: What happened, for a human AND an agent with no product context.  Deliberately
@@ -317,10 +323,16 @@ def render(record: dict[str, Any]) -> str:
     harness = one_line(str(record.get("harness") or "")) or "unknown"
     stamp = one_line(
         str(record.get("recorded_at") or "")) or "an unrecorded time"
+    # ``why:`` takes a fallback too (#4041 review round 3, P3): ``harness`` and
+    # ``recorded_at`` had one and this did not, so an empty/omitted/whitespace-only
+    # ``detail`` rendered a ``why:`` with NO value — the one field whose absence the
+    # whole feature exists to prevent. The writer always emits a non-empty detail, so
+    # this is the synthetic-input case; it is still a field silently going blank.
+    why = one_line(bound_detail(record.get("detail"))) or "no detail was recorded"
     lines = (
         f"{'code:':<{_FIELD_WIDTH}}{kind}",
         f"{'what:':<{_FIELD_WIDTH}}{_WHAT.format(stamp=stamp, harness=harness)}",
-        f"{'why:':<{_FIELD_WIDTH}}{bound_detail(record.get('detail'))}",
+        f"{'why:':<{_FIELD_WIDTH}}{why}",
         f"{'next:':<{_FIELD_WIDTH}}{_RECOVERY}",
     )
     return "\n".join(lines) + "\n"

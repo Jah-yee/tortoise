@@ -159,12 +159,19 @@ _record_breadcrumb() {
 # with NO user content, so the redaction the Python half performs is not needed
 # here — said explicitly so its absence cannot be read as an oversight.
 _render_breadcrumb_inert() {
-  local harness="$1" detail="$2" stamp="$3"
+  local harness="$1" detail="$2" stamp="$3" recovery="$4"
   printf 'code:     install-inert\n' || true
   printf 'what:     Tortoise memory for this project has NOT been filed since %s. %s capture is affected.\n' \
     "$stamp" "$harness" || true
   printf 'why:      %s\n' "$detail" || true
-  printf 'next:     Recovery: `tortoise hooks upgrade` reinstalls this hook; `tortoise hooks status` reports the drift. The seam resolved no tortoise module dir, and memory is not filed until it does.\n' || true
+  # ⛔ THE RECOVERY IS PER-BRANCH, NOT A CONSTANT (#4041 review round 3, P2). This
+  # renderer serves TWO inert branches with DIFFERENT causes, and the hard-coded
+  # sentence named the first one in both: branch 2's `why:` says a module dir WAS
+  # resolved and only `python3` was missing, while its `next:` said the module dir was
+  # NOT resolved and told the reader to run `tortoise hooks upgrade` — a payload that
+  # contradicted itself and prescribed the wrong remedy. The caller passes the clause
+  # that matches its own cause, so `why:` and `next:` cannot disagree.
+  printf 'next:     Recovery: %s\n' "$recovery" || true
   return 0
 }
 
@@ -266,7 +273,8 @@ if [ -z "$TORTOISE_BIN" ] && [ -z "$TORTOISE_MODULE" ]; then
   # #4041: tell the AGENT, not only the machine. `install-inert` is rendered
   # pure shell, because THIS branch is reached with no interpreter to run
   # Python with.
-  _render_breadcrumb_inert claude "$INERT_DETAIL" "$INERT_STAMP"
+  _render_breadcrumb_inert claude "$INERT_DETAIL" "$INERT_STAMP" \
+    '`tortoise hooks upgrade` reinstalls this hook; `tortoise hooks status` reports the drift. The seam resolved no tortoise module dir, and memory is not filed until it does.'
   # #3797: the hook RAN — record that too, so the install is not reported as
   # never-ran.  No probe was attempted, hence the bare `null`.
   _record_hook_run claude false null
@@ -286,7 +294,8 @@ if [ -z "$TORTOISE_BIN" ]; then
     INERT_DETAIL="the installed Claude session-start hook resolved a tortoise module dir but found no python3 interpreter, and injected nothing"
     INERT_STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
     _record_breadcrumb claude "$INERT_DETAIL" "$INERT_STAMP"
-    _render_breadcrumb_inert claude "$INERT_DETAIL" "$INERT_STAMP"
+    _render_breadcrumb_inert claude "$INERT_DETAIL" "$INERT_STAMP" \
+      'a `python3` on the PATH this hook runs with provides the interpreter the capture half needs (the hook resolves it with `command -v python3`), and memory is not filed until one is there.'
     # #3797: same as the other inert branch — the hook ran, the probe did not.
     _record_hook_run claude false null
     exit 0
