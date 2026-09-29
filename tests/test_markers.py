@@ -53,6 +53,13 @@ _TESTS_ROOT = Path(__file__).resolve().parent
 # The swept (renamed) sites are the test_-prefixed literals/constants the
 # guard passes on their own — the table documents the residual declarations.
 ROUTED_NAMESPACES: dict[str, dict[str, str]] = {
+    # 2026-09-29 main-red reconciliation: test_github_connect.py's
+    # `_make_sdk(namespace="registry")` seeds the org's Team node that
+    # `_github_credentials` reads back — the literal IS the canonical
+    # namespace PROD resolves (the documented prod-coupled case, same shape
+    # as test_acl_graph_users.py's team seeding). Shipped in the 2026-09-28
+    # 19:05 bulk land and red'd this guard on main itself until declared.
+    "test_github_connect.py": {"registry": "prod-coupled"},
     # 2026-08-28 merge-reconciliation: #1785/#1816 files use the 'registry'
     # literal (session/extraction tests) — routed so the markers gate passes
     # repo-wide.
@@ -192,6 +199,13 @@ ROUTED_NAMESPACES: dict[str, dict[str, str]] = {
 #                              name, but it must stay CONSISTENT between the
 #                              seed, the call and the read-back assert.
 ROUTED_SELECT_GRAPH_SITES: dict[str, dict[str, str]] = {
+    # 2026-09-29 main-red reconciliation: the backup path's SUBJECT —
+    # `create_backup(proj, registry, ...)` dumps/READS this handle and the
+    # ledger goes to the object-store stub, so the site only reads (verified:
+    # no CREATE/MERGE/SET on the argument). The test asserts
+    # `store.list(...)`, never graph state. Shipped in the 2026-09-28 19:05
+    # bulk land (#5711) and red'd this guard on main itself until declared.
+    "test_backup_ledger_5062.py": {'"registry_tortoise"': "read-only"},
     "test_dr_endpoints.py": {
         'f"org_{org_id}"': "endpoint-constrained",  # seed write — drill/backup resolve org_{id}
         # #2823 Supabase-lane sweep seed — the DATA plane stays FalkorDB in

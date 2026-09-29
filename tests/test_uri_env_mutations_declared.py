@@ -192,7 +192,13 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # #3039: the ACL admin-client decode pin forces a docker:// URI so
     # `_admin_client` takes the redis path; redis.Redis is stubbed, never
     # connects. The setenv IS the test input (deliberate docker lane).
-    "test_from_uri_userinfo.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
+    "test_from_uri_userinfo.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"',
+                                   # :950/:1012 put the URI literal on the
+                                   # FOLLOWING line (`setenv(` then the string),
+                                   # so the site matches only this trailing
+                                   # branch — the same multi-line shape and the
+                                   # same remedy as `test_backup.py` above.
+                                   r'monkeypatch\.setenv\(\s*$'],
     "test_namespace_uri_mode.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])',
                                      r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"',
                                      r'monkeypatch\.setenv\(\s*$'],
@@ -272,6 +278,20 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
                                      # same multi-line shape and the same remedy as
                                      # `test_backup.py` above.
                                      r'monkeypatch\.setenv\(\s*$'],
+    # ── 2026-09-29 main-red reconciliation (the #3458 precedent, second
+    #    landing): these sites shipped in the 2026-09-28 19:05 bulk land and
+    #    red'd the uri-env declaration guard on main itself until declared.
+    # #5769 backfill: the autouse fixture points the SDK at the docker
+    # test-matrix graph (DELIBERATE_URI — the setenv IS the test input;
+    # fixture-param monkeypatch auto-restores, so no lane leaks).
+    "test_2500_terminal_ep_backfill.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
+    # #3815: the module-level live-FalkorDB probe (set + try/finally restore at
+    # :61-76 — the DELIBERATE_URI module-probe pattern) plus the autouse
+    # `_set_docker_uri` fixture forcing the isolated per-test docker graph.
+    "test_3815_mitigation_moves_weight.py": [
+        r'os\.environ\["TORTOISE_DB_URI"\]\s*=',
+        r'os\.environ\.pop\(\s*["\']TORTOISE_DB_URI["\']',
+        r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
 }
 
 # Carve-out TEST-MODULE stems (Task 5 wires these into TEST_NO_REDIRECT_STEMS;
