@@ -59,14 +59,17 @@ sub-split note in `measure()`) and there is NO review-wait figure in this report
   not on the PR head, so requiring it here would leave every merged PR
   unmeasurable.
 
-* **The newest-attempt key is `(app.slug, name)`, NOT `(app.slug, workflow,
-  name)`** — the rule the merge rail and `tools/merge_throughput.py` use. The two
-  agree for every context in the current entry set (all five are distinct job
-  names in one workflow), but a check name published by two workflows would let a
-  newer attempt in one shadow a red in the other — the failure
+* **The newest-attempt key is `(app.slug, name)` — a WEAK key that THIS tool
+  uses and its sibling does NOT.** `tools/merge_throughput.py` groups by
+  `(app.slug, workflow, job_name)`, and the test this tool's earlier note cited —
   `tests/test_merge_throughput.py::`
   `test_grouping_must_not_shadow_a_red_behind_a_newer_success_in_another_workflow`
-  pins for the sibling. A weak key, recorded rather than silently assumed.
+  — exists to prove the NARROWER `(app.slug, name)` key WRONG: a check name
+  published by two workflows lets a newer attempt in one shadow a red in the
+  other. By the sibling's own standard this key is a latent false GREEN. It is
+  not wrong for any number in this report — the current entry set is five
+  distinct job names in one workflow, where the two keys agree — but it is
+  recorded as a defect to fix, never as an accepted rule.
 
 * **Author-based filtering is impossible on this repo.** Every agent
   authenticates as `daniel-ospina`, so the PR author and its reviewer share one
@@ -76,8 +79,10 @@ sub-split note in `measure()`) and there is NO review-wait figure in this report
 * **The window's gate is the CURRENT `.mergify.yml`, applied RETROACTIVELY.**
   `entry_gate_contexts` is read at run time; if the required set changed
   mid-window, every PR in the window is judged against the current set, and the
-  set's CONSTANCY across the window is unestablished. The output does not restate
-  that caveat, so read the report with it in mind.
+  set's CONSTANCY across the window is unestablished. The JSON's
+  `rule_gate_success` field states this caveat; the rendered report does not, so
+  a reader of the prose alone sees a gate number with no note that it is
+  retroactive.
 
 * **The partition invariant is asserted, not hoped for.** Every closed human PR
   lands in exactly one terminal leg, the three legs reconcile to the population,
@@ -935,14 +940,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = measure(gh, args.repo, contexts, args.days, now,
                          prune_after=args.prune_after)
-    except (RuntimeError, subprocess.CalledProcessError) as exc:
+    except (RuntimeError, OSError, json.JSONDecodeError,
+            subprocess.CalledProcessError) as exc:
         # `1` is reserved for "a gate would fail". A read that could not be made is
-        # UNKNOWN (`2`), never the code that reads as a verdict.
+        # UNKNOWN (`2`), never the code that reads as a verdict. OSError covers a
+        # missing or failing `gh` binary (FileNotFoundError) and connection
+        # errors; json.JSONDecodeError covers a corrupt cache entry and a non-JSON
+        # body on exit 0. SystemExit is a BaseException and still propagates: a
+        # partition violation is a verdict about this code, not an unobserved read.
         print(f"UNKNOWN: {exc}", file=sys.stderr)
         return 2
-    if args.json_out:
-        args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     # "never 0 on an unobserved read" (tools/ci_timing.py:454). The siblings pin
     # this with test_empty_enumeration_is_unknown_not_zero and
     # test_record_refuses_an_empty_enumeration_as_unknown_not_zero.
@@ -959,6 +966,13 @@ def main(argv: list[str] | None = None) -> int:
     # render() after the guards, not before: an empty or truncated result is
     # missing the keys it reads, so rendering first would raise and exit 1 —
     # the code reserved for a verdict — instead of UNKNOWN (2).
+    # --json-out is written only AFTER both guards. A file left behind by an
+    # UNKNOWN run is the same "an unobserved read reads as a measurement" defect
+    # the guards exist to prevent, for every consumer that reads the file instead
+    # of the exit code.
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(render(result))
     print(f"(gh calls={gh.calls} cache_hits={gh.cache_hits})")
     return 0

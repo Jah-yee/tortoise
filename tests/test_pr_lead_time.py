@@ -122,6 +122,31 @@ def test_none_gate_passes_through():
     assert plt.clamp_gate(None, T0, T0 + timedelta(hours=1)) is None
 
 
+# --- bot approvals are not human readiness ----------------------------------
+
+def test_bot_approval_is_not_human_readiness():
+    """`first_approval_at` feeds ready = max(gate, approval), so a bot's
+    APPROVED review counted as human readiness until it was filtered;
+    `first_activity()` already excluded bots, so the two disagreed."""
+    bots = [{"state": "APPROVED", "submitted_at": _iso(T0),
+             "user": {"login": "mergify[bot]", "type": "Bot"}}]
+    assert plt.review_stats(bots)["first_approval_at"] is None
+
+
+def test_human_approval_is_still_readiness():
+    """The discriminating half: if the filter were widened to drop ALL
+    approvals, the test above would still pass."""
+    human = [{"state": "APPROVED", "submitted_at": _iso(T0),
+              "user": {"login": "daniel-ospina", "type": "User"}}]
+    assert plt.review_stats(human)["first_approval_at"] is not None
+
+
+def test_bot_detection_is_what_the_filter_rests_on():
+    """Second discrimination: neutering is_bot() must not leave the suite green."""
+    assert plt.is_bot({"login": "mergify[bot]", "type": "Bot"}) is True
+    assert plt.is_bot({"login": "daniel-ospina", "type": "User"}) is False
+
+
 # --- timestamps -------------------------------------------------------------
 
 def test_naive_timestamp_is_read_as_utc():
@@ -182,11 +207,42 @@ def test_main_exits_unknown_on_a_failed_read(monkeypatch, capsys):
     assert rc == 2, "an unobserved read must be UNKNOWN (2), not the verdict code 1"
 
 
+def test_main_exits_unknown_when_gh_is_missing(monkeypatch, capsys):
+    """REPRODUCED by review: with `gh` off PATH, `FileNotFoundError` escaped the
+    narrower `except (RuntimeError, subprocess.CalledProcessError)` and the tool
+    exited 1 — the verdict code — for a read it never made."""
+    rc = _run_main(monkeypatch, raises=FileNotFoundError("gh"))
+    assert rc == 2, "a missing `gh` binary is an unobserved read, not a verdict"
+
+
+def test_main_exits_unknown_on_a_corrupt_read(monkeypatch, capsys):
+    """A corrupt cache entry or a non-JSON body on exit 0 raises
+    json.JSONDecodeError out of json.loads — same escape, same wrong exit 1."""
+    import json as _json
+    rc = _run_main(monkeypatch, raises=_json.JSONDecodeError("boom", "doc", 0))
+    assert rc == 2
+
+
+def test_unobserved_run_leaves_no_json_artifact(monkeypatch, tmp_path, capsys):
+    """--json-out used to be written BEFORE the guards, so an UNKNOWN run left a
+    file whose contents read as a measurement to any consumer that reads the file
+    rather than the exit code."""
+    out = tmp_path / "lead.json"
+    rc = _run_main(monkeypatch, argv_extra=["--json-out", str(out)],
+                   result={"prs": []})
+    assert rc == 2 and not out.exists()
+
+
 def test_partition_violation_is_not_reported_as_unknown(monkeypatch):
     """`1` stays reserved for a real verdict: an invariant failure must NOT be
-    swallowed into the UNKNOWN path."""
-    with pytest.raises(SystemExit):
-        _run_main(monkeypatch, raises=SystemExit("PARTITION VIOLATED: legs != elapsed"))
+    swallowed into the UNKNOWN path. This asserts the MESSAGE, not merely that
+    *some* SystemExit was raised — the weaker form was satisfied by any
+    unrelated SystemExit, so it stayed green even when the partition assertion
+    itself had been deleted (found by review)."""
+    with pytest.raises(SystemExit) as ei:
+        _run_main(monkeypatch,
+                  raises=SystemExit("PARTITION VIOLATED: legs != elapsed"))
+    assert "PARTITION VIOLATED" in str(ei.value)
 
 
 # --- the fabricated zero ----------------------------------------------------
@@ -195,7 +251,15 @@ def test_prune_after_does_not_zero_the_queue_population():
     """`--prune-after` cleared `queue_prs`, so the report printed
     `queue_prs_closed_in_window=0` as if the queue were genuinely empty — the
     'single largest accounting error in earlier readings' this tool exists to
-    prevent. Pinned against the source so it cannot quietly return."""
+    prevent.
+
+    LIMIT, stated rather than implied (found by review): this is a TEXT pin and
+    covers only that literal expression. A semantically equivalent reintroduction
+    — `queue_prs.clear()`, `queue_prs = []`, `del queue_prs[:]` — passes it. It
+    strips `#` comments but not string literals, so quoting the expression in the
+    module DOCSTRING still trips it. A behavioural pin would drive `measure()`
+    with a fake `Gh`; that is NOT done here, so this guard is weaker than its
+    name suggests."""
     src = (ROOT / "tools" / "pr_lead_time.py").read_text()
     # strip comments: the source legitimately MENTIONS the removed expression in
     # the comment that explains why it is gone — the pin is on executable code.
