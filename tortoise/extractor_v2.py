@@ -6993,9 +6993,15 @@ def extract_session_v2(model, conversation: list[dict], *, sdk=None,
             # tenant_view uses, so the classifier can never assign a kind
             # the L1 write gate will 422. ``sdk=None`` (offline callers) =
             # no gate (the union). A bound-but-unreachable graph RAISES
-            # here and the except below disables classify-later for this
-            # session — no ungated classification runs (fail-closed),
-            # never a silent fallback to the catalog union.
+            # here and the except below sets ``classify_later = False``:
+            # the GATED classifier pass does not run and the session
+            # continues down the legacy path, whose master is the ungated
+            # catalog union — fail-OPEN onto the wider vocabulary, with the
+            # error recorded (the except's own note says fail-open).
+            # #5339 review: this sentence used to call that fail-closed,
+            # which its own except contradicts; the SDK entry points that
+            # need the fail-closed direction (``_commit_session_v1``/
+            # ``_commit_session_v2``) guard the resolver themselves.
             installed = None
             if sdk is not None:
                 from tortoise.pack_state import graph_installed_namespaces
