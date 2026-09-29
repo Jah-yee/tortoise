@@ -180,10 +180,10 @@ def test_the_real_enumeration_partitions_every_name(guard):
 
 # ── COMPOSITION: run() must actually CALL each check ───────────────────────
 #
-# The checks are pinned in isolation above, which is not enough: deleting a
-# check call from `run()` left all 30 tests green (measured by the reviewer).
-# These drive `run()` end-to-end through the env seams so the WIRING is pinned
-# too — a refactor that drops a check now reddens.
+# The checks are pinned in isolation above, which is not enough: a refactor that
+# drops a check call from `run()` keeps every isolation test green, because none
+# of them drives `run()` at all. These drive it end-to-end through the env seams
+# so the WIRING is pinned too, and so dropping a call reddens.
 
 
 def _write_minimal_gate(guard, needs: list[str], legs: list[str]) -> None:
@@ -1567,8 +1567,20 @@ def test_a_non_list_queue_rules_is_a_cannot_measure_not_an_empty_list(guard, tmp
     """
     for bad in ("queue_rules: 0\n", "queue_rules: {}\n", "queue_rules: nothing\n"):
         guard.MERGIFY_PATH.write_text(bad)
-        with pytest.raises(guard.CannotMeasure, match="present but not a list"):
+        with pytest.raises(guard.CannotMeasure, match="absent or not a list"):
             guard.read_injection_modes()
+
+
+def test_an_absent_queue_rules_also_cannot_be_measured(guard, tmp_guard_env):
+    """The ABSENT key reaches the same raise, and the message must not deny it.
+
+    `cfg.get("queue_rules")` returns None for an absent key exactly as it does for
+    an explicit null, so the message said "present but not a list" about a key that
+    was not present — the very absent/unusable distinction this branch draws.
+    """
+    guard.MERGIFY_PATH.write_text("pull_request_rules: []\n")
+    with pytest.raises(guard.CannotMeasure, match="absent or not a list"):
+        guard.read_injection_modes()
 
 
 def test_no_queue_rule_at_all_is_a_violation(guard):

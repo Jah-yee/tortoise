@@ -393,8 +393,12 @@ def read_injection_modes(path: Path | None = None) -> list[Any]:
             f"{path}: top level is not a mapping, got {type(cfg).__name__} — cannot measure")
     rules = cfg.get("queue_rules")
     if not isinstance(rules, list):
+        # Not "present but not a list": an ABSENT key reaches here too and arrives
+        # as None (`cfg.get` cannot tell absent from explicit-null), so wording it
+        # "present" made the message itself collapse the distinction this branch
+        # exists to draw. The type name is the part that is always true.
         raise CannotMeasure(
-            f"{path}: `queue_rules` is present but not a list, got "
+            f"{path}: `queue_rules` is absent or not a list, got "
             f"{type(rules).__name__} — cannot measure")
     return [
         rule.get("branch_protection_injection_mode") if isinstance(rule, dict) else None
