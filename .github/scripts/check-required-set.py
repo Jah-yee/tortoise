@@ -164,8 +164,24 @@ GATE_LEGS_HEREDOC = "<<'LEGS'"
 CHECK_SUCCESS_PREFIX = "check-success="
 
 # LITERAL spellings of a falsy `if:` that GitHub evaluates as false. See
-# `_is_literally_off` — these are decidable, unlike a real expression.
-_FALSY_IF_STRINGS = frozenset({"false", "0", "${{ false }}"})
+# `_is_literally_off` — these are decidable, unlike a real expression. Compared
+# AFTER `_normalise_if`, so the `${{ }}` wrapper and any inner whitespace are
+# already gone: `${{false}}`, `${{ 0 }}` and `${{ null }}` all land here.
+_FALSY_IF_STRINGS = frozenset({"false", "0", "null", '\"\"', "''"})
+
+
+def _normalise_if(condition: str) -> str:
+    """A literal `if:` value reduced to its bare expression.
+
+    `${{ false }}`, `${{false}}`, `${{ FALSE }}` and `false` are the SAME constant
+    to GitHub, so they must normalise to the same string. Matching the raw text
+    meant only the exact spellings in `_FALSY_IF_STRINGS` were recognised and
+    `${{false}}` — one space away from a caught form — counted as PRODUCIBLE.
+    """
+    text = condition.strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2].strip()
+    return text.lower()
 
 # ── THE ENUMERATION (design decision 2) ───────────────────────────────────────
 # Every LIVE-required status check, HOW the merge queue enforces it, and the
@@ -330,13 +346,17 @@ def injected_names() -> set[str]:
     return {n for n, (where, _) in REQUIRED_SET.items() if where == "injected"}
 
 
-def read_injection_mode(path: Path | None = None) -> Any:
-    """`.mergify.yml`'s `branch_protection_injection_mode` from the queue rule.
+def read_injection_modes(path: Path | None = None) -> list[Any]:
+    """`branch_protection_injection_mode` for EVERY queue rule, in order.
 
-    Returned as the RAW value so an absent key and a wrong key stay
-    distinguishable: absent -> None, which `check_injection_mode` treats as
-    Mergify's default (`queue`) and therefore as a violation of this repo's
-    documented `merge` setting.
+    ALL rules, not just the first: `queue_rules` is a LIST and each rule injects
+    independently, so a second rule left at the default `queue` would still gate
+    ENTRY with the injected contexts while the first said `merge`. Reading only the
+    first rule would report a clean verdict for a claim that is false of the second
+    — the failure this catches is a two-rule config where only one is checked.
+
+    An ABSENT key comes back as None (Mergify's default is `queue`); a missing key
+    inside a non-dict rule does too, since such a rule cannot be read either.
     """
     path = path or MERGIFY_PATH
     try:
@@ -348,11 +368,11 @@ def read_injection_mode(path: Path | None = None) -> Any:
             f"{path}: top level is not a mapping, got {type(cfg).__name__} — cannot measure")
     rules = cfg.get("queue_rules")
     if not isinstance(rules, list):
-        return None
-    for rule in rules:
-        if isinstance(rule, dict) and "branch_protection_injection_mode" in rule:
-            return rule["branch_protection_injection_mode"]
-    return None
+        return []
+    return [
+        rule.get("branch_protection_injection_mode") if isinstance(rule, dict) else None
+        for rule in rules
+    ]
 
 
 def _triggers(workflow: dict[str, Any]) -> set[str]:
@@ -401,7 +421,7 @@ def _is_literally_off(condition: Any) -> bool:
     if condition is False:
         return True
     if isinstance(condition, str):
-        return condition.strip().lower() in _FALSY_IF_STRINGS
+        return _normalise_if(condition) in _FALSY_IF_STRINGS
     if isinstance(condition, (int, float)):
         return not condition
     return False
@@ -813,27 +833,33 @@ def check_partition(parsed: dict[str, set[str]]) -> list[str]:
     return problems
 
 
-def check_injection_mode(mode: Any) -> list[str]:
-    """.mergify.yml must set `branch_protection_injection_mode: merge`.
+def check_injection_mode(modes: list[Any]) -> list[str]:
+    """EVERY queue rule must set `branch_protection_injection_mode: merge`.
 
     Not decoration. Under `merge` (set in `.mergify.yml`, contract point 4) the
-    injected branch-protection contexts gate the MERGE only, which is what makes
-    an `injected` name's absence from `queue_conditions` a deliberate choice
-    WITHOUT weakening enforcement. Under `queue` — Mergify's DEFAULT, so an ABSENT
-    key means `queue` — those same contexts are injected for QUEUING too, and the
-    enumeration's claim about an `injected` name stops being true. The failure
-    this catches, named concretely: the key is deleted or flipped to `queue`, and
-    the comment justifying `ai-review-gate`'s absence silently becomes false.
+    injected branch-protection contexts gate the MERGE only, which is what makes an
+    `injected` name's absence from `queue_conditions` a deliberate choice WITHOUT
+    weakening enforcement. Under `queue` — Mergify's DEFAULT, so an ABSENT key means
+    `queue` — those same contexts are injected for QUEUING too, and the enumeration's
+    claim about an `injected` name stops being true. The failure this catches, named
+    concretely: the key is deleted, flipped to `queue`, or left unset on a SECOND
+    rule while the first says `merge`.
     """
-    if mode != "merge":
+    if not modes:
         return [
-            f".mergify.yml branch_protection_injection_mode is {mode!r}, not 'merge' "
-            f"(an absent key means Mergify's default, 'queue') — under 'queue' the "
-            f"injected branch-protection contexts gate ENTRY as well, so an "
-            f"'injected' name is no longer 'deliberately not an entry gate' and the "
-            f"enumeration's reason for it is false (#6144)"
+            ".mergify.yml has no queue rule, so `branch_protection_injection_mode` "
+            "cannot be read — the mode justifies every 'injected' name, so it cannot "
+            "be assumed (#6144)"
         ]
-    return []
+    return [
+        f".mergify.yml queue_rules[{index}].branch_protection_injection_mode is "
+        f"{mode!r}, not 'merge' (an absent key means Mergify's default, 'queue') — "
+        f"under 'queue' the injected branch-protection contexts gate ENTRY as well, "
+        f"so an 'injected' name is no longer 'deliberately not an entry gate' and "
+        f"the enumeration's reason for it is false (#6144)"
+        for index, mode in enumerate(modes)
+        if mode != "merge"
+    ]
 
 
 def check_injected_producible(injected: set[str], producible: set[str]) -> list[str]:
@@ -1115,7 +1141,7 @@ def run(live: bool = False) -> tuple[int, list[str], list[str]]:
             live_contexts, live_strict = read_live_protection()
         else:
             live_contexts, live_strict = None, None
-        injection_mode = read_injection_mode()
+        injection_modes = read_injection_modes()
     except CannotMeasure as exc:
         return 2, [], [f"CANNOT MEASURE: {exc}"]
 
@@ -1133,7 +1159,7 @@ def run(live: bool = False) -> tuple[int, list[str], list[str]]:
         + check_settings(settings, expected)
         + check_settings_branches(off_main)
         + check_declared_strict(live_strict, declared_strict)
-        + check_injection_mode(injection_mode)
+        + check_injection_mode(injection_modes)
         + check_injected_producible(injected, producible)
         + check_gate_legs(needs, legs)
     )

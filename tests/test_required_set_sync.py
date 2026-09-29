@@ -1514,7 +1514,30 @@ def test_the_injection_mode_must_be_merge(guard, tmp_guard_env, mode, flagged):
         guard.MERGIFY_PATH.write_text(
             "queue_rules:\n  - name: main\n"
             f"    branch_protection_injection_mode: {mode!r}\n")
-    assert bool(guard.check_injection_mode(guard.read_injection_mode())) is flagged
+    assert bool(guard.check_injection_mode(guard.read_injection_modes())) is flagged
+
+
+def test_a_second_queue_rule_is_also_measured(guard, tmp_guard_env):
+    """EVERY queue rule injects independently — reading only the first is a hole.
+
+    With two rules, `[{merge}, {queue}]`, the second still injects the
+    branch-protection contexts for QUEUING, so the enumeration's "deliberately not
+    an entry gate" claim is false of it. A first-rule-only read returned `merge`
+    for the whole file and reported clean.
+    """
+    guard.MERGIFY_PATH.write_text(
+        "queue_rules:\n"
+        "  - name: first\n    branch_protection_injection_mode: merge\n"
+        "  - name: second\n")
+    modes = guard.read_injection_modes()
+    assert modes == ["merge", None], modes
+    problems = guard.check_injection_mode(modes)
+    assert len(problems) == 1 and "queue_rules[1]" in problems[0], problems
+
+
+def test_no_queue_rule_at_all_is_a_violation(guard):
+    """The mode justifies every `injected` name, so it cannot simply be assumed."""
+    assert guard.check_injection_mode([]) != []
 
 
 def test_an_injected_name_named_in_mergify_is_a_violation(guard, tmp_guard_env, monkeypatch):
@@ -1572,6 +1595,11 @@ def test_the_injection_mode_is_checked_through_run(guard, tmp_guard_env, monkeyp
     "false",        # string spelling GitHub evaluates as falsy
     "FALSE",
     "${{ false }}",
+    "${{false}}",     # no spaces — one character away from the caught form
+    "${{  FALSE  }}",
+    "${{ 0 }}",
+    "${{ null }}",
+    "null",
     "0",
     0,
 ])
@@ -1582,16 +1610,22 @@ def test_a_literally_falsy_if_is_gated_off(guard, cond):
     counted PRODUCIBLE, so a required check whose only producer was `if: false`
     read as arriving forever — a false GREEN in the direction the deadlock checks
     must never fail in.
+
+    The `${{ }}` spellings are the point: GitHub sees `${{false}}`, `${{ 0 }}` and
+    `${{ null }}` as the SAME constants as their bare forms, so matching only exact
+    strings left them producible. Those rows are why the comparison normalises.
     """
     assert guard._gated_off_pr_refs({"if": cond}) is True, cond
 
 
-@pytest.mark.parametrize("cond", [None, True, "always()", "${{ true }}", 1])
+@pytest.mark.parametrize("cond", [None, True, "always()", "${{ true }}", 1,
+                                  "${{ 1 }}", "${{ !cancelled() }}"])
 def test_a_non_falsy_or_absent_if_stays_producible(guard, cond):
     """The documented direction holds: an absent/unclassifiable `if:` is producible.
 
     `None` MUST stay producible — an absent `if:` means the job RUNS, so treating
-    it as gated off would manufacture a false DEADLOCK on every normal job.
+    it as gated off would manufacture a false DEADLOCK on every normal job. The
+    `${{ }}` rows check that normalising does not over-reach into the truthy side.
     """
     assert guard._gated_off_pr_refs({"if": cond}) is False, cond
 
