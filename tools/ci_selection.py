@@ -1543,13 +1543,15 @@ def parse_matrix_halves(workflow_text: str) -> dict[str, list[str]]:
 
     #6135: the `test` job carries no literal rows any more (its matrix is
     `fromJSON(...fast_matrix)`), so the only block this regex can still match
-    is the `test-slow` job's. It is reached ONLY by the `--integrity` failure
-    fallback — i.e. once `workflow_matrix_issues()` has ALREADY reported the
-    workflow drifted off the derived shape; the normal path feeds the derived
-    shards from `push_legs()` instead. The halves are folded scalars with bare
-    file names (no .py) — the run step maps them to `tests/<name>.py` and
-    `bench/*`. Returns {} when the parse fails so callers fail closed on
-    "workflow changed shape" instead of silently passing.
+    is the `test-slow` job's. Both callers reach it only on the integrity
+    gate's FAILURE fallback — `ci_selection.py --integrity`, and the same
+    composition in `ci_timing.integrity_problems()` (used by
+    `--refresh-durations`) — i.e. once `workflow_matrix_issues()` has ALREADY
+    reported the workflow drifted off the derived shape; the normal path feeds
+    the derived shards from `push_legs()` instead. The halves are folded
+    scalars with bare file names (no .py) — the run step maps them to
+    `tests/<name>.py` and `bench/*`. Returns {} when the parse fails so callers
+    fail closed on "workflow changed shape" instead of silently passing.
     """
     halves: dict[str, list[str]] = {}
     for m in re.finditer(r"- half: ([ab])\n\s+files: >-\n\s+([^\n]+)\n", workflow_text):
