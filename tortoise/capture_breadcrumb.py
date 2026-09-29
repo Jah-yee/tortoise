@@ -48,6 +48,7 @@ imperatives: an imperative costs the whole payload its context-injection path.
 from __future__ import annotations
 
 import json
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -158,17 +159,35 @@ _STRIP_CONTROLS: dict[int, None] = {
 #: write must not be forgeable.  The zero-width joiners are stripped for the
 #: same reason the C0/C1 controls are: one can split a credential-shaped run the
 #: scan would otherwise see whole (``ghp_`` + ZWSP + the body).
-_STRIP_FORMAT: dict[int, None] = {
-    **{cp: None for cp in range(0x202A, 0x202F)},  # bidi embed/override/PDF
-    **{cp: None for cp in range(0x2060, 0x2070)},  # word joiner … isolates
-    0x200B: None,  # zero-width space
-    0x200C: None,  # zero-width non-joiner
-    0x200D: None,  # zero-width joiner
-    0x200E: None,  # left-to-right mark
-    0x200F: None,  # right-to-left mark
-    0x061C: None,  # Arabic letter mark
-    0xFEFF: None,  # BOM / zero-width no-break space
-}
+#:
+#: ⛔ THE WHOLE ``Cf`` CATEGORY, BY CATEGORY (#4041 review round 2, P1). This was
+#: a hand-written list of the visible offenders, which covered 27 of the 170
+#: ``Cf`` code points in the installed tables (Unicode 15.0.0); the 143 survivors
+#: were BOTH a credential-redaction bypass — one ``Cf`` inserted inside a
+#: credential defeats the shape anchor of every rule in ``_SECRET_SHAPES``, so
+#: ``ghp_<U+00AD>`` + body rendered the secret in cleartext — AND a covert
+#: channel into the agent's context (the tags block ``U+E0020-U+E007F`` carried a
+#: hidden instruction through the injected ``why:`` value). A list of "the
+#: invisible characters" cannot be kept complete against a Unicode table that
+#: moves under it; the category is the property we actually mean, so the category
+#: is what is tested.
+#:
+#: Tested PER CHARACTER rather than via a built ``str.translate`` table, because
+#: building the table means enumerating all 1.1M code points (measured: 1.55 s —
+#: unacceptable on a hook's critical path). ``category()`` is only consulted for
+#: non-ASCII text, which the ``isascii`` fast path skips entirely (ASCII has no
+#: ``Cf`` code point).
+#:
+#: KNOWN COST, accepted: a legitimate ``U+200D`` (ZWJ) is removed, so an emoji ZWJ
+#: sequence renders as its component code points. A credential in cleartext and a
+#: hidden instruction in an agent's context are worse than a degraded glyph.
+
+def _strip_format(text: str) -> str:
+    """Remove every Unicode ``Cf`` (format) code point from ``text``."""
+    if text.isascii():
+        return text
+    return "".join(
+        ch for ch in text if unicodedata.category(ch) != "Cf")
 
 
 def _normalize(text: str) -> str:
@@ -195,7 +214,16 @@ def _normalize(text: str) -> str:
     genuinely unpaired surrogates are replaced.
     """
     normalized = " ".join(text.split())
-    normalized = normalized.translate(_STRIP_CONTROLS).translate(_STRIP_FORMAT)
+    normalized = _strip_format(normalized.translate(_STRIP_CONTROLS))
+    # ⛔ STRIP AGAIN AFTER REMOVING ``Cf`` (#4041 review round 2, P2 follow-up).
+    # Removing a format character can EXPOSE whitespace at the edges, so
+    # ``"\u200b \u200b"`` collapses to ``" "`` — non-empty after the first
+    # collapse, so the caller's ``or`` fallback did not fire and the field
+    # rendered EMPTY (``since .`` / a double space where the harness belongs).
+    # Stripping HERE, where the removal happens, makes "normalizes to empty" and
+    # "is empty" the SAME question for every input, instead of fixing the class
+    # the last review happened to name.
+    normalized = normalized.strip()
     return normalized.encode("utf-8", "replace").decode("utf-8")
 
 #: What happened, for a human AND an agent with no product context.  Deliberately
@@ -277,13 +305,18 @@ def render(record: dict[str, Any]) -> str:
     kind = record.get("kind")
     if kind != KIND_CAPTURE_FAILURE:
         return ""
-    # ``.strip()`` BEFORE the ``or`` fallback: ``"   "`` is TRUTHY, so the bare
-    # ``or`` let a whitespace-only value through, and ``bound_detail`` then
-    # normalized it to "" — the rendered line lost the harness (or the stamp)
-    # entirely instead of taking the documented fallback.
-    harness = one_line(str(record.get("harness") or "").strip() or "unknown")
+    # ⛔ NORMALIZE BEFORE THE ``or`` FALLBACK (#4041 review round 2, P2). ``"   "``
+    # is TRUTHY, so a bare ``or`` let a whitespace-only value through and
+    # ``bound_detail`` then normalized it to "" — the rendered line lost the
+    # harness (or the stamp) entirely instead of taking the documented fallback.
+    # ``.strip()`` fixed the whitespace case but NOT the ``Cf`` case: every
+    # ``Cf`` is non-whitespace, so ``"\u200b"`` stayed truthy and then vanished
+    # in normalization — the SAME empty field, one character class over. The fix
+    # is to normalize FIRST and fall back on the normalized result, so no value
+    # that normalizes to empty can reach the line, whatever its composition.
+    harness = one_line(str(record.get("harness") or "")) or "unknown"
     stamp = one_line(
-        str(record.get("recorded_at") or "").strip() or "an unrecorded time")
+        str(record.get("recorded_at") or "")) or "an unrecorded time"
     lines = (
         f"{'code:':<{_FIELD_WIDTH}}{kind}",
         f"{'what:':<{_FIELD_WIDTH}}{_WHAT.format(stamp=stamp, harness=harness)}",
