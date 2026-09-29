@@ -21,7 +21,10 @@ leg in `needs:` with no `LEGS` row still trips rule 1 (which greps the joined
 results for `failure|cancelled`), but a leg that reports `skipped` has NO row to
 fail closed on — so the required check would CERTIFY a shard the selector
 selected and GitHub never ran. That is #5219 (a green required check over a tree
-whose shard did not run) reached through the other door, and nothing pinned it.
+whose shard did not run) reached through the other door. `tests/test_ci_selection.py`
+already asserts this same set equality at test time; the guard re-asserts it at
+RUN time inside the aggregate job — defence in depth on the job that owns the
+required context, not the discovery of a gap.
 
 Hermetic: no network. The env seams (`MERGIFY_CONFIG`, `BRANCH_PROTECTION_DECLARATION`,
 `WORKFLOWS_DIR`, `PYTHON_CI_WORKFLOW`) point the guard at fixtures. The `--live`
@@ -1553,18 +1556,19 @@ def test_a_second_queue_rule_is_also_measured(guard, tmp_guard_env):
     assert len(problems) == 1 and "queue_rules[1]" in problems[0], problems
 
 
-def test_a_non_list_queue_rules_cannot_be_measured_by_every_reader(guard, tmp_guard_env):
-    """`read_injection_modes` owns a non-list guard too, and it is not dead.
+def test_a_non_list_queue_rules_is_a_cannot_measure_not_an_empty_list(guard, tmp_guard_env):
+    """PRESENT-but-unusable `queue_rules` is exit 2, not "declared nothing".
 
-    `load_mergify` fails closed first in `run()`, but this function is callable on
-    its own — and without its own guard a non-iterable `queue_rules` raises
-    TypeError from the comprehension, which is an UNANNOTATED traceback and a
-    non-2 exit. The documented exit-2 contract is the thing being protected here,
-    so the guard stays and is pinned rather than deleted as unreachable.
+    Returning `[]` reported an unreadable value as an absent one: the violation
+    that followed was exit 1 rather than exit 2, and a direct caller comparing
+    modes could read the empty list as success — a fail-open. Raising matches
+    `require_list`'s sibling behaviour and the module's own distinction between
+    absent and unusable.
     """
     for bad in ("queue_rules: 0\n", "queue_rules: {}\n", "queue_rules: nothing\n"):
         guard.MERGIFY_PATH.write_text(bad)
-        assert guard.read_injection_modes() == []
+        with pytest.raises(guard.CannotMeasure, match="present but not a list"):
+            guard.read_injection_modes()
 
 
 def test_no_queue_rule_at_all_is_a_violation(guard):

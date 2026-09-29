@@ -374,6 +374,14 @@ def read_injection_modes(path: Path | None = None) -> list[Any]:
 
     An ABSENT key comes back as None (Mergify's default is `queue`); a missing key
     inside a non-dict rule does too, since such a rule cannot be read either.
+
+    A `queue_rules` that is PRESENT but not a list raises `CannotMeasure` rather
+    than returning an empty list. Returning `[]` reported "no mode was declared"
+    for a value that is not a declaration at all: `check_injection_mode([])` then
+    reported a violation (exit 1) for a config whose real defect is that it could
+    not be READ, and a direct caller comparing modes could read the empty list as
+    success. "Present but unusable" is exit 2, which is the distinction this module
+    draws everywhere else.
     """
     path = path or MERGIFY_PATH
     try:
@@ -385,7 +393,9 @@ def read_injection_modes(path: Path | None = None) -> list[Any]:
             f"{path}: top level is not a mapping, got {type(cfg).__name__} — cannot measure")
     rules = cfg.get("queue_rules")
     if not isinstance(rules, list):
-        return []
+        raise CannotMeasure(
+            f"{path}: `queue_rules` is present but not a list, got "
+            f"{type(rules).__name__} — cannot measure")
     return [
         rule.get("branch_protection_injection_mode") if isinstance(rule, dict) else None
         for rule in rules
@@ -1051,7 +1061,10 @@ def check_gate_legs(needs: list[str], legs: set[str]) -> list[str]:
     has NO row to fail closed on — so the required check would CERTIFY a shard
     the selector selected and GitHub never ran. That is the #5219 shape (a
     green required check over a tree whose shard did not run) reached through
-    the other door, and nothing pinned it.
+    the other door. `tests/test_ci_selection.py` asserts the same set equality at
+    test time; this re-asserts it at RUN time inside the aggregate job itself —
+    defence in depth on the job that owns the required context, not the discovery
+    of a gap.
     """
     problems: list[str] = []
     as_set = set(needs)
