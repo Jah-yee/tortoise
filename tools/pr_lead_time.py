@@ -47,21 +47,37 @@ Design notes that are load-bearing:
 name was wrong (the interval is development + wait, not review — see the
 sub-split note in `measure()`) and there is NO review-wait figure in this report.
 
-* **"Entry-gate success" is the AND of the `.mergify.yml` `queue_conditions`**
-  (read at run time, never hardcoded — the set changed mid-window once). The
-  `merge_conditions` context `python-ci-gate` is deliberately EXCLUDED: it runs
-  on the queue branch `mergify/merge-queue/<sha>`, not on the PR head, so
-  requiring it here would leave every merged PR unmeasurable.
+* **"Entry-gate success" is the AND of the `.mergify.yml` `queue_conditions`
+  `check-success=` contexts** (read at run time, never hardcoded — the set
+  changed mid-window once). The OTHER conditions in that list (`base=main`,
+  `-draft`) are not applied, so a PR merged from a non-main base would still be
+  judged as if `base=main`. The gate also depends on
+  `branch_protection_injection_mode`: under the default `queue` the entry gate is
+  the REQUIRED set, not this list; this tool assumes `merge` and does not yet
+  read or assert the mode. The `merge_conditions` context `python-ci-gate` is
+  deliberately EXCLUDED: it runs on the queue branch `mergify/merge-queue/<sha>`,
+  not on the PR head, so requiring it here would leave every merged PR
+  unmeasurable.
+
+* **The newest-attempt key is `(app.slug, name)`, NOT `(app.slug, workflow,
+  name)`** — the rule the merge rail and `tools/merge_throughput.py` use. The two
+  agree for every context in the current entry set (all five are distinct job
+  names in one workflow), but a check name published by two workflows would let a
+  newer attempt in one shadow a red in the other — the failure
+  `tests/test_merge_throughput.py::`
+  `test_grouping_must_not_shadow_a_red_behind_a_newer_success_in_another_workflow`
+  pins for the sibling. A weak key, recorded rather than silently assumed.
 
 * **Author-based filtering is impossible on this repo.** Every agent
   authenticates as `daniel-ospina`, so the PR author and its reviewer share one
   login. "First activity" therefore excludes *bots only* — a rule stated in the
   output, because it is a limit on the measurement, not a detail.
 
-* **The window's gate is the CURRENT `.mergify.yml`.** `entry_gate_contexts` is
-  read at run time; if the required set changed mid-window, every PR in the
-  window is judged against the current set. The rule is stated in the output so a
-  reader can tell.
+* **The window's gate is the CURRENT `.mergify.yml`, applied RETROACTIVELY.**
+  `entry_gate_contexts` is read at run time; if the required set changed
+  mid-window, every PR in the window is judged against the current set, and the
+  set's CONSTANCY across the window is unestablished. The output does not restate
+  that caveat, so read the report with it in mind.
 
 * **The partition invariant is asserted, not hoped for.** Every closed human PR
   lands in exactly one terminal leg, the three legs reconcile to the population,
@@ -104,7 +120,45 @@ _BOT_LOGINS = {
 def ts(value: str | None) -> datetime | None:
     if not value:
         return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    # GitHub always sends an offset, but `--now` is operator-supplied and a bare
+    # date/instant parses NAIVE; comparing that against an aware timestamp raises
+    # TypeError. A naive value is therefore read as UTC.
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)  # noqa: UP017 — bare `python3` is 3.9
+
+
+def queue_entry(runs: list[dict]) -> datetime | None:
+    """Earliest start among the NONZERO-DURATION `Mergify Merge Queue` runs.
+
+    A zero-length run is the queue's EVALUATION probe, not residence: 109/109
+    merged human PRs carry at least one, and 31/109 open one within 60 s of the
+    PR (issue #6139, 2026-09-29T00:37Z). Counting one as entry collapses the
+    post-gate interval to 0 and charges the whole of (b) to "queue residence".
+    `None` means the head carries only zero-length probes — it has NO queue
+    marker, which is what `merged_without_queue_marker` counts.
+    """
+    starts: list[datetime] = []
+    for r in runs:
+        if r.get("name") != "Mergify Merge Queue":
+            continue
+        s, c = ts(r.get("started_at")), ts(r.get("completed_at"))
+        if s and c and c > s:
+            starts.append(s)
+    return min(starts) if starts else None
+
+
+def clamp_gate(gate: datetime | None, created: datetime,
+               merged_at: datetime) -> datetime | None:
+    """Clamp the entry gate into the PR's own life.
+
+    A head can already be green when the PR is CREATED (a branch cut from a
+    CI-passing commit), which puts the gate before `created_at`. Unclamped,
+    `seconds_a` goes negative and the partition invariant aborts the WHOLE run —
+    losing the entire report rather than one row (reproduced: PR #5137, created
+    2026-09-24T21:48:44Z with its gate ~18:49Z, a = -10762 s; 1 of 200 sampled).
+    Clamping here is the same treatment `fa` already gets.
+    """
+    return None if gate is None else min(max(gate, created), merged_at)
 
 
 def is_bot(user: dict | None) -> bool:
@@ -362,15 +416,10 @@ def ci_on_head(gh: Gh, repo: str, sha: str, contexts: list[str]) -> dict:
     """
     runs = check_runs(gh, repo, sha)
     gha = [r for r in runs if (r.get("app") or {}).get("slug") == "github-actions"]
-    mergify = [r for r in runs if r.get("name") == "Mergify Merge Queue"]
+    entry = queue_entry(runs)
     attempts: dict[str, int] = {}
     for r in gha:
         attempts[r.get("name")] = attempts.get(r.get("name"), 0) + 1
-    resident = [r for r in mergify
-                if ts(r.get("started_at")) and ts(r.get("completed_at"))
-                and ts(r.get("completed_at")) > ts(r.get("started_at"))]
-    starts = [ts(r.get("started_at")) for r in resident]
-    starts = [s for s in starts if s]
     all_span, newest_span = _span(gha, False), _span(gha, True)
     return {
         "span_seconds": all_span,
@@ -379,7 +428,7 @@ def ci_on_head(gh: Gh, repo: str, sha: str, contexts: list[str]) -> dict:
                                     newest_only=True),
         "rerun_seconds": (max(0.0, all_span - newest_span)
                           if all_span is not None and newest_span is not None else None),
-        "queue_enter_at": min(starts).isoformat() if starts else None,
+        "queue_enter_at": entry.isoformat() if entry else None,
         "attempts": len(gha),
         "reruns": sum(1 for c in attempts.values() if c > 1),
     }
@@ -413,7 +462,9 @@ def review_stats(reviews: list[dict]) -> dict:
     for r in reviews:
         state = (r.get("state") or "").upper()
         t = ts(r.get("submitted_at"))
-        if state == "APPROVED" and t:
+        # a bot approval is not human readiness: `first_activity()` already
+        # excludes bots, and `first_approval_at` feeds ready = max(gate, approval)
+        if state == "APPROVED" and t and not is_bot(r.get("user")):
             approvals.append(t)
         if state in ("CHANGES_REQUESTED", "COMMENTED") and t:
             rounds.add(f"{(r.get('user') or {}).get('login')}@{t.isoformat()}")
@@ -460,7 +511,10 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
 
     if prune_after is not None:
         human = sorted(human, key=lambda p: p.get("closed_at") or "", reverse=True)[:prune_after]
-        queue_prs = queue_prs[:0]
+        # deliberately NOT `queue_prs = queue_prs[:0]`: zeroing the queue
+        # population made the report print `queue_prs_closed_in_window=0` as if
+        # the queue were genuinely empty — the accounting error this file exists
+        # to prevent, reintroduced by a flag whose only purpose is to cut load.
 
     rows: list[dict] = []
     for pr in human:
@@ -525,14 +579,7 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             continue
 
         gate = gate_success(gh, repo, pr["number"], contexts, not_after=merged_at)
-        # A head can already be green when the PR is CREATED (a branch cut from a
-        # CI-passing commit), which puts the gate before created_at. Left alone,
-        # seconds_a goes negative and the invariant below aborts the WHOLE run,
-        # losing the entire report rather than one row (reproduced: PR #5137,
-        # created 2026-09-24T21:48:44Z with its gate ~18:49Z, a = -10762 s; 1 of
-        # 200 sampled rows). Clamp into the PR's own life, as `fa` already is.
-        if gate is not None:
-            gate = min(max(gate, created), merged_at)
+        gate = clamp_gate(gate, created, merged_at)
         row["gate_success_at"] = gate.isoformat() if gate else None
         if gate is None:
             row["leg"] = "unknown"
@@ -704,7 +751,10 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             "the latest of their completions; the PR value is the earliest "
             "satisfying commit, and a completion after merged_at is rejected "
             "(the queue re-checks on the queue branch). `merge_conditions` "
-            "(python-ci-gate) is excluded: it reports on the queue branch, not the head."
+            "(python-ci-gate) is excluded: it reports on the queue branch, not the head. "
+            "The set is read NOW and applied to EVERY PR in the window; its constancy "
+            "across the window is not established, and the non-check conditions in "
+            "`queue_conditions` (base=main, -draft) are not applied."
         ),
         "rule_first_activity": (
             "earliest review submission, review comment, or issue comment by a "
@@ -893,8 +943,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    print(render(result))
-    print(f"(gh calls={gh.calls} cache_hits={gh.cache_hits})")
     # "never 0 on an unobserved read" (tools/ci_timing.py:454). The siblings pin
     # this with test_empty_enumeration_is_unknown_not_zero and
     # test_record_refuses_an_empty_enumeration_as_unknown_not_zero.
@@ -908,6 +956,11 @@ def main(argv: list[str] | None = None) -> int:
         print("UNKNOWN: the window produced an EMPTY population — nothing was "
               "observed", file=sys.stderr)
         return 2
+    # render() after the guards, not before: an empty or truncated result is
+    # missing the keys it reads, so rendering first would raise and exit 1 —
+    # the code reserved for a verdict — instead of UNKNOWN (2).
+    print(render(result))
+    print(f"(gh calls={gh.calls} cache_hits={gh.cache_hits})")
     return 0
 
 
