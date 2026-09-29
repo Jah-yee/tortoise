@@ -813,17 +813,17 @@ def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
 # change the EXIT CODE or the VERDICT, plus the four that could turn the
 # documented exit 2 into an unannotated traceback.
 #
-# It is NOT a claim that every branch is pinned. The branches whose deletion leaves
-# this suite green are exactly these, and each is redundant rather than uncovered:
+# It is NOT a claim that every branch is pinned. Exactly ONE branch survives
+# deletion, and it is redundant rather than uncovered:
 #
-#   1. `_raw_settings_entries`' `except OSError` — `read_yaml`'s stat guard already
-#      converts that OSError to CannotMeasure, so only the message differs.
-#   2. `os.lstat`'s `NotADirectoryError` arm — a path whose PARENT is a file cannot
-#      be constructed portably in a test; the arm only decides absent-vs-
-#      unmeasurable for that shape.
+#   `_raw_settings_entries`' `except OSError` — `read_yaml`'s stat guard already
+#   converts that OSError to CannotMeasure, so only the message differs.
 #
-# Anything not on that list reddens on deletion. Verified by mutating each branch
-# in turn and re-running this file.
+# Anything not on that list reddens on deletion. Two branches previously listed
+# here were removed from the list by PINNING them instead: `yaml.safe_load`'s
+# MemoryError, and `os.lstat`'s `NotADirectoryError` arm (which an earlier version
+# of this comment wrongly called unconstructible — a path whose parent is a FILE
+# raises it on POSIX and Windows alike).
 
 
 @pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
@@ -1200,6 +1200,34 @@ def test_a_live_run_reports_the_live_note(guard, tmp_guard_env, monkeypatch):
     assert any(n.startswith("LIVE required    :") and "alpha" in n for n in notes), notes
     _, _, offline = guard.run(live=False)
     assert any("not read (offline mode" in n for n in offline), offline
+
+
+def test_an_unparsable_document_too_large_for_memory_cannot_be_measured(guard, tmp_guard_env, monkeypatch):
+    """The parser needs its OWN MemoryError guard, separate from the read's.
+
+    A document small enough to READ can still fail to PARSE into an object graph
+    that fits; that MemoryError escaped as an unannotated traceback.
+    """
+    guard.SETTINGS_PATH.write_text("repository: {}\n")
+
+    def fake_load(*a, **k):
+        raise MemoryError("cannot allocate")
+
+    monkeypatch.setattr(guard.yaml, "safe_load", fake_load)
+    with pytest.raises(guard.CannotMeasure, match="too large to parse"):
+        guard.declared_settings_contexts()
+
+
+def test_a_mirror_path_whose_parent_is_a_file_is_absent(guard, tmp_guard_env, monkeypatch):
+    """`os.lstat`'s `NotADirectoryError` arm — constructible on POSIX and Windows.
+
+    `parent/settings.yml` where `parent` is a FILE raises NotADirectoryError; that
+    is a path with no directory entry, so the mirror is absent (skip), not a crash.
+    """
+    blocker = tmp_guard_env / "afile"
+    blocker.write_text("not a directory\n")
+    monkeypatch.setattr(guard, "SETTINGS_PATH", blocker / "settings.yml")
+    assert guard.declared_settings_contexts() is None
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
