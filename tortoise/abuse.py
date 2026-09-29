@@ -721,7 +721,6 @@ class AbuseEngine:
             except Exception as e:
                 report_abuse_decision_fault(
                     "clean_window_episode_end", org_id, rule, e)
-                logger.debug("abuse flag_clear failed for %s/%s", org_id, rule)
             if ended:
                 # Episode CONFIRMED over: re-arm the alert budget so a NEW
                 # episode alerts again (#3631 — per-episode, not a wall-clock
