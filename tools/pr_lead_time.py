@@ -84,6 +84,21 @@ sub-split note in `measure()`) and there is NO review-wait figure in this report
   a reader of the prose alone sees a gate number with no note that it is
   retroactive.
 
+* **Every CI figure here is EXECUTION, and it EXCLUDES runner allocation.**
+  Measured 2026-09-29 by joining check-runs to Actions jobs on the job id embedded
+  in `details_url`: `cr.started_at == job.started_at` and
+  `cr.completed_at == job.completed_at` to 0.00 min on all 14 jobs of a
+  36.60-min run — the check-run boundary IS the job boundary, so every CI-TIME
+  figure here is job execution and never the run's `created_at -> updated_at`
+  (169.28 min on that same run, inflated by every re-run). The COROLLARY is a
+  limit: a check-run carries no RUNNER-QUEUE time, so each CI-time figure here is
+  a LOWER BOUND on what CI actually charges to lead time. Do not confuse that with
+  the `queue_enter_at` field, which is the Mergify MERGE-QUEUE marker and is
+  excluded from every CI figure. Runner wait measured 12-33 min median per job on
+  that population — larger than execution for every surface except
+  test (a)/(b)/test-carve-out. Sharding moves this axis; it does not move the
+  queue, so do not quote an improvement here as a lead-time improvement.
+
 * **The partition invariant is asserted, not hoped for.** Every closed human PR
   lands in exactly one terminal leg, the three legs reconcile to the population,
   each PR's legs sum to its own elapsed time, and no segment is negative.
@@ -418,6 +433,15 @@ def ci_on_head(gh: Gh, repo: str, sha: str, contexts: list[str]) -> dict:
                            force-pushed PR this is the queue entry of the head
                            that was merged). `None` when the head carries only
                            zero-length evaluation probes — it has NO queue marker.
+
+    Every CI-TIME figure returned here is job EXECUTION: the check-run `started_at` /
+    `completed_at` boundary was verified equal to the Actions job boundary (0.00
+    min delta on all 14 jobs, 2026-09-29), and the run-level
+    `created_at` / `updated_at` is deliberately NOT used. The time figures therefore
+    EXCLUDE runner allocation, which a check-run does not expose at all — each is a
+    LOWER BOUND on the CI charge to lead time. (The `attempts` / `reruns` counts and
+    `queue_enter_at` are not time figures; `queue_enter_at` is the Mergify merge-queue
+    marker, never runner wait.)
     """
     runs = check_runs(gh, repo, sha)
     gha = [r for r in runs if (r.get("app") or {}).get("slug") == "github-actions"]
