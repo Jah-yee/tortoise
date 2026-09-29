@@ -548,20 +548,35 @@ def _session_llm_transcript(conversation: list[dict]) -> tuple[str, int]:
         # test extracted 3 points where pre-#4897 extracted 1, the two extra being the two
         # markers. Judging the MARKER-FREE body with the SAME >=3-char predicate the sentence
         # filter below applies is what makes the skip agree with what the turn can contribute.
-        body_only, _marker = _split_truncation_marker(content)
+        # ⛔ AND THE MARKER IS ATTACHED, NOT APPENDED (#4897 review round 16, P1). Testing the
+        # marker-free body is NECESSARY BUT NOT SUFFICIENT. The round-15 form still built the
+        # line from the WHOLE content, and `_SENT` takes a run of NON-terminators plus AT MOST
+        # one terminator — so for a clipped turn whose retained body happens to END with a
+        # sentence terminator (keep = cap - len(marker), i.e. "character `keep` is a '.'",
+        # ~1 in 80 in prose) the marker sits AFTER that terminator and `_SENT` carves it into a
+        # SECOND match. `_utterances` then yields it as its own utterance and `LLMExtractor.run`
+        # mints one Point per utterance 1:1 — a Point whose entire content is this module's own
+        # marker. Measured on `"a" * 4958 + "." + " " * 500`: this branch extracted 3 points
+        # where `origin/main` extracted 2, the extra being the marker. Appending the marker to
+        # the last sentence does NOT fix it (the terminator is between them); it is placed
+        # INSIDE the final sentence, immediately before that sentence's own terminator, so
+        # marker and sentence are ONE `_SENT` match. The node still stores the marker verbatim
+        # as written; this is the TRANSCRIPT view, and relocating it within the turn is what
+        # lets it reach the model WITHOUT becoming a claim of its own.
+        body_only, marker = _split_truncation_marker(content)
         real = " ".join(body_only.split())
-        if not any(len(s.group(0).strip()) >= 3 for s in _SENT.finditer(real)):
-            continue
-        # #4897: the extraction input is the SAME marked window the node
-        # stores — the caller passes `_capture_turn_window`'s output (the
-        # windowed, cap-applied conversation), so the marker and its TRUE
-        # pre-redaction length ride through here untouched. Re-clipping it
-        # would recompute that length from already-scrubbed text (see the
-        # CALLER CONTRACT above) and break #721 parity when the marker matters.
-        body = " ".join(content.split())
-        sents = [s.group(0).strip() for s in _SENT.finditer(body)]
+        sents = [s.group(0).strip() for s in _SENT.finditer(real)]
         sents = [s for s in sents if len(s) >= 3]
+        if not sents:
+            continue
+        # Cap BEFORE attaching: `MAX_EXTRACTIONS_PER_TURN` keeps the FIRST 200 sentences and
+        # the marker belongs to the LAST of them, so attaching first let a flood turn drop the
+        # marker from the transcript while the stored node still carried it.
         capped = sents[:MAX_EXTRACTIONS_PER_TURN]
+        if marker:
+            last = capped[-1]
+            capped[-1] = (f"{last[:-1]} {marker}{last[-1]}" if last[-1] in ".!?"
+                          else f"{last} {marker}")
         n_sentences += len(capped)
         if capped:
             lines.append(f"{speaker}: {' '.join(capped)}")
