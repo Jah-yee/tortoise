@@ -235,7 +235,7 @@ jobs:
     # raw-client probes in test_search_engine et al.).
     services:
       falkordb:
-        image: falkordb/falkordb-server:latest
+        image: falkordb/falkordb-server:v4.20.4
         env:
           # #2216: no periodic RDB snapshot in this lane. Redis refuses a second
           # fork while any child is active ("Can't fork for module: File exists"
@@ -259,7 +259,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       falkordb-legacy:
-        image: falkordb/falkordb-server:latest
+        image: falkordb/falkordb-server:v4.20.4
         env:
           # #2216: same no-periodic-snapshot rule as the passworded falkordb
           # service above (see there for the mechanism + the reproduced
