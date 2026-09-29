@@ -473,7 +473,7 @@
       ]
     ]
   },
-  "gate_digest": "537d96d656dd2b9886951ee2d03b66a56fb8af5a2aa132ae5ed16dbe0f0ef3e6",
+  "gate_digest": "3b249c85901ce86ef7ec92d9bbc32d5328b3eafb73ff97b6f5826718adf7364b",
   "live_checked_at": "2026-09-28T05:36:59Z",
   "live_observed_contexts": [
     "docs",
@@ -495,5 +495,5 @@
     "test-isolation"
   ],
   "settings_home_consistent": false,
-  "verified_at": "2026-09-29T07:45:58Z"
+  "verified_at": "2026-09-29T19:24:51Z"
 }

@@ -167,13 +167,52 @@ queue_rules:
     batch_size: 4
     batch_max_wait_time: 5 min
 
-# ── Auto-queue: finished work enters the queue with no human click (#3016) ─────
+# ── Auto-queue: OFF since 2026-09-29 (#6238) ──────────────────────────────────
 #
-# WHAT THIS SETS
-#   `merge_protections_settings.auto_merge_conditions: true`. A PR matching
-#   `queue_conditions` above is then queued automatically. Without it, Mergify
-#   posts "Tick the box to add this pull request to the merge queue" and waits
-#   for a human.
+# WHAT IS SET NOW
+#   NOTHING. `merge_protections_settings.auto_merge_conditions` is deliberately
+#   ABSENT — which is the only supported way to disable auto-merge. Do NOT
+#   "fix" it to `false`: the schema REJECTS that (see HOW TO RESTORE).
+#
+# WHY IT IS OFF (measured 2026-09-29 ~18:35Z — #6238; graph node 1a0ee912a17)
+#   With it on, entry was automatic for every PR satisfying the protections
+#   (~137 open), and because Mergify re-evaluates as heads move it re-cut its
+#   batches continuously. Over 300 recent runs: 188 on `mergify/merge-queue/*`
+#   against 112 on everything else, 26 distinct batch branches, and 99 batch
+#   runs created in 20 minutes (~5/min, FLAT across 45 minutes: 19,29,24,24,
+#   26,24,17,22 per 5-min bucket). Of the 90 completed batches: CANCELLED 46,
+#   skipped 23, success 21. The CANCELLATIONS, not the failures, are the
+#   signal — the queue was churning, not mis-verifying.
+#   Two costs, both measured:
+#     · COST 1 — the queue is occupied by its own churn, so a newly-green PR
+#       cannot be admitted. That is the candidate cause of the 10.11 h median
+#       admission wait #6238 files as cause-NOT-identified. (#6238's own
+#       candidate, the `ai-review-gate` red, is separately refuted: node
+#       1a0e9956121 shows 14 batches at 0 success while merges continued.)
+#     · COST 2 — the batches hold the runner pool, so ordinary PR CI waits 40+
+#       minutes JUST TO START (measured queued: 43.0 / 42.1 / 42.0 / 41.5 /
+#       41.2 / 40.5 min on six branches). The real gate latency is therefore
+#       ~40 min of queue wait PLUS ~19 min of run — not the 18.8 min median a
+#       completed-run measurement reports, which silently excludes the wait.
+#
+# WHY THIS IS SAFE, AND WHAT IT TRADES AWAY
+#   Landings continue through the LOCAL rails — `scripts/atomic-land.sh` and
+#   `scripts/admin-merge.sh` — which are the paths that carry the head-bound
+#   review attestation. The queue is the LESS safe path: #5433 records that
+#   Mergify merges server-side and NO step on that path reads the review record.
+#   So this trades an unsafe, thrashing auto-land for the disciplined local rail
+#   while the backlog drains.
+#
+# HOW TO RESTORE
+#   Re-add exactly this pair of lines:
+#       merge_protections_settings:
+#         auto_merge_conditions: true
+#   `true` (unconditional) or a list of conditions are the accepted values; the
+#   schema REJECTS `false` and any mapping, and an explicit `null` is accepted
+#   but means the same as omitting the field (Mergify docs, Merge Protections →
+#   Auto-Merge → "Accepted and rejected values"). Restoring it is a DECISION,
+#   not a cleanup: read #6238 first, and re-measure the batch-creation rate
+#   after, because the churn it stops is the baseline those numbers came from.
 #
 #   ⚠️ The `pull_request_rules` section of this file is NOT LOADED. Mergify
 #   reports it unused — "The product Workflow Automation needs to be activated
@@ -183,8 +222,12 @@ queue_rules:
 #   until Workflow Automation is activated for this repository.
 #
 #   `merge_protections_settings` IS loaded — Mergify's own message says the rest
-#   of the configuration will be used — which is why this setting, and not that
-#   rule, is what actually queues finished work.
+#   of the configuration will be used — so this FILE, not a dashboard value, is
+#   where the switch lives. Mergify's own file-format reference lists
+#   `merge_protections_settings` as a top-level key of this file; the dashboard
+#   only ENABLES Merge Protections, it does not hold this value. (The one thing
+#   to re-check if a future change here has no effect is the other direction —
+#   see the falsifier below.)
 #
 # WHY NOT `autoqueue: true`
 #   `queue_rules[].autoqueue` is deprecated and maps to this setting. The two are
@@ -193,13 +236,26 @@ queue_rules:
 #
 # WHAT STILL GATES A MERGE
 #   `queue_conditions` above still gate entry, and `merge_conditions` is
-#   re-asserted against the queue branch before that branch is merged. This
-#   setting removes the click. It removes no check.
+#   re-asserted against the queue branch before that branch is merged. Turning
+#   auto-merge off removes the automatic ENTRY; it removes no check.
+#
+# THE FALSIFIER — how you will know this lever did not take
+#   Within a few minutes of this landing on `main`, a PR that satisfies
+#   `queue_conditions` must STOP being auto-queued, and Mergify should instead
+#   offer its "Queue this pull request" control. If auto-queueing CONTINUES
+#   with the field absent, then the value is NOT read from this file (a
+#   dashboard-side override) — that is the one outcome that would refute the
+#   premise above, and it is cheap to check: `tools/merge_throughput.py check
+#   queue-entry --pr <n> --require-fresh` reads the Mergify check-run's
+#   `Entered queue` line and reports its trigger (`auto_merge_conditions` vs a
+#   human `@mergifyio queue`).
 #
 # DO NOT RESTATE THE REASONING HERE
 #   Reasoning belongs where it can be maintained and cited, not duplicated into a
 #   comment that nothing re-reads:
-#     · #3016 — the base race this queue exists to remove
+#     · #6238 — the admission wait, and the batch-churn measurement above
+#     · #3016 — the base race this queue exists to remove; its auto-queue half is
+#       what this change PAUSES (the queue itself stays, reachable by hand)
 #     · #5215 — merge throughput, and what the click actually cost
 #     · #5426 — `ai-review-gate` is red whenever no valid recorded review marker
 #       exists for the PR, and it is not a required context
@@ -208,8 +264,6 @@ queue_rules:
 #       server-side, so no step on that path reads it
 #   ⛔ Never write "the review attestation is an enforced gate" here or anywhere
 #   else. It is enforced on local land paths only, never on a queue merge.
-merge_protections_settings:
-  auto_merge_conditions: true
 
 # NOTE: `batch_size` is deliberately NOT mutated here. Raising it and this
 # change are separate levers and separate reviews; PR #5384 owns batch_size.
