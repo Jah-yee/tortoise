@@ -1599,9 +1599,15 @@ def test_the_injection_mode_is_checked_through_run(guard, tmp_guard_env, monkeyp
     "${{  FALSE  }}",
     "${{ 0 }}",
     "${{ null }}",
+    "${{ '' }}",      # the EMPTY constant, wrapped
     "null",
     "0",
     0,
+    "",
+    '""',             # two characters — a DIFFERENT input from the empty string
+    "''",
+    "-0",
+    "0.0",
 ])
 def test_a_literally_falsy_if_is_gated_off(guard, cond):
     """A LITERAL falsy `if:` is the ONE decidable case: the job can never run.
@@ -1628,6 +1634,32 @@ def test_a_non_falsy_or_absent_if_stays_producible(guard, cond):
     `${{ }}` rows check that normalising does not over-reach into the truthy side.
     """
     assert guard._gated_off_pr_refs({"if": cond}) is False, cond
+
+
+def test_an_empty_string_if_is_gated_off_through_yaml(guard, tmp_guard_env):
+    """`if: ''` must reach the falsy set through a real YAML parse.
+
+    The direct-`dict` test above cannot see the transformation that matters:
+    `if: ''` parses to the ZERO-character string, not to the two-character `'""'`.
+    Listing only the two-character forms left this case producible while looking
+    covered, so it is pinned end-to-end here.
+    """
+    guard.WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    (guard.WORKFLOWS_DIR / "pr.yml").write_text(
+        "on:\n  pull_request:\njobs:\n"
+        "  alive:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n"
+        "  blank:\n    if: ''\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - run: 'true'\n"
+        "  dquoted:\n    if: \"\"\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - run: 'true'\n"
+        "  wrapped:\n    if: \"${{ '' }}\"\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - run: 'true'\n")
+    names = guard.producible_on_pull_request()
+    assert "alive" in names
+    for never in ("blank", "dquoted", "wrapped"):
+        assert never not in names, (
+            f"{never!r} is gated on a falsy constant, so it never produces a check "
+            f"run; counting it producible is a false GREEN in the deadlock checks")
 
 
 def test_a_never_running_job_is_not_producible(guard, tmp_guard_env):

@@ -167,7 +167,14 @@ CHECK_SUCCESS_PREFIX = "check-success="
 # `_is_literally_off` — these are decidable, unlike a real expression. Compared
 # AFTER `_normalise_if`, so the `${{ }}` wrapper and any inner whitespace are
 # already gone: `${{false}}`, `${{ 0 }}` and `${{ null }}` all land here.
-_FALSY_IF_STRINGS = frozenset({"false", "0", "null", '\"\"', "''"})
+#
+# The EMPTY STRING is the entry that matters most and is easiest to get wrong:
+# `if: ''` and `if: ""` parse to `""` (zero characters), NOT to the two-character
+# string `'""'`. Listing only the two-character forms left `if: ''` PRODUCIBLE —
+# a false GREEN — while looking like the empty case was covered.
+_FALSY_IF_STRINGS = frozenset({
+    "false", "0", "-0", "0.0", "null", "", '\"\"', "''",
+})
 
 
 def _normalise_if(condition: str) -> str:
@@ -417,6 +424,11 @@ def _is_literally_off(condition: Any) -> bool:
     only producer is such a job would read as arriving forever while the merge waits
     for it. `None` is deliberately NOT falsy here — an absent (or explicitly null)
     `if:` means the job RUNS.
+
+    LIMIT, so this is not over-trusted: this classifies CONSTANTS. `if: ${{ 3-3 }}`
+    is an expression that evaluates falsy and is deliberately NOT recognised —
+    classifying arbitrary expressions is the trade `_gated_off_pr_refs` documents,
+    and guessing there would manufacture false deadlocks.
     """
     if condition is False:
         return True
