@@ -1655,6 +1655,20 @@ def test_the_injection_mode_is_checked_through_run(guard, tmp_guard_env, monkeyp
     "''",
     "-0",
     "0.0",
+    # Exponent forms. GitHub numbers are "any number format supported by JSON", so
+    # these are ALL the number zero — but YAML 1.1 does not resolve them (its float
+    # pattern wants a dot or a SIGNED exponent), so PyYAML hands them over as `str`
+    # and the numeric arm never sees them. Undecoded, each was called PRODUCIBLE.
+    # These rows are the ONLY thing pinning `_is_a_zero_number`: deleting it leaves
+    # them green, because every OTHER falsy row is caught by `_FALSY_IF_STRINGS` or
+    # by the `(int, float)` arm without it.
+    "0e0",
+    "0E0",
+    "-0e0",
+    "0.0e0",
+    "0e+0",
+    "${{ 0e0 }}",
+    "${{ 0.0e0 }}",
 ])
 def test_a_literally_falsy_if_is_gated_off(guard, cond):
     """A LITERAL falsy `if:` is the ONE decidable case: the job can never run.
