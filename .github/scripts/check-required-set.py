@@ -315,6 +315,14 @@ def _triggers(workflow: dict[str, Any]) -> set[str]:
 
 
 _PR_IS_PUSH = re.compile(r"github\.event_name\s*==\s*['\"]push['\"]")
+# A POSITIVE comparison against any NON-PR event is exactly as decisive as
+# `== 'push'`: a job gated `github.event_name == 'schedule'` can no more report on
+# a PR ref than a push-gated one. Matching only `push` left `schedule`,
+# `workflow_dispatch`, `issues`, ... classified PRODUCIBLE — a false GREEN in the
+# deadlock check, the one direction that guard must never fail in. The lookahead
+# excludes the PR events, which the check below already excludes anyway.
+_PR_IS_OTHER_EVENT = re.compile(
+    r"github\.event_name\s*==\s*['\"](?!pull_request(?:_target)?['\"])[A-Za-z_]+['\"]")
 _PR_IS_NOT_PULL_REQUEST = re.compile(
     r"github\.event_name\s*(?:!=|<>)\s*['\"]pull_request(?:_target)?['\"]")
 _PR_IS_PULL_REQUEST = re.compile(
@@ -333,18 +341,20 @@ def _gated_off_pr_refs(job: dict[str, Any]) -> bool:
     `"pull_request" in condition` test also swallowed the NEGATED form
     (`!= 'pull_request'`), which is just as push-only as `== 'push'`.
 
-    LIMIT, stated so it is not over-trusted: only these DECISIVE shapes are
-    treated as unproducible. Anything else — including an `if:` we cannot
-    classify — counts as producible, because the opposite default would turn an
-    unrecognised expression into a false DEADLOCK on a healthy check, which is a
-    worse failure than the false negative being closed.
+    LIMIT, stated so it is not over-trusted: the POSITIVE comparisons classified
+    here are `== 'push'` and `== '<any other non-PR event>'`. An `if:` we cannot
+    classify at all — an arbitrary expression, a `contains()`, a comparison against
+    something that is not a quoted event name — still counts as producible,
+    because the opposite default would turn an unrecognised expression into a
+    false DEADLOCK on a healthy check, which is a worse failure than an unclosed
+    false negative.
     """
     condition = job.get("if")
     if not isinstance(condition, str):
         return False
     if _PR_IS_PULL_REQUEST.search(condition):
         return False  # names a PR event positively; it CAN run on a PR ref
-    if _PR_IS_PUSH.search(condition):
+    if _PR_IS_PUSH.search(condition) or _PR_IS_OTHER_EVENT.search(condition):
         return True
     return bool(_PR_IS_NOT_PULL_REQUEST.search(condition))
 
@@ -579,8 +589,34 @@ def declared_settings_contexts(path: Path | None = None) -> set[str] | None:
         if not _is_main(entry):
             continue
         rsc = _required_status_checks(entry)
-        contexts |= {str(c) for c in (rsc.get("contexts") or [])}
+        contexts |= _settings_contexts(rsc, path)
     return contexts
+
+
+def _settings_contexts(rsc: dict[str, Any], path: Path) -> set[str]:
+    """The mirror's `contexts` for one entry, with ELEMENT types validated.
+
+    `str(c)` used to coerce every element, so `contexts: [5, null]` silently became
+    `{'5', 'None'}` — an unvalidated input in the one file whose whole purpose is
+    to be compared exactly. A non-string can never equal a real check name, so this
+    was never a fail-open; it is refused for the same reason the live path refuses
+    it: a value we cannot read is a value we cannot measure.
+
+    The LIST shape is deliberately NOT re-checked here — `_required_status_checks`
+    already refuses a non-list `contexts` (and is the only caller-visible guard on
+    that), so a `require_list` here would be unreachable for every caller in this
+    module and no test could detect its removal. Element types are this function's
+    own contribution.
+    """
+    entries = rsc.get("contexts")
+    if entries is None:
+        return set()
+    for ctx in entries:
+        if not isinstance(ctx, str):
+            raise CannotMeasure(
+                f"{path}: contexts must be strings, got {type(ctx).__name__}"
+                " — cannot measure")
+    return set(entries)
 
 
 def declared_settings_off_main(path: Path | None = None) -> list[str]:

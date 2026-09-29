@@ -453,6 +453,39 @@ def test_a_blank_needs_entry_cannot_be_measured(guard, tmp_guard_env):
         guard.gate_legs()
 
 
+def test_a_non_string_settings_context_cannot_be_measured(guard, tmp_guard_env):
+    """The mirror must shape-validate contexts, as the live path does — no `str()`.
+
+    The anchor is this guard's OWN message. An earlier version anchored on the
+    bare `"must be a list"` and passed for the wrong reason: the parser's
+    `required_status_checks` guard raised first and matched, so removing the
+    element check entirely left the test green.
+    """
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        strict: false\n"
+        "        contexts:\n          - 5\n          - docs\n")
+    with pytest.raises(guard.CannotMeasure, match="contexts must be strings"):
+        guard.declared_settings_contexts()
+
+
+def test_a_non_list_settings_contexts_cannot_be_measured(guard, tmp_guard_env):
+    """Pins the PARSER's list-shape guard, reached through this entry point.
+
+    Anchored on the parser's message because that is the guard that fires: the
+    list shape is enforced in `_required_status_checks`, not in
+    `_settings_contexts`. This asserts the end-to-end behaviour, not a guard in
+    `_settings_contexts` (which deliberately does not re-check the shape).
+    """
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        strict: false\n"
+        "        contexts: false\n")
+    with pytest.raises(guard.CannotMeasure,
+                       match="required_status_checks\\.contexts must be a list"):
+        guard.declared_settings_contexts()
+
+
 def test_a_dangling_symlink_at_the_mirror_path_is_not_read_as_absent(guard, tmp_guard_env):
     """A BROKEN SYMLINK is a present directory entry, not a missing mirror.
 
@@ -533,6 +566,12 @@ def test_a_string_contexts_is_refused_not_iterated(guard, tmp_guard_env):
     ("github.event_name != 'pull_request'", True),
     ("github.event_name != 'pull_request_target'", True),
     ("github.event_name == 'push' || github.event_name == 'pull_request'", False),
+    # A POSITIVE comparison against any other non-PR event is as decisive as
+    # `== 'push'`. Matching only `push` classified these PRODUCIBLE — a false GREEN.
+    ("github.event_name == 'schedule'", True),
+    ("github.event_name == 'workflow_dispatch'", True),
+    ("github.event_name == 'issues'", True),
+    ("github.event_name == 'pull_request_target'", False),
     ("github.event_name == 'pull_request'", False),
     ("needs.changes.outputs.python == 'true'", False),
 ])
@@ -674,9 +713,15 @@ def test_a_non_string_step_run_cannot_be_measured(guard, tmp_guard_env, value):
         guard.gate_legs()
 
 
-@pytest.mark.parametrize("value", ["0", "false", "''"])
+@pytest.mark.parametrize("value", ["0", "false"])
 def test_a_falsy_non_list_needs_cannot_be_measured(guard, tmp_guard_env, value):
-    """`needs: 0` must not be read as `needs: []` — the same shape as `needs: 5`."""
+    """`needs: 0` must not be read as `needs: []` — the same shape as `needs: 5`.
+
+    `''` is deliberately NOT a row here: it is a STRING, so the scalar branch
+    accepts it as `[""]` and the raise comes from the blank-element guard, not the
+    shape guard this test exists to pin. It is covered by
+    `test_a_blank_needs_entry_cannot_be_measured`.
+    """
     _write_gate_with_a_bad_shape(guard, needs=value)
     with pytest.raises(guard.CannotMeasure):
         guard.gate_legs()
