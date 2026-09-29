@@ -4375,13 +4375,31 @@ class TortoiseSDK:
             # process-global union — the same decision the hosted commit door
             # enforces server-side, so the client never POSTs a payload it
             # knows the door will 422.
-            l1, _model = validate_payload_dict(
-                payload, vocab=compile_vocab(
-                    installed_namespaces=_installed_namespaces_for_gate(self)))
-            if not l1.ok:
-                for field, reasons in l1.errors.items():
-                    for r in reasons:
-                        l1_errors.append(f"Layer-1 {field}: {r}")
+            #
+            # #5339: the resolver RAISES on a bound-but-unreachable graph
+            # (pack_state's documented posture — an outage must never read as
+            # "no packs"). That must not escape this public entry point, and
+            # it must not degrade to the ungated union either: ``None`` means
+            # NO gate, which WIDENS the allowed kind set. The sibling
+            # resolver call in ``extract_session_v2`` handles the same outage
+            # by DISABLING the gated pass (``classify_later = False``) and
+            # recording the error — same fail-closed direction here: skip the
+            # L1 pre-check and surface the failure in ``errors`` so the
+            # result is a structured ``ok=False`` and nothing is POSTed.
+            try:
+                gate = _installed_namespaces_for_gate(self)
+            except Exception as e:  # noqa: BLE001, RUF100 — an outage must
+                # never raise out of a public method, and must never widen
+                # the gate to the catalog union (see above).
+                errors.append(
+                    f"Layer-1 gate resolution failed: {type(e).__name__}: {e}")
+            else:
+                l1, _model = validate_payload_dict(
+                    payload, vocab=compile_vocab(installed_namespaces=gate))
+                if not l1.ok:
+                    for field, reasons in l1.errors.items():
+                        for r in reasons:
+                            l1_errors.append(f"Layer-1 {field}: {r}")
         if l1_errors:
             errors = l1_errors + errors
         result = {

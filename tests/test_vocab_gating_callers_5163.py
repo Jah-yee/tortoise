@@ -258,6 +258,104 @@ class TestCaller2SdkV1Wiring:
         assert any("objectKind" in e for e in out["errors"]), out["errors"]
 
 
+class TestCaller2SdkV2GateOutage:
+    """#5339 review (P2) — a graph outage must not RAISE out of the SDK's
+    client-side Layer-1 pre-check, and must not WIDEN the gate either.
+
+    ``_installed_namespaces_for_gate`` resolves the gate through
+    ``pack_state.graph_installed_namespaces``, which RAISES on a
+    bound-but-unreachable graph (its documented posture: an outage must never
+    read as "no packs"). ``_commit_session_v2`` resolved it OUTSIDE any error
+    handling, so a transient outage propagated a raw driver exception out of
+    the public ``commit_session`` — breaking the method's own contract
+    ("Errors are surfaced (ok=False) with the payload for inspection").
+
+    The fix follows the sibling resolver call in ``extract_session_v2``: on
+    failure it DISABLES the gated pass (there, ``classify_later = False``)
+    and records the error, never falling back to the ungated union. The
+    fail-closed direction matters — ``installed_namespaces=None`` means NO
+    gate and would silently admit another pack's kinds.
+
+    FAIL-ON: the resolver raise escapes ``_commit_session_v2`` (and
+    ``commit_session``), so the call raises instead of returning a result.
+    REACHABLE: the graph handle IS bound (a real SDK), and the resolver is
+    patched to raise exactly as an unreachable graph does.
+    """
+
+    @staticmethod
+    def _outage_sdk(tmp_path):
+        from tortoise.sdk import TortoiseSDK
+        return TortoiseSDK(db_path=str(tmp_path / "g5339.db"),
+                           namespace="test_g5339_v2")
+
+    @staticmethod
+    def _payload():
+        """A Layer-1-VALID payload carrying ``marketing:contentBrief`` — a
+        kind the catalogue union ADMITS and a dev-only graph REJECTS. If the
+        outage degraded to the union this payload would validate and POST,
+        so the assertions below also pin the fail-closed direction."""
+        from tests.test_commit_schema import _finalize, _point, _raw_payload
+        return _finalize(_raw_payload(
+            points=[_point(0, pointKind=MARKETING_POINT)], session_id="s5339"))
+
+    def test_v2_gate_outage_returns_a_structured_result_not_a_raise(
+            self, tmp_path, monkeypatch):
+        import tortoise.extractor_v2 as ex_mod
+        import tortoise.pack_state as ps_mod
+        from tortoise import sdk as sdk_mod
+
+        payload = self._payload()
+        monkeypatch.setattr(ex_mod, "extract_session_v2",
+                            lambda *a, **k: {"payload": payload, "errors": [],
+                                             "warnings": []})
+
+        def _unreachable(*a, **k):
+            raise RuntimeError("graph unreachable (simulated outage)")
+        monkeypatch.setattr(ps_mod, "graph_installed_namespaces", _unreachable)
+
+        posted = []
+        monkeypatch.setattr(sdk_mod, "_post_commit",
+                            lambda *a, **k: posted.append(a) or {"ok": True})
+
+        sdk = self._outage_sdk(tmp_path)
+        # Public entry point: must NOT raise.
+        out = sdk.commit_session([{"role": "user", "content": "hi"}],
+                                 extractor="v2", session_id="s5339",
+                                 base_url="http://unused", api_key="k")
+        assert isinstance(out, dict), out
+        assert out["ok"] is False, out
+        assert any("gate resolution failed" in e for e in out["errors"]), \
+            out["errors"]
+        assert out["payload"] == payload
+        # Fail-CLOSED: the union fallback would have validated marketing:*
+        # and reached the POST; the gated pass must not POST anything.
+        assert posted == [], "an unreadable gate must not POST a payload"
+
+    def test_v2_gate_outage_is_non_fatal_directly(self, tmp_path, monkeypatch):
+        """The same guarantee at ``_commit_session_v2`` — the method that
+        resolves the gate — so a future wrapper around it cannot re-hide the
+        raise."""
+        import tortoise.extractor_v2 as ex_mod
+        import tortoise.pack_state as ps_mod
+
+        payload = self._payload()
+        monkeypatch.setattr(ex_mod, "extract_session_v2",
+                            lambda *a, **k: {"payload": payload, "errors": [],
+                                             "warnings": []})
+
+        def _unreachable(*a, **k):
+            raise RuntimeError("graph unreachable (simulated outage)")
+        monkeypatch.setattr(ps_mod, "graph_installed_namespaces", _unreachable)
+
+        sdk = self._outage_sdk(tmp_path)
+        out = sdk._commit_session_v2([{"role": "user", "content": "hi"}],
+                                     "s5339", None, 50, "http://unused", "k")
+        assert isinstance(out, dict), out
+        assert out["ok"] is False, out
+        assert any("gate resolution failed" in e for e in out["errors"]), \
+            out["errors"]
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 3. The hosted commit door — the WRITE GATE
 # ══════════════════════════════════════════════════════════════════════════
