@@ -192,13 +192,28 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # #3039: the ACL admin-client decode pin forces a docker:// URI so
     # `_admin_client` takes the redis path; redis.Redis is stubbed, never
     # connects. The setenv IS the test input (deliberate docker lane).
-    "test_from_uri_userinfo.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
+    # #3038 drift: the two #3067 session-indexer sites call `setenv(` with the
+    # KEY on the FOLLOWING line, so the single-line pattern above never matched
+    # them and both read as undeclared. The `\s*$` form is the multi-line
+    # coverage (same shape as test_namespace_uri_mode.py below).
+    "test_from_uri_userinfo.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"',
+                                  r'monkeypatch\.setenv\(\s*$'],
     "test_namespace_uri_mode.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])',
                                      r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"',
                                      r'monkeypatch\.setenv\(\s*$'],
     "test_session_index_health.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
     "test_tortoise_client.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],
     "test_2206_confidence_surfaces.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],  # #2206: module-level live-FalkorDB probe + per-test isolated-graph fixture (set/restore, never leaves a mutation)
+    # #3038 drift: both sites below mutate TORTOISE_DB_URI and were undeclared.
+    # DELIBERATE_URI, not EMBEDDED: neither forces the embedded lane.
+    # test_3815 mirrors the module-level live-FalkorDB probe pattern (set,
+    # probe, restore in `finally`) and then forces the docker graph per-test;
+    # test_2500 setenvs the docker URI because `main()` reads it before it
+    # constructs the SDK. Both use the fixture-param monkeypatch, which pytest
+    # auto-undoes at teardown, so neither leaks a lane.
+    "test_3815_mitigation_moves_weight.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])',
+                                             r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
+    "test_2500_terminal_ep_backfill.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI",\s*"docker:'],
     # ── E2E-8 conformance (Task 8): the leg env control IS the test input —
     #    the embedded leg delenvs the URI, the docker leg setenvs it (the
     #    E2E-1 pattern); declared so the guard stays green ────────────────
