@@ -25,7 +25,7 @@ Reported separately as NON-partitioning sub-splits:
   - time to first non-bot activity (from creation; it can fall INSIDE (b), since
     the cheap entry gate usually finishes first)
   - (a) split at min(activity, gate), over the merged PRs that have an activity
-  - (b) split at queue entry into review/readiness wait + queue residence
+  - (b) split at queue entry into post-gate development/wait + queue residence
   - CI wall clock on the head commit, its re-run span delta, and force-pushes
 
 Design notes that are load-bearing:
@@ -42,6 +42,10 @@ Design notes that are load-bearing:
 * **Survivorship is a reported bucket, never a silent drop.** A PR still open
   has no end timestamp; it is counted in `human_open_now` and is NOT reconciled
   against the closed population.
+
+`review_wait_seconds` was the old name for `post_gate_pre_entry_seconds`; that
+name was wrong (the interval is development + wait, not review — see the
+sub-split note in `measure()`) and there is NO review-wait figure in this report.
 
 * **"Entry-gate success" is the AND of the `.mergify.yml` `queue_conditions`**
   (read at run time, never hardcoded — the set changed mid-window once). The
@@ -82,6 +86,10 @@ from pathlib import Path
 
 SCHEMA_VERSION = 2
 PAGE = 100
+
+# Paginated reads that hit their page cap. A non-empty list here makes `main()`
+# exit 2 (UNKNOWN): an unobserved slice must never read as a measured zero.
+_TRUNCATIONS: list[str] = []
 DEFAULT_REPO = "daniel-ospina/tortoise"
 QUEUE_REF_PREFIX = "mergify/"
 QUEUE_TITLE_PREFIX = "merge queue:"
@@ -177,6 +185,7 @@ class Gh:
             out.extend(items)
             if len(items) < per_page:
                 return out
+        _TRUNCATIONS.append(base_url)
         print(f"WARNING: pagination cap ({max_pages}) hit for {base_url} — "
               f"the population may be TRUNCATED", file=sys.stderr)
         return out
@@ -198,6 +207,7 @@ class Gh:
             if len(items) < per_page:
                 merged[merge_key] = acc
                 return merged
+        _TRUNCATIONS.append(f"{base_url}#{merge_key}")
         print(f"WARNING: pagination cap ({max_pages}) hit for {base_url} — "
               f"{merge_key} may be TRUNCATED", file=sys.stderr)
         merged[merge_key] = acc
@@ -328,9 +338,14 @@ def _span(runs: list[dict], newest_only: bool) -> float | None:
 def ci_on_head(gh: Gh, repo: str, sha: str, contexts: list[str]) -> dict:
     """CI and queue timing from the check-runs on the PR's head commit.
 
-    The `Mergify Merge Queue` check-run is NOT CI: it is opened when the PR
-    enters the queue and closed when it merges, so its span IS the queue wait. It
-    is the queue-entry marker and is excluded from every CI figure.
+    The `Mergify Merge Queue` check-run is NOT CI. It is the queue-entry marker and
+    is excluded from every CI figure. But a ZERO-LENGTH run is the queue's
+    EVALUATION probe, not residence: 109/109 merged human PRs carry at least one,
+    and 31/109 open one within 60 s of the PR (issue #6139, 2026-09-29T00:37Z).
+    Counting one as entry collapses the post-gate interval to 0 and charges the
+    whole of (b) to "queue residence". tools/queue_window_observe.py::queue_intervals
+    drops it for exactly this reason, pinned by
+    test_zero_length_queue_wait_is_dropped_not_counted_as_active.
 
     `final_pass_seconds` = newest-attempt span of github-actions checks (the CI
                            wall clock of the PR's final pass).
@@ -339,9 +354,11 @@ def ci_on_head(gh: Gh, repo: str, sha: str, contexts: list[str]) -> dict:
     `rerun_seconds`      = span_seconds - final_pass_seconds: a SPAN DELTA, i.e.
                            the wall clock a re-run set added, not the sum of the
                            re-run jobs' own durations.
-    `queue_enter_at`     = earliest start of the `Mergify Merge Queue` check on
-                           the FINAL head commit (for a force-pushed PR this is
-                           the queue entry of the head that was merged).
+    `queue_enter_at`     = earliest start among the NONZERO-DURATION `Mergify
+                           Merge Queue` runs on the FINAL head commit (for a
+                           force-pushed PR this is the queue entry of the head
+                           that was merged). `None` when the head carries only
+                           zero-length evaluation probes — it has NO queue marker.
     """
     runs = check_runs(gh, repo, sha)
     gha = [r for r in runs if (r.get("app") or {}).get("slug") == "github-actions"]
@@ -349,7 +366,10 @@ def ci_on_head(gh: Gh, repo: str, sha: str, contexts: list[str]) -> dict:
     attempts: dict[str, int] = {}
     for r in gha:
         attempts[r.get("name")] = attempts.get(r.get("name"), 0) + 1
-    starts = [ts(r.get("started_at")) for r in mergify]
+    resident = [r for r in mergify
+                if ts(r.get("started_at")) and ts(r.get("completed_at"))
+                and ts(r.get("completed_at")) > ts(r.get("started_at"))]
+    starts = [ts(r.get("started_at")) for r in resident]
     starts = [s for s in starts if s]
     all_span, newest_span = _span(gha, False), _span(gha, True)
     return {
@@ -429,6 +449,7 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
         if min((ts(p.get("updated_at")) or since) for p in batch) < since:
             break
     else:
+        _TRUNCATIONS.append("closed-PR scan")
         print("WARNING: closed-PR scan hit its page cap — the population may be "
               "TRUNCATED", file=sys.stderr)
     queue_prs = [p for p in in_window if is_queue_pr(p)]
@@ -473,13 +494,14 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             row["has_activity"] = False
             row["first_activity_seconds"] = None
             row["pre_activity_seconds"] = row["a_gate_seconds"] = None
-            row["review_wait_seconds"] = row["queue_cycle_seconds"] = None
+            row["post_gate_pre_entry_seconds"] = row["queue_cycle_seconds"] = None
             rows.append(row)
             continue
         total = (end - created).total_seconds()
         row["seconds_total"] = total
         # clamp an activity recorded after the end into the PR's own life, so no
         # sub-segment can exceed the lifetime
+        row["activity_clamped"] = bool(fa is not None and fa > end)
         if fa is not None and fa > end:
             fa = end
         row["has_activity"] = fa is not None
@@ -493,7 +515,7 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             row["seconds_a"] = row["seconds_b"] = None
             row["seconds_c"] = total
             row["gate_success_at"] = None
-            row["review_wait_seconds"] = row["queue_cycle_seconds"] = None
+            row["post_gate_pre_entry_seconds"] = row["queue_cycle_seconds"] = None
             row["first_activity_seconds"] = (
                 (fa - created).total_seconds() if fa else None)
             row["pre_activity_seconds"] = (
@@ -503,6 +525,14 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             continue
 
         gate = gate_success(gh, repo, pr["number"], contexts, not_after=merged_at)
+        # A head can already be green when the PR is CREATED (a branch cut from a
+        # CI-passing commit), which puts the gate before created_at. Left alone,
+        # seconds_a goes negative and the invariant below aborts the WHOLE run,
+        # losing the entire report rather than one row (reproduced: PR #5137,
+        # created 2026-09-24T21:48:44Z with its gate ~18:49Z, a = -10762 s; 1 of
+        # 200 sampled rows). Clamp into the PR's own life, as `fa` already is.
+        if gate is not None:
+            gate = min(max(gate, created), merged_at)
         row["gate_success_at"] = gate.isoformat() if gate else None
         if gate is None:
             row["leg"] = "unknown"
@@ -510,7 +540,7 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             row["first_activity_seconds"] = (
                 (fa - created).total_seconds() if fa else None)
             row["pre_activity_seconds"] = row["a_gate_seconds"] = None
-            row["review_wait_seconds"] = row["queue_cycle_seconds"] = None
+            row["post_gate_pre_entry_seconds"] = row["queue_cycle_seconds"] = None
             rows.append(row)
             continue
         row["seconds_a"] = (gate - created).total_seconds()
@@ -533,12 +563,15 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
         row["a_gate_seconds"] = ((gate - boundary).total_seconds() if fa else None)
         # sub-split of (b) at QUEUE ENTRY (the Mergify check's start). The check
         # often opens BEFORE the cheap entry gate finishes (the queue waits for
-        # it), so entry is clamped into [gate, merged]: time before entry is
-        # review/readiness wait, the rest is queue residence.
-        # review_wait + queue_cycle == (b) exactly.
+        # it), so entry is clamped into [gate, merged]. The interval before entry
+        # is NOT "review wait": 96 of 107 merged PRs receive commits AFTER the
+        # gate, and for the rows that produce the split the last such commit lands
+        # a median ~1 min before queue entry — so it is development + wait, not
+        # review, and it is not decomposable from these timestamps.
+        # post_gate_pre_entry + queue_cycle == (b) exactly.
         qenter = ts(row["ci"].get("queue_enter_at")) or merged_at
         qenter = min(max(qenter, gate), merged_at)
-        row["review_wait_seconds"] = (qenter - gate).total_seconds()
+        row["post_gate_pre_entry_seconds"] = (qenter - gate).total_seconds()
         row["queue_cycle_seconds"] = (merged_at - qenter).total_seconds()
         row["leg"] = "merged"
         rows.append(row)
@@ -576,11 +609,11 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
                 raise SystemExit(
                     f"SEGMENT EXCEEDS LIFETIME: PR #{r['number']} {k}={v:.3f} "
                     f"> {r['seconds_total']:.3f}")
-        if r.get("review_wait_seconds") is not None and abs(
-                (r["review_wait_seconds"] + r["queue_cycle_seconds"])
+        if r.get("post_gate_pre_entry_seconds") is not None and abs(
+                (r["post_gate_pre_entry_seconds"] + r["queue_cycle_seconds"])
                 - r["seconds_b"]) > 1e-6:
             raise SystemExit(f"QUEUE SPLIT VIOLATED: PR #{r['number']}")
-        for k in ("pre_activity_seconds", "a_gate_seconds", "review_wait_seconds",
+        for k in ("pre_activity_seconds", "a_gate_seconds", "post_gate_pre_entry_seconds",
                   "queue_cycle_seconds", "first_activity_seconds"):
             v = r.get(k)
             if v is not None and v < -1e-6:
@@ -626,7 +659,7 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
         "a_pre_activity": tot(active_merged, "pre_activity_seconds"),
         "a_after_activity": tot(active_merged, "a_gate_seconds"),
         "first_activity_all": tot(active, "first_activity_seconds"),
-        "review_wait": tot(merged, "review_wait_seconds"),
+        "post_gate_pre_entry": tot(merged, "post_gate_pre_entry_seconds"),
         "queue_cycle": tot(merged, "queue_cycle_seconds"),
     }
     # shares over the ACCOUNTED population, and over the whole population so the
@@ -640,6 +673,14 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
                 if r["ci"]["rerun_seconds"] is not None]
     ci_gate = [r["ci"]["gate_pass_seconds"] for r in rows
                if r["ci"].get("gate_pass_seconds") is not None]
+
+    def _ratio(r: dict) -> float | None:
+        ci, leg = r["ci"].get("final_pass_seconds"), r.get("seconds_b")
+        return 100.0 * ci / leg if ci is not None and leg else None
+
+    ci_merged = [r["ci"]["final_pass_seconds"] for r in merged
+                 if r["ci"].get("final_pass_seconds") is not None]
+    ratios = [x for r in merged if (x := _ratio(r)) is not None]
     merged_secs = tot(merged, "seconds_total")
     aband_secs = tot(aband, "seconds_total")
 
@@ -651,8 +692,11 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
         "entry_gate_contexts": contexts,
         "rule_queue_pr_excluded": (
             f"head.ref starts with '{QUEUE_REF_PREFIX}' or title starts with "
-            f"'{QUEUE_TITLE_PREFIX}' (Mergify speculative-batch probes; none merged "
-            f"in the enumerated window, so they can only inflate the unmerged count)"
+            f"'{QUEUE_TITLE_PREFIX}' (Mergify speculative-batch probes). They are "
+            f"partitioned out of the human population and can only inflate the "
+            f"unmerged count; `population.queue_prs_merged_in_window` states how "
+            f"many merged in this window (0 for the pinned run, which is what "
+            f"makes them churn rather than abandoned work)"
         ),
         "rule_gate_success": (
             "per commit, the newest attempt (max id) of each entry-gate context "
@@ -686,7 +730,7 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
         "dominant_leg": max(leg, key=lambda k: leg[k]) if leg_total else None,
         "sub_segments_seconds": {k: round(v, 1) for k, v in sub.items()},
         "merge_path_split_pct": {
-            "review_wait": (round(100.0 * sub["review_wait"] / leg["b_merge_path"], 1)
+            "post_gate_pre_entry": (round(100.0 * sub["post_gate_pre_entry"] / leg["b_merge_path"], 1)
                             if leg["b_merge_path"] else None),
             "queue_cycle": (round(100.0 * sub["queue_cycle"] / leg["b_merge_path"], 1)
                             if leg["b_merge_path"] else None),
@@ -699,7 +743,7 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             "c_abandoned": med(aband, "seconds_c"),
             "queue_wait": med(merged, "queue_wait_seconds"),
             "approval_wait": med(merged, "approval_wait_seconds"),
-            "review_wait": med(merged, "review_wait_seconds"),
+            "post_gate_pre_entry": med(merged, "post_gate_pre_entry_seconds"),
             "queue_cycle": med(merged, "queue_cycle_seconds"),
             "ci_gate_pass": statistics.median(ci_gate) if ci_gate else None,
             "total_lead_time": med(rows, "seconds_total"),
@@ -707,18 +751,25 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             "ci_rerun": statistics.median(ci_rerun) if ci_rerun else None,
             "review_rounds": statistics.median([r["review_rounds"] for r in rows]) if rows else None,
         },
-        # CI's share of the dominant leg, as an UPPER BOUND. The queue-branch
-        # suite that actually gates the merge (`python-ci-gate`) is not separately
-        # observable here, so this charges the ENTIRE full head-CI wall clock to
-        # queue residence; if that bound is small, no queue-branch CI figure can
-        # make CI the binding constraint.
-        "ci_share_of_merge_leg_bound_pct": {
-            "full_suite_median": (round(100.0 * statistics.median(ci_final)
-                                         / med(merged, "seconds_b"), 2)
-                                   if ci_final and med(merged, "seconds_b") else None),
-            "entry_gate_median": (round(100.0 * statistics.median(ci_gate)
-                                        / med(merged, "seconds_b"), 3)
-                                  if ci_gate and med(merged, "seconds_b") else None),
+        # CI's cost against the dominant leg. This is a CENTRAL-TENDENCY proxy,
+        # NOT a bound: head CI runs CONCURRENTLY with review, so it is not
+        # additive to (b) and can exceed it (7 of 107 merged PRs; worst 592%).
+        # The queue-branch suite that validates the merge is not observable from
+        # the PR head and is NOT measured here; the merge-gate job itself is a
+        # seconds-scale verdict (`python-ci-gate`), not a test suite. Numerator
+        # and denominator are restricted to the SAME rows (merged, both known).
+        "ci_head_vs_merge_leg": {
+            "prs": len(ratios),
+            "median_head_ci_seconds": (round(statistics.median(ci_merged), 1)
+                                       if ci_merged else None),
+            "median_merge_leg_seconds": (round(med(merged, "seconds_b"), 1)
+                                         if med(merged, "seconds_b") else None),
+            "median_of_per_pr_ratio_pct": (round(statistics.median(ratios), 2)
+                                           if ratios else None),
+            "head_ci_exceeds_merge_leg_prs": sum(
+                1 for r in merged if _ratio(r) is not None and _ratio(r) > 100.0),
+            "note": ("head CI overlaps review, is not additive to (b), and is not a "
+                     "bound; the queue-branch suite is not measured"),
         },
         "totals": {
             "human_pr_time_seconds": round(total_secs, 1),
@@ -727,18 +778,20 @@ def measure(gh: Gh, repo: str, contexts: list[str], days: int, now: datetime,
             "abandoned_time_share_pct": round(100.0 * aband_secs / total_secs, 2) if total_secs else 0.0,
             "ci_final_pass_seconds": round(sum(ci_final), 1),
             "ci_rerun_seconds": round(sum(ci_rerun), 1),
-            "review_wait_seconds": round(sub["review_wait"], 1),
+            "post_gate_pre_entry_seconds": round(sub["post_gate_pre_entry"], 1),
             "queue_cycle_seconds": round(sub["queue_cycle"], 1),
             "merged_without_queue_marker": sum(
                 1 for r in merged if r["ci"].get("queue_enter_at") is None),
             "unknown_pr_time_seconds": round(unknown_total, 1),
             "force_push_prs": sum(1 for r in rows if r["force_pushes"] > 0),
             "no_activity_prs": sum(1 for r in rows if not r.get("has_activity")),
+            "activity_clamped_to_end_prs": sum(
+                1 for r in rows if r.get("activity_clamped")),
         },
         "queue_pr_lifetime": _queue_lifetime(queue_prs),
         "verified": {
             "partition_asserted": True,
-            "legs_plus_unknown_sum_to_population": True,
+            "legs_plus_unknown_sum_to_elapsed_time": True,
             "closed_equals_merged_plus_unmerged": True,
             "queue_prs_excluded_from_human": True,
             "no_negative_segments": True,
@@ -769,8 +822,8 @@ def render(result: dict) -> str:
     active_n = sum(1 for r in result["prs"] if r.get("first_activity_seconds") is not None)
     active_merged_n = sum(1 for r in result["prs"] if r.get("a_gate_seconds") is not None)
     split = result["merge_path_split_pct"]
-    bound = result["ci_share_of_merge_leg_bound_pct"]
-    ts = result["leg_shares_of_total_pct"]
+    ci_vs = result["ci_head_vs_merge_leg"]
+    tsh = result["leg_shares_of_total_pct"]
 
     def pct(v) -> str:
         return "n/a" if v is None else f"{v}%"
@@ -788,22 +841,24 @@ def render(result: dict) -> str:
     for k, label in (("a_gate", "(a) created -> entry-gate success"),
                      ("b_merge_path", "(b) gate success -> merged"),
                      ("c_abandoned", "(c) created -> closed unmerged")):
-        L.append(f"  {label:38s} {s[k]:6.2f}% accounted / {ts[k]:5.2f}% all  "
+        L.append(f"  {label:38s} {s[k]:6.2f}% accounted / {tsh[k]:5.2f}% all  "
                  f"median={hours(m.get(k))}")
     L += [f"  DOMINANT: {result['dominant_leg']}",
           f"  time to first non-bot activity (over {active_n}/{len(result['prs'])} PRs): "
           f"median={hours(m['first_activity'])}",
           f"  sub-split of (a) at min(activity, gate) over {active_merged_n} merged PRs: "
           f"median={hours(m['pre_activity'])}",
-          f"  sub-split of (b) at queue entry: review/readiness {pct(split['review_wait'])} "
+          f"  sub-split of (b) at queue entry: post-gate development/wait "
+          f"{pct(split['post_gate_pre_entry'])} "
           f"| queue residence {pct(split['queue_cycle'])}",
           f"  terminal: abandonment = {t['abandoned_time_share_pct']}% of elapsed PR-time",
           f"CI on head: final pass median={minutes(m['ci_final_pass'])} "
           f"| gate pass median={minutes(m['ci_gate_pass'])} "
           f"| rerun total={t['ci_rerun_seconds']/3600:.1f}h",
-          f"  CI charged to the merge leg (UPPER BOUND): full suite="
-          f"{pct(bound.get('full_suite_median'))} | entry gate="
-          f"{pct(bound.get('entry_gate_median'))} of (b)",
+          f"  CI on head (overlaps review; NOT additive): median ratio "
+          f"{pct(ci_vs.get('median_of_per_pr_ratio_pct'))} of (b), "
+          f"exceeds (b) in {ci_vs.get('head_ci_exceeds_merge_leg_prs')}"
+          f"/{ci_vs.get('prs')} PRs",
           f"queue-PR probe lifetime: median="
           f"{result['queue_pr_lifetime'].get('median_seconds',0)/60:.1f}min "
           f"(n={result['queue_pr_lifetime'].get('n',0)})"]
@@ -823,15 +878,36 @@ def main(argv: list[str] | None = None) -> int:
                     default=Path(__file__).resolve().parent.parent)
     args = ap.parse_args(argv)
 
-    now = ts(args.now) if args.now else datetime.now(timezone.utc)
+    _TRUNCATIONS.clear()
+    now = ts(args.now) if args.now else datetime.now(timezone.utc)  # noqa: UP017 — bare `python3` is 3.9
     contexts = entry_gate_contexts(args.repo_root)
     gh = Gh(cache_dir=args.cache_dir)
-    result = measure(gh, args.repo, contexts, args.days, now, prune_after=args.prune_after)
+    try:
+        result = measure(gh, args.repo, contexts, args.days, now,
+                         prune_after=args.prune_after)
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        # `1` is reserved for "a gate would fail". A read that could not be made is
+        # UNKNOWN (`2`), never the code that reads as a verdict.
+        print(f"UNKNOWN: {exc}", file=sys.stderr)
+        return 2
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(render(result))
     print(f"(gh calls={gh.calls} cache_hits={gh.cache_hits})")
+    # "never 0 on an unobserved read" (tools/ci_timing.py:454). The siblings pin
+    # this with test_empty_enumeration_is_unknown_not_zero and
+    # test_record_refuses_an_empty_enumeration_as_unknown_not_zero.
+    if _TRUNCATIONS:
+        print(f"UNKNOWN: {len(_TRUNCATIONS)} paginated read(s) hit their page cap "
+              f"({', '.join(_TRUNCATIONS[:3])}"
+              f"{'...' if len(_TRUNCATIONS) > 3 else ''}) — the population may be "
+              f"TRUNCATED", file=sys.stderr)
+        return 2
+    if not result.get("prs"):
+        print("UNKNOWN: the window produced an EMPTY population — nothing was "
+              "observed", file=sys.stderr)
+        return 2
     return 0
 
 
