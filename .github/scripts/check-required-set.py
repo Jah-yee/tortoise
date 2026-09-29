@@ -240,7 +240,13 @@ def load_mergify(path: Path | None = None) -> dict[str, set[str]]:
             if conds is None:
                 continue
             for cond in require_list(conds, f"{path}: queue_rules[{index}].{key}"):
-                if isinstance(cond, str) and cond.startswith(CHECK_SUCCESS_PREFIX):
+                if not isinstance(cond, str):
+                    # A non-string condition used to reach `.startswith` ->
+                    # AttributeError (exit 1, no annotation).
+                    raise CannotMeasure(
+                        f"{path}: queue_rules[{index}].{key} entries must be strings, "
+                        f"got {type(cond).__name__} — cannot measure")
+                if cond.startswith(CHECK_SUCCESS_PREFIX):
                     out[bucket].add(cond[len(CHECK_SUCCESS_PREFIX) :])
 
     if not out["queue"] and not out["merge"]:
@@ -261,9 +267,10 @@ def declared_lists() -> tuple[set[str], set[str]]:
 def _triggers(workflow: dict[str, Any]) -> set[str]:
     """Workflow trigger names. PyYAML resolves a bare `on:` key to the BOOLEAN True.
 
-    The `isinstance` chain falls through to an empty set, so there is deliberately
-    no `if raw is None` early exit: the fallthrough IS the same answer, and a
-    redundant branch is an untestable one.
+    There is no `if raw is None` early exit: the `isinstance` chain falls through
+    to the same empty set, so the branch was REDUNDANT. (Redundant, not
+    untestable — `("", False)` in the trigger test exercises exactly that
+    fallthrough.) It was removed to keep one expression of the behaviour.
     """
     raw = workflow.get("on", workflow.get(True))
     if isinstance(raw, str):
@@ -377,6 +384,11 @@ def producible_on_pull_request(workflows_dir: Path | None = None) -> set[str]:
             if _gated_off_pr_refs(job):
                 continue
             template = job.get("name")
+            if template is not None and not isinstance(template, str):
+                # `name: 5` used to reach `.strip()` -> AttributeError.
+                raise CannotMeasure(
+                    f"{path}: jobs.{job_id}.name must be a string, got "
+                    f"{type(template).__name__} — cannot measure")
             if isinstance(template, str) and template.strip():
                 strategy = job.get("strategy")
                 if strategy is None:
@@ -400,21 +412,29 @@ def _raw_settings_entries(path: Path | None) -> Any:
     """The `repository.branch-protection` VALUE, `_KEY_ABSENT` when there is NO FILE.
 
     `_KEY_ABSENT` means NO FILE — the mirror does not exist, so `check_settings`
-    skips it. A file that exists but declares nothing returns `[]` (an empty
-    declaration), which `check_settings` then flags. The distinction is
-    load-bearing: an emptied declaration must reach `check_settings` as an EMPTY
-    set, not as None — otherwise it passes vacuously, a fail-open in the one place
-    this guard exists to fail closed.
+    skips it. A file that exists but declares nothing returns None, which
+    `_settings_entries` maps to `[]` (an empty declaration) and `check_settings`
+    then flags: an emptied declaration must reach it as an EMPTY set, not as None,
+    or it passes vacuously in the one place this guard exists to fail closed.
+
+    A present-but-null `branch-protection:` is deliberately NOT special-cased here;
+    the `None -> []` mapping lives in `_settings_entries`. A duplicate branch here
+    would be untestable — whichever copy you delete, the verdict is identical.
     """
     path = path or SETTINGS_PATH
-    if not os.path.lexists(path):
-        # `os.path.lexists`, NOT `Path.exists()`: `exists()` also returns False for
-        # a BROKEN SYMLINK, so a dangling `settings.yml` was classified "no file"
-        # and the mirror check was skipped (exit 0) while the same shape at the
-        # other two seams was fail-closed exit 2. Only a path with NO directory
-        # entry at all is "the mirror does not exist"; a dangling link is a
-        # present-but-unreadable entry, which `read_yaml`'s stat guard then reports.
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        # NO directory entry at all: the mirror does not exist. This is the ONE
+        # legitimate skip, and `os.lstat` (not `os.path.lexists`) is what makes it
+        # safe: `lexists` swallows every OSError, so a PRESENT-but-UNREADABLE
+        # mirror (EACCES on the file or a parent dir) was classified "absent",
+        # `check_settings` was skipped, and the guard exited 0 with a surface
+        # never compared.
         return _KEY_ABSENT
+    except OSError as exc:
+        raise CannotMeasure(
+            f"{path}: unreadable ({type(exc).__name__}: {exc}) — cannot measure") from exc
     try:
         doc = read_yaml(path)
     except yaml.YAMLError as exc:
@@ -434,9 +454,7 @@ def _raw_settings_entries(path: Path | None) -> Any:
     # `check_settings` skips — silently disabling one of the three surfaces with
     # an exit 0.
     repository = require_mapping(repository, f"{path}: `repository`")
-    if repository.get("branch-protection") is None:
-        return []
-    return repository["branch-protection"]
+    return repository.get("branch-protection")
 
 
 def _settings_entries(path: Path | None) -> list[dict[str, Any]]:
@@ -474,8 +492,12 @@ def _required_status_checks(entry: dict[str, Any]) -> dict[str, Any]:
         raise CannotMeasure(
             f"required_status_checks must be a mapping, got {type(rsc).__name__} — "
             "cannot measure")
-    if rsc.get("contexts") is not None:
-        require_list(rsc["contexts"], "required_status_checks.contexts")
+    # Validate presence AND shape: a bare `required_status_checks:` reaches the
+    # `or []` below, and a non-list `contexts` reaches iteration, either as a
+    # non-2 exit with no `::error::`.
+    contexts = rsc.get("contexts")
+    if contexts is not None:
+        require_list(contexts, "required_status_checks.contexts")
     return rsc
 
 
@@ -637,10 +659,6 @@ def gate_legs(path: Path | None = None) -> tuple[list[str], set[str]]:
     if needs is None:
         needs = []
     elif isinstance(needs, str):
-        if not needs.strip():
-            # `needs: ''` is a present-but-blank job id: unusable, not "no needs".
-            raise CannotMeasure(
-                f"{path}: jobs.{GATE_JOB}.needs is a blank string — cannot measure")
         needs = [needs]
     elif not isinstance(needs, list):
         # `needs: 5` AND `needs: 0` / `false` / `''`: a truthiness-based `or []`

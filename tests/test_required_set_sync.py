@@ -809,8 +809,12 @@ def test_run_compares_the_live_context_set(guard, tmp_guard_env, monkeypatch,
 # ── the remaining guard branches, pinned by OUTCOME ─────────────────────────
 #
 # An 8th review showed that a guard nobody deletes is a guard nobody is testing:
-# five were correct and completely unpinned. These cover the rest of the branches
-# so that deleting any one of them reddens the suite.
+# five were correct and completely unpinned. These cover most of the rest. NOT
+# all of them — a 10th review enumerated 14 branches whose deletion still leaves
+# this suite green, of which the four that could turn exit 2 into an unannotated
+# traceback are pinned below and the rest are noted as redundant or
+# verdict-neutral in `check-required-set.py`. The claim is deliberately narrow:
+# these pin the branches that change the EXIT CODE or the VERDICT.
 
 
 @pytest.mark.parametrize("seam", ["mergify", "settings", "python-ci"])
@@ -950,31 +954,148 @@ def test_partition_flags_a_broken_enumeration(guard, monkeypatch, declared, need
     assert any(needle in p for p in problems), problems
 
 
-@pytest.mark.parametrize("mode", ["raises", "returncode", "not-json"])
-def test_live_read_failures_cannot_be_measured(guard, monkeypatch, mode):
-    """The gh-invocation guards: a spawn failure, a non-zero exit, and non-JSON."""
-    import subprocess
+@pytest.mark.parametrize("mode,needle", [
+    ("raises", "could not run gh"),
+    ("returncode", "could not read branch protection"),
+    ("not-json", "non-JSON"),
+])
+def test_live_read_failures_cannot_be_measured(guard, monkeypatch, mode, needle):
+    """The three gh-invocation guards, each ANCHORED on its own message.
 
-    class Done:
-        returncode = 0
-        stdout = "not json"
-        stderr = ""
+    The `returncode` case must return VALID JSON: with a shared `stdout="not json"`
+    fixture the sibling JSONDecodeError guard satisfied the assertion, so deleting
+    the returncode guard left the suite green — and a FAILED `gh` call whose stdout
+    happened to be JSON would have been accepted as a measurement.
+    """
+    import subprocess
 
     if mode == "raises":
         def fake(*a, **k):
             raise OSError("gh not found")
     elif mode == "returncode":
         def fake(*a, **k):
-            class Fail(Done):
+            class Fail:
                 returncode = 1
-                stderr = "API rate limit exceeded"
+                stdout = '{"contexts": ["ghost"], "strict": false}'
+                stderr = "gh: Not Found (HTTP 404)"
             return Fail()
     else:
         def fake(*a, **k):
-            return Done()
+            class Bad:
+                returncode = 0
+                stdout = "not json"
+                stderr = ""
+            return Bad()
     monkeypatch.setattr(subprocess, "run", fake)
-    with pytest.raises(guard.CannotMeasure):
+    with pytest.raises(guard.CannotMeasure, match=needle):
         guard.read_live_protection()
+
+
+def test_a_non_string_mergify_condition_cannot_be_measured(guard, tmp_guard_env):
+    """A non-string condition used to reach `.startswith` -> AttributeError."""
+    guard.MERGIFY_PATH.write_text(
+        "queue_rules:\n  - name: main\n    queue_conditions:\n      - 5\n"
+        "    merge_conditions:\n      - check-success=python-ci-gate\n")
+    with pytest.raises(guard.CannotMeasure, match="entries must be strings"):
+        guard.load_mergify()
+
+
+def test_a_non_string_job_name_cannot_be_measured(guard, tmp_guard_env):
+    """`name: 5` used to reach `.strip()` -> AttributeError."""
+    (tmp_guard_env / "workflows" / "bad.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  g:\n    name: 5\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    with pytest.raises(guard.CannotMeasure, match=r"jobs\.g\.name must be a string"):
+        guard.producible_on_pull_request()
+
+
+def test_a_main_entry_without_required_status_checks_is_usable(guard, tmp_guard_env):
+    """`rsc is None -> {}`: an entry with no `required_status_checks` declares nothing."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n")
+    assert guard.declared_settings_contexts() == set()
+
+
+def test_a_bare_required_status_checks_is_not_iterated(guard, tmp_guard_env):
+    """`required_status_checks:` with no `contexts` used to hit `None` iteration."""
+    guard.SETTINGS_PATH.write_text(
+        "repository:\n  branch-protection:\n    - branch: main\n"
+        "      required_status_checks:\n        strict: false\n")
+    assert guard.declared_settings_contexts() == set()
+    assert guard.declared_settings_strict() is False
+
+
+def test_check_deadlock_defaults_to_the_merge_bucket(guard):
+    problems = guard.check_deadlock({"alpha"}, set())
+    assert any("merge_conditions" in p for p in problems), problems
+
+
+def test_an_unreadable_mirror_is_not_read_as_absent(guard, tmp_guard_env, monkeypatch):
+    """PRESENT-but-UNREADABLE must not skip the comparison (the cardinal sin).
+
+    `os.path.lexists` swallows PermissionError and returned False, so a locked
+    settings.yml was classified absent and the guard exited 0 with a surface
+    never compared.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    locked = tmp_guard_env / "locked"
+    locked.mkdir()
+    (locked / "settings.yml").write_text("repository: {}\n")
+    locked.chmod(0o000)
+    monkeypatch.setattr(guard, "SETTINGS_PATH", locked / "settings.yml")
+    try:
+        with pytest.raises(guard.CannotMeasure):
+            guard.declared_settings_contexts()
+    finally:
+        locked.chmod(0o700)
+
+
+def test_a_rule_with_only_merge_conditions_is_usable(guard, tmp_guard_env):
+    """`conds is None -> continue`: a rule may declare only ONE of the two lists.
+
+    Deleting that `continue` makes `require_list(None, ...)` raise — turning a
+    legitimate one-sided rule into a false exit 2.
+    """
+    guard.MERGIFY_PATH.write_text(
+        "queue_rules:\n  - name: main\n    merge_conditions:\n"
+        "      - check-success=python-ci-gate\n")
+    assert guard.load_mergify() == {"queue": set(), "merge": {"python-ci-gate"}}
+
+
+def test_a_step_without_a_run_is_skipped(guard, tmp_guard_env):
+    """A `uses:` step has no `run:` — it must be skipped, not treated as unusable."""
+    guard.PYTHON_CI_PATH.write_text(
+        "jobs:\n  python-ci-gate:\n    needs: [alpha]\n    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: |\n          done <<'LEGS'\n          alpha|success|-\n          LEGS\n")
+    assert guard.gate_legs() == (["alpha"], {"alpha"})
+
+
+def test_a_blank_job_name_falls_back_to_the_job_id(guard, tmp_guard_env):
+    """A whitespace-only `name:` is not a check name; the job id is."""
+    (tmp_guard_env / "workflows" / "w.yml").write_text(
+        "on:\n  pull_request:\njobs:\n  mycheck:\n    name: '   '\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    assert guard.producible_on_pull_request() == {"mycheck"}
+
+
+def test_an_absent_jobs_key_names_the_missing_gate_job(guard, tmp_guard_env):
+    """`jobs or {}` keeps the error message about the GATE, not about `jobs:`."""
+    guard.PYTHON_CI_PATH.write_text("name: ci\n")
+    with pytest.raises(guard.CannotMeasure, match="no 'python-ci-gate' job"):
+        guard.gate_legs()
+
+
+def test_a_null_gate_job_cannot_be_measured(guard, tmp_guard_env):
+    """`python-ci-gate:` with no body: `gate or {}` turns it into "no LEGS table".
+
+    Both the shipped path and the un-coerced one exit 2, so only the MESSAGE
+    distinguishes them — an unanchored assertion would pass either way.
+    """
+    guard.PYTHON_CI_PATH.write_text("jobs:\n  python-ci-gate:\n")
+    with pytest.raises(guard.CannotMeasure, match="no <<'LEGS' table"):
+        guard.gate_legs()
 
 
 def test_the_real_queue_lists_are_all_produced_on_pr_refs(guard):
