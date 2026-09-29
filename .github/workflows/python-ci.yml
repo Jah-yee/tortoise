@@ -210,7 +210,7 @@ jobs:
           # (full selections + tier-2 + docs-only) so these echoes are safe for
           # push too. slow_selected is space-joined BARE names (the
           # test-slow matrix format — no .py suffix) so a leg can case-match it
-          # against ${{ matrix.files }} in the tier-2 shape.
+          # against the matrix.files expression in the tier-2 shape.
           echo "slow_run=$(echo "$SEL" | python3 -c 'import json,sys; print(str(json.load(sys.stdin)["slow_run"]).lower())')" >> "$GITHUB_OUTPUT"
           echo "carve_out_run=$(echo "$SEL" | python3 -c 'import json,sys; print(str(json.load(sys.stdin)["carve_out_run"]).lower())')" >> "$GITHUB_OUTPUT"
           echo "slow_selected=$(echo "$SEL" | python3 -c 'import json,sys; print(" ".join(x[:-3] if x.endswith(".py") else x for x in json.load(sys.stdin)["slow_selected"]))')" >> "$GITHUB_OUTPUT"
@@ -253,7 +253,7 @@ jobs:
           MATRIX=$(python3 tools/ci_selection.py --emit-push-matrix)
           # #1472 regression fix: SPACE-JOINED strings inside the matrix (the
           # old hardcoded `files: >-` format). fromJSON(...) yields a JS array,
-          # which renders as "Array" in the shell `for f in ${{ matrix.files }}`
+          # which renders as "Array" in the shell `for f in the matrix.files expression`
           # loop (template-context toString) — every full-matrix run collected
           # tests/Array.py. json.dumps keeps the object on one GITHUB_OUTPUT
           # line (multi-line would need the heredoc form).
@@ -377,7 +377,7 @@ jobs:
     # print. The cap stays 55m watchdog + ~10m — the worst case at S=2 — so it
     # remains correct if `fast_shards` is lowered again.
     # #6135: the OUTER cap is not the watchdog. The per-shard watchdog is the
-    # `timeout -s INT -k 10 ${{ matrix.watchdog_minutes }}m` in the pytest step,
+    # `timeout -s INT -k 10 the matrix.watchdog_minutes expressionm` in the pytest step,
     # sized to that shard's own packed estimate — a 6.6-minute shard is killed
     # at 15m, not 55m, so a hung small shard cannot hold the required aggregate
     # red for the old budget. This outer cap only bounds SETUP (pre-existing).
@@ -601,8 +601,12 @@ jobs:
         run: |
           if [ "${{ matrix.canary_producer }}" = "true" ]; then
             # #6135: the shard's watchdog reaches the marker through the ENV,
-            # never as an unquoted `${{ }}` in the embedded python — that is
-            # invalid Python and the column-zero guard reds on it.
+            # never as an unquoted GitHub expression in the embedded python —
+            # that is invalid Python and the column-zero guard reds on it.
+            # NOTE: this comment must not contain template syntax. GitHub
+            # evaluates expressions over the ENTIRE `run` scalar, comments
+            # included, so a literal expression here fails workflow validation
+            # and the job never starts (no check-run is produced at all).
             SHARD_WATCHDOG_MINUTES=${{ matrix.watchdog_minutes }} python3 - <<'EOF'
           import json, os
           marker = {
@@ -1110,7 +1114,7 @@ jobs:
       - name: Generate coverage manifest (slow legs — expected nodeids, epic #1647 Task 9)
         # Cycle-6 P2-8 (int-10): the manifest runs in its OWN step BEFORE the
         # pytest step (off the 75m watchdog), using each leg's committed
-        # ${{ matrix.files }} x --collect-only
+        # the matrix.files expression x --collect-only
         # -m 'not track_b and not live and not integration' (#4750) (the same
         # construction the run step builds) -> /tmp/expected-nodeids.txt.
         run: |
