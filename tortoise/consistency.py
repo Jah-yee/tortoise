@@ -57,6 +57,7 @@ from .projection import (
     _norm,
     _promotion_point_with_operator,
     journal_hard_delete_seqs,
+    plan_point_restamp_folds,
     prewipe_snapshot_path,
 )
 from .projection.entities import (
@@ -823,6 +824,19 @@ def _fold_journal(events: list[dict]) -> dict:
 
     The right long-term fix is the arms on `fold` itself and lives outside this
     lane's file family (#3692 covers the promotions).
+
+    #3305 KNOWN GAP: these terminalizer arms are NOT driven by
+    ``plan_point_restamp_folds``, the selection the replay engines obey, so this
+    reference fold can disagree with a correctly replayed graph. Measured on a
+    bare same-id ``PointAdded`` re-emit after an invalidate: the graph holds the
+    decayed belief (both engines keep it — a bare re-emit MERGEs live), while
+    this fold's ``_apply_one`` PointAdded arm REPLACES the entry and drops the
+    decay, so ``check_consistency`` reports ``divergence="content"`` on
+    ``confidence``/``posterior_alpha``/``posterior_beta`` for a healthy replay.
+    That disagreement with the ``rebuild_all`` graph predates #3305; the #3305
+    fix widened it to the apply() arm by making that arm agree with
+    ``rebuild_all``. Driving these arms from the plan is the durable fix and is
+    deliberately left to the consistency lane.
     """
     # `journal_hard_delete_seqs` normalises internally, and stays on the RAW
     # list (the anchor boundary is an envelope property).
@@ -1289,15 +1303,45 @@ def recover_from_log(events_dir: str, projection) -> dict:
     applied = 0
     hard_delete_seqs = journal_hard_delete_seqs(events)
     entity_link_events: list[tuple[int, dict]] = []
+    # #3305: the Point lifecycle terminalizers are folded by the SHARED
+    # whole-journal plan, not by ``apply()``'s inline branch — that branch
+    # folds every terminalizer, while ``rebuild_all`` deliberately drops the
+    # pre-recreation ones and canonicalizes supersedes. Computing the plan
+    # here keeps this recovery engine on the same selection.
+    restamp_plan, _ = plan_point_restamp_folds(events)
+    # #3305: defer the terminalizers' CORRECTS edges — an endpoint created later
+    # in the journal cannot be merged chronologically (see
+    # ``fold_deferred_corrects_edges``), and ``rebuild_all``'s after-creations
+    # sweep resolves it, so the engines would disagree.
+    deferred_corrects: list[tuple[int, str, str]] = []
     for seq, ev in enumerate(events):
         if isinstance(ev, dict) and ev.get("type") == "EntityLinked":
             entity_link_events.append((seq, ev))
             continue
         try:
-            projection.apply(ev)
+            # Keyed on the PLAN, not the raw envelope type — the plan selects
+            # by the NORMALIZED type (``_norm`` splices a nested payload), so a
+            # raw-type guard would let a ``type``-in-``point`` terminalizer fall
+            # through to ``apply()``'s inline branch and its unshared selection
+            # (#325/#3722's raw-vs-normalized class).
+            if seq in restamp_plan:
+                edge = projection.apply_journal_point_restamp(
+                    ev, seq, restamp_plan)
+                if edge is not None:
+                    deferred_corrects.append(edge)
+            else:
+                projection.apply(ev)
             applied += 1
         except Exception:
             torn += 1
+    if deferred_corrects:
+        try:
+            projection.fold_deferred_corrects_edges(
+                deferred_corrects, hard_delete_seqs)
+        except Exception:
+            logger.exception(
+                "recover_from_log: deferred CORRECTS fold failed; %d "
+                "edge(s) not replayed", len(deferred_corrects))
     if entity_link_events:
         try:
             applied += projection.fold_deferred_entity_links(
