@@ -1943,41 +1943,84 @@ def soft_delete_org(cp, org_id: str, now: str | None = None,
 
 
 def account_deletion_row(cp, user_id: str) -> dict | None:
-    """The account soft-delete stamp, or None (#4029).
+    """The account-deletion ledger row, or None (#4029).
 
-    The idempotent-replay read: a present row means the account is already
-    delete-pending, so the endpoint answers from the STORED promise instead of
-    re-cascading. Shape-gates user_id (#1719).
+    A present row is the endpoint's retry anchor. When ``deleted_at`` is set
+    the account is delete-pending and the endpoint answers from the STORED
+    promise instead of re-cascading; when it is NULL the row is a PRIOR attempt
+    that failed mid-cascade and ``org_ids`` is the durable cascade set the
+    retry replays (the cascade itself destroys the membership discovery read).
+    Shape-gates user_id (#1719).
     """
     if not _is_uuid(user_id):
         return None
     rows = cp.query(
         "account_deletions",
-        select=["user_id", "deleted_at", "grace_hours"],
+        select=["user_id", "deleted_at", "grace_hours", "org_ids"],
         filters=[("user_id", "eq", user_id)],
     )
     return rows[0] if rows else None
 
 
-def soft_delete_account(cp, user_id: str, now: str | None = None,
-                        grace_hours: float = float(RESTORE_WINDOW_HOURS)) -> None:
-    """Stamp the account soft-delete ledger row (#4029).
+def begin_account_deletion(cp, user_id: str, org_ids: list[str]) -> None:
+    """INSERT the account-deletion retry anchor BEFORE the cascade (#4029).
+
+    Persists the org ids the deletion intends to cascade while they are still
+    discoverable — ``remove_org_memberships`` deletes the ``status='active'``
+    owner rows ``sole_owned_org_ids`` reads, so an anchor written after the
+    cascade could never rediscover a partially-failed org. ``deleted_at`` and
+    ``grace_hours`` are deliberately left NULL: the stamp is written LAST by
+    :func:`stamp_account_deletion`, so a partial failure leaves the account
+    un-stamped (the fail-closed ordering the per-org cascade uses).
+
+    INSERT, not upsert: a concurrent second schedule is a primary-key conflict
+    (PostgREST 409) that the caller treats as already-scheduled — a
+    first-write-wins promise. An upsert here would let the loser overwrite the
+    winner's stored window.
+    """
+    cp.query(
+        "account_deletions",
+        method="POST",
+        json_body={"user_id": user_id, "org_ids": list(org_ids),
+                   "deleted_at": None, "grace_hours": None},
+    )
+
+
+def set_account_deletion_org_ids(cp, user_id: str,
+                                 org_ids: list[str]) -> None:
+    """Widen an unstamped anchor's org set with a retry's fresh discovery.
+
+    A team the user acquired between a partial failure and the retry must
+    survive later retries too, so the union is persisted. Guarded on
+    ``deleted_at IS NULL`` — once stamped the set is frozen with the promise.
+    """
+    cp.query(
+        "account_deletions",
+        method="PATCH",
+        filters=[("user_id", "eq", user_id), ("deleted_at", "is", None)],
+        json_body={"org_ids": list(org_ids)},
+    )
+
+
+def stamp_account_deletion(cp, user_id: str, now: str | None = None,
+                           grace_hours: float = float(RESTORE_WINDOW_HOURS)) -> None:
+    """Stamp the account soft-delete — the LAST cascade step (#4029).
 
     ``grace_hours`` is persisted so the purge sweep and the idempotent replay
     honor the ``hard_delete_after`` promised at schedule time, even if
     ``TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS`` changes mid-grace — the same
     stored-promise contract ``soft_delete_org`` (#302/#4179) implements.
 
-    INSERT, not upsert: the endpoint only reaches this after reading no row, so
-    a concurrent second schedule is a primary-key conflict (PostgREST 409) that
-    the caller treats as already-scheduled — a first-write-wins promise. An
-    upsert here would let the loser overwrite the winner's stored window.
+    PATCH guarded on ``deleted_at IS NULL`` (first-write-wins): a concurrent
+    schedule that reaches the stamp second matches no row, so the winner's
+    stored promise is never overwritten — the caller then answers from the
+    stored row.
     """
     cp.query(
         "account_deletions",
-        method="POST",
-        json_body={"user_id": user_id, "deleted_at": now or _now_iso(),
-                   "grace_hours": grace_hours},
+        method="PATCH",
+        filters=[("user_id", "eq", user_id), ("deleted_at", "is", None)],
+        json_body={"deleted_at": now or _now_iso(), "grace_hours": grace_hours},
     )
 
 

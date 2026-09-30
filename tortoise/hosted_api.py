@@ -18989,6 +18989,76 @@ async def delete_org(org_id: str, request: Request,
     }
 
 
+def _account_org_ids_from_row(row: dict | None) -> list[str]:
+    """The persisted cascade set of an account-deletion anchor (#4029).
+
+    Tolerant by design: the value is ``jsonb`` (a list in the control-plane
+    row), but a legacy/odd shape must never break the retry — an unreadable
+    anchor degrades to the fresh membership discovery.
+    """
+    if not row:
+        return []
+    raw = row.get("org_ids")
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = _json.loads(raw)
+        except Exception:
+            return []
+    try:
+        return [str(org_id) for org_id in raw if str(org_id)]
+    except Exception:
+        return []
+
+
+def _merge_org_ids(stored: list[str], fresh: list[str]) -> list[str]:
+    """Stored anchor ids first, then any freshly discovered solely-owned org.
+
+    The union keeps a team the user acquired between a partial failure and the
+    retry without dropping the durable set the anchor exists to carry.
+    """
+    out = list(stored)
+    seen = set(stored)
+    for org_id in fresh:
+        org_id = str(org_id)
+        if org_id and org_id not in seen:
+            seen.add(org_id)
+            out.append(org_id)
+    return out
+
+
+def _account_replay_body(row: dict, env_grace: float) -> dict:
+    """The 200-``already`` body, derived from the STORED promise (#4029).
+
+    Deliberately NOT a fresh env read: the deadline promised at schedule time
+    must not move when the env default changes mid-grace. Shared by the
+    idempotent replay and the concurrent-schedule (409) loser so the two
+    cannot disagree on the field.
+    """
+    stored_grace = row.get("grace_hours")
+    try:
+        replay_grace = (float(stored_grace) if stored_grace is not None
+                        else env_grace)
+    except Exception:
+        replay_grace = env_grace
+    deleted_at = row.get("deleted_at")
+    try:
+        hard_delete_after = (
+            datetime.fromisoformat(str(deleted_at))
+            + timedelta(hours=replay_grace)
+        ).isoformat()
+    except Exception:
+        hard_delete_after = None
+    return {
+        "status": "delete_pending", "already": True,
+        "deleted_at": deleted_at,
+        "grace_hours": replay_grace,
+        "hard_delete_after": hard_delete_after,
+        "teams_deleted": [],
+    }
+
+
 @app.delete("/v1/user/account", status_code=202)
 async def delete_user_account(request: Request,
                               user: dict = Depends(get_current_user)):  # noqa: B008
@@ -19002,10 +19072,16 @@ async def delete_user_account(request: Request,
     Ordering mirrors the team endpoint: the org cascades (access-kill first)
     run BEFORE the account is stamped, and the account's ``deleted_at`` +
     ``grace_hours`` are written LAST, so a partial failure leaves the account
-    un-stamped and a retry re-runs the full, idempotent cascade. The stored
-    grace window is the sole authority for the erasure deadline; the
-    ``TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS`` env var is only the fallback
-    default for a row that carries no stored grace (#4179 contract).
+    un-stamped and a retry re-runs the full, idempotent cascade. The org ids
+    the deletion intends to cascade are persisted in the ledger row BEFORE the
+    cascade runs (``org_ids``): the cascade itself removes the active-owner
+    memberships the sole-ownership discovery reads, so without that anchor a
+    failure after membership removal but before the org stamp would leave the
+    org un-stamped AND undiscoverable — its graph intact and its pending
+    invitations stranded. The stored grace window is the sole authority for
+    the erasure deadline; the ``TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS`` env
+    var is only the fallback default for a row that carries no stored grace
+    (#4179 contract).
 
     Idempotent: a repeat request while pending → 200 ``already`` carrying the
     STORED promise. AuthZ: the endpoint acts on the AUTHENTICATED account and
@@ -19022,10 +19098,12 @@ async def delete_user_account(request: Request,
     await _check_sensitive_op_rate_limit(request, "account_delete")
     from tortoise.supabase_control import (
         account_deletion_row,
+        begin_account_deletion,
         get_control_plane,
         is_supabase_enabled,
-        soft_delete_account,
+        set_account_deletion_org_ids,
         sole_owned_org_ids,
+        stamp_account_deletion,
     )
     if not is_supabase_enabled():
         # 200 (not the route's declared 202): nothing was scheduled. Mirrors
@@ -19038,46 +19116,77 @@ async def delete_user_account(request: Request,
         str(USER_ACCOUNT_DELETE_GRACE_HOURS)))
 
     existing = await asyncio.to_thread(account_deletion_row, cp, user_id)
-    if existing:
+    if existing and existing.get("deleted_at"):
         # Idempotent replay: already scheduled — answer from the STORED
         # promise (never a fresh env read, which could move the deadline).
-        stored_grace = existing.get("grace_hours")
-        try:
-            replay_grace = float(stored_grace) if stored_grace is not None else grace_hours
-        except Exception:
-            replay_grace = grace_hours
-        try:
-            hard_delete_after = (
-                datetime.fromisoformat(str(existing.get("deleted_at")))
-                + timedelta(hours=replay_grace)
-            ).isoformat()
-        except Exception:
-            hard_delete_after = None
         return JSONResponse(
             status_code=200,
-            content={
-                "status": "delete_pending", "already": True,
-                "deleted_at": existing.get("deleted_at"),
-                "grace_hours": replay_grace,
-                "hard_delete_after": hard_delete_after,
-                "teams_deleted": [],
-            },
+            content=_account_replay_body(existing, grace_hours),
         )
 
+    # The durable retry anchor. A row whose ``deleted_at`` is NULL is a PRIOR
+    # attempt that failed mid-cascade; its stored org set survives the cascade
+    # (which removes the owner rows discovery reads), so replay it — unioned
+    # with any solely-owned team acquired since.
+    stored_ids = _account_org_ids_from_row(existing)
+    fresh_ids = await asyncio.to_thread(sole_owned_org_ids, cp, user_id)
+    org_ids = _merge_org_ids(stored_ids, fresh_ids)
+
+    if existing is None:
+        try:
+            # Persist the anchor BEFORE the cascade begins: the cascade
+            # destroys the membership rows a retry would rediscover the org by.
+            await asyncio.to_thread(
+                begin_account_deletion, cp, user_id, org_ids)
+        except RuntimeError as exc:
+            # A concurrent request won the primary-key insert (PostgREST 409):
+            # its stored promise is the one that stands, never ours. Anything
+            # else is real.
+            if "409" not in str(exc):
+                raise
+            won = await asyncio.to_thread(account_deletion_row, cp, user_id)
+            if won and won.get("deleted_at"):
+                return JSONResponse(
+                    status_code=200,
+                    content=_account_replay_body(won, grace_hours),
+                )
+            stored_ids = _account_org_ids_from_row(won)
+            org_ids = _merge_org_ids(stored_ids, fresh_ids)
+    elif org_ids != stored_ids:
+        # Widen the durable anchor so a team acquired mid-grace reaches the
+        # cascade on a later retry too.
+        await asyncio.to_thread(
+            set_account_deletion_org_ids, cp, user_id, org_ids)
+
     now = datetime.now(UTC).isoformat()
-    org_ids = await asyncio.to_thread(sole_owned_org_ids, cp, user_id)
     for org_id in org_ids:
         await _cascade_soft_delete_org(org_id, now, grace_hours)
+    # Account stamp LAST — a partial cascade above leaves this unwritten, so a
+    # retry re-runs the whole (idempotent) cascade. First-write-wins: the seam
+    # matches only an unstamped row, so a concurrent schedule's stored promise
+    # is never overwritten.
+    await asyncio.to_thread(
+        stamp_account_deletion, cp, user_id, now, grace_hours=grace_hours)
+
+    # Answer from the STORED row (ours, or a concurrent winner's) and derive
+    # hard_delete_after from that same stamped deleted_at — never a second
+    # now(), which would advertise a deadline LATER than the purge enforces.
+    stored = await asyncio.to_thread(account_deletion_row, cp, user_id) or {}
+    deleted_at = stored.get("deleted_at") or now
+    stored_grace = stored.get("grace_hours")
     try:
-        # Account stamp LAST — a partial cascade above leaves this unwritten,
-        # so a retry re-runs the whole (idempotent) cascade.
-        await asyncio.to_thread(
-            soft_delete_account, cp, user_id, now, grace_hours=grace_hours)
-    except RuntimeError as exc:
-        # A concurrent request won the primary-key insert (PostgREST 409): its
-        # stored promise is the one that stands. Anything else is real.
-        if "409" not in str(exc):
-            raise
+        final_grace = (float(stored_grace) if stored_grace is not None
+                       else grace_hours)
+    except Exception:
+        final_grace = grace_hours
+    try:
+        hard_delete_after = (
+            datetime.fromisoformat(str(deleted_at))
+            + timedelta(hours=final_grace)
+        ).isoformat()
+    except Exception:
+        hard_delete_after = None
+
     await _async_audit(
         request, "", "account_delete_requested",
         resource_type="account", resource_id=user_id,
@@ -19085,11 +19194,9 @@ async def delete_user_account(request: Request,
         detail={"teams_deleted": org_ids},
     )
     return {
-        "status": "delete_scheduled", "deleted_at": now,
-        "grace_hours": grace_hours,
-        "hard_delete_after": (
-            datetime.now(UTC) + timedelta(hours=grace_hours)
-        ).isoformat(),
+        "status": "delete_scheduled", "deleted_at": deleted_at,
+        "grace_hours": final_grace,
+        "hard_delete_after": hard_delete_after,
         "teams_deleted": org_ids,
         "note": "Teams you solely own are deleted immediately (keys revoked, "
                  "memberships removed); your account and its data are erased "
@@ -19405,7 +19512,13 @@ def _purge_deleted_accounts() -> None:
                 continue  # stored promise decides (env = fallback only)
             try:
                 status = _supabase_admin_delete_user(user_id)
-                if status >= 400 and status != 404:
+                # Fail-closed: a successful erasure is EXACTLY 200/204 (the
+                # auth user was deleted) or 404 (already gone — idempotent).
+                # httpx.delete does NOT follow redirects, so a 301/302 (e.g. a
+                # SUPABASE_URL on http://, or a CDN/proxy redirect on the admin
+                # path) must NOT read as erased — treating it as success would
+                # drop the only retry anchor with the auth user still alive.
+                if status not in (200, 204, 404):
                     raise RuntimeError(
                         f"auth-service delete failed: HTTP {status}")
                 # Ledger row LAST — it is the retry anchor for a failed above.

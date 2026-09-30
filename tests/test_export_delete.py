@@ -1166,6 +1166,41 @@ class TestPurge:
         ops = [e["operation"] for e in capture_audit]
         assert ops.count("team_delete_purged") == 2
 
+    def test_purge_unparseable_stamp_is_purged(self, sb_client,
+                                               capture_audit):
+        """#4029 FIX 4.1 (org path): a corrupt (unparseable) ``deleted_at``
+        must be PURGED, not skipped — a corrupt row must never pin its graph
+        and control-plane rows forever.
+
+        RED condition: ``_stored_grace_elapsed``'s defensive except returns
+        False, so the unparseable org is skipped and never purged. MUTATION
+        CONFIRMED RED: change ``return True`` to ``return False`` in
+        ``_stored_grace_elapsed``'s ``except Exception`` — the org row and its
+        graph survive the sweep and no ``team_delete_purged`` is emitted.
+
+        The stamp is ``"!!!"`` deliberately: the sweep's ``deleted_at lte
+        now`` prefilter is a lexicographic string compare, and ``'!' < '2'``
+        makes the row reach ``_stored_grace_elapsed`` (an ISO-shaped-but-bad
+        stamp would be filtered out before the defensive branch runs).
+        """
+        tc, fake, _ = sb_client  # noqa: RUF059
+        fake.seed("organizations", [dict(FREE_TEAM, deleted_at="!!!",
+                                     grace_hours=1)])
+        fake.seed("org_memberships", [_membership_row()])
+        fake.seed("api_keys", [_key_row()])
+        fake.seed("invitations", [{
+            "id": "inv-1", "org_id": ORG_ID, "email": "bob@example.com",
+            "role": "member", "status": "pending", "expires_at": None,
+        }])
+
+        ha_mod._purge_deleted_orgs()
+
+        assert all(r["id"] != ORG_ID for r in fake.tables["organizations"])
+        assert all(r["org_id"] != ORG_ID for r in fake.tables["api_keys"])
+        assert fake.tables["invitations"] == []
+        ops = [e["operation"] for e in capture_audit]
+        assert ops.count("team_delete_purged") == 1
+
 
 class TestDropTeamGraphImplCloudShape:
     """#2163 regression: _drop_team_graph_impl must issue GRAPH.DELETE on a
@@ -1446,7 +1481,8 @@ class TestAccountDeletion:
         RED condition: the second call re-cascades and re-INSERTs instead of
         replaying, so it answers 202 (or a 409 escapes) instead of 200-already
         and the ledger grows a second row. MUTATION CONFIRMED RED: delete the
-        ``if existing:`` early-return block in ``delete_user_account``.
+        ``if existing and existing.get("deleted_at"):`` early-return block in
+        ``delete_user_account``.
         """
         tc, fake, _ = sb_client
         fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
@@ -1458,6 +1494,154 @@ class TestAccountDeletion:
         assert second.json()["already"] is True
         assert len(fake.tables["account_deletions"]) == 1
         assert second.json()["deleted_at"] == first.json()["deleted_at"]
+
+    def test_partial_cascade_retry_reaches_org_and_purge(
+            self, sb_client, as_user, monkeypatch, capture_audit):
+        """#4029 FIX 1: a fault AFTER membership removal but BEFORE the org
+        stamp must not strand the org. The persisted anchor (`org_ids`) lets
+        the retry cascade and stamp it, so the post-grace purge actually finds
+        it.
+
+        RED condition: the retry rediscovers solely-owned orgs from the
+        ``status='active'`` owner rows, which the partial cascade already set
+        to ``removed`` — so it answers 202 with ``teams_deleted: []``,
+        ``org.deleted_at`` stays None, and ``_purge_deleted_orgs`` (which
+        selects on ``deleted_at``) never sees the org; its graph and pending
+        invitations survive. MUTATION CONFIRMED RED: make ``_merge_org_ids``
+        ignore its ``stored`` argument (return only the fresh discovery) — the
+        retry's ``teams_deleted`` is ``[]`` and the org is never stamped.
+        """
+        import tortoise.supabase_control as sc
+        tc, fake, _ = sb_client
+        fake.seed("organizations", [_account_org(ORG_ID)])
+        fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
+        fake.seed("api_keys", [_key_row()])
+        fake.seed("invitations", [{
+            "id": "inv-1", "org_id": ORG_ID, "email": "bob@example.com",
+            "role": "member", "status": "pending", "expires_at": None,
+        }])
+
+        real_revoke = sc.revoke_org_invitations
+        calls = {"n": 0}
+
+        def _flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient control-plane fault")
+            return real_revoke(*args, **kwargs)
+
+        monkeypatch.setattr(sc, "revoke_org_invitations", _flaky)
+        as_user()
+
+        with pytest.raises(RuntimeError, match="transient"):
+            tc.delete("/v1/user/account")
+
+        # partial failure: memberships removed, org NOT stamped, account NOT
+        # stamped — but the intended org set is durably anchored.
+        org = next(o for o in fake.tables["organizations"]
+                   if o["id"] == ORG_ID)
+        assert org.get("deleted_at") is None
+        assert all(m["status"] == "removed"
+                   for m in fake.tables["org_memberships"])
+        anchor = fake.tables["account_deletions"][0]
+        assert anchor["deleted_at"] is None
+        assert list(anchor["org_ids"]) == [ORG_ID]
+
+        # retry: re-cascades FROM THE ANCHOR and stamps the org
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        assert r.json()["teams_deleted"] == [ORG_ID]
+        org = next(o for o in fake.tables["organizations"]
+                   if o["id"] == ORG_ID)
+        assert org["deleted_at"]
+        assert org["grace_hours"] == RESTORE_WINDOW_HOURS
+        assert all(i["status"] == "revoked"
+                   for i in fake.tables["invitations"])
+
+        # the stamped org is now discoverable by the purge once its grace
+        # elapses — the whole point: it is not orphaned.
+        org["deleted_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=30)  # noqa: UP017
+        ).isoformat()
+        ha_mod._purge_deleted_orgs()
+        assert all(o["id"] != ORG_ID for o in fake.tables["organizations"])
+        ops = [e["operation"] for e in capture_audit]
+        assert ops.count("team_delete_purged") == 1
+
+    def test_scheduled_hard_delete_after_derives_from_stored_stamp(
+            self, sb_client, as_user):
+        """#4029 FIX 3: the advertised ``hard_delete_after`` is the STORED
+        ``deleted_at`` + the promised grace — never a second ``now()`` (which
+        would advertise a deadline later than the one the purge enforces).
+
+        RED condition: the 202 body computes ``hard_delete_after`` from a fresh
+        ``datetime.now(UTC)``, so it is later than ``deleted_at +
+        grace_hours``. MUTATION CONFIRMED RED: revert the return to
+        ``(datetime.now(UTC) + timedelta(hours=grace_hours)).isoformat()`` —
+        equality fails (time elapses across the cascade's thread hops and the
+        ledger round-trip).
+        """
+        tc, fake, _ = sb_client
+        fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
+        as_user()
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        body = r.json()
+        expected = (
+            datetime.fromisoformat(body["deleted_at"])
+            + timedelta(hours=body["grace_hours"])
+        ).isoformat()
+        assert body["hard_delete_after"] == expected
+
+    def test_concurrent_schedule_409_stored_promise_wins(
+            self, sb_client, as_user, monkeypatch, capture_audit):
+        """#4029 FIX 4.2: a concurrent schedule that loses the INSERT race
+        answers from the STORED promise (200 already), never its own fresh
+        grace, and emits no second ``account_delete_requested``.
+
+        RED condition: the 409 is swallowed and the handler returns 202 with
+        its OWN grace/``hard_delete_after`` and a second audit event.
+        MUTATION CONFIRMED RED: in the ``begin_account_deletion`` except,
+        replace the winner re-read with ``pass`` — the response is 202 with the
+        env grace (168) and the audit count is 1.
+        """
+        import tortoise.supabase_control as sc
+        monkeypatch.setenv("TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS", "168")
+        tc, fake, _ = sb_client
+        one_hour_ago = (
+            datetime.now(timezone.utc) - timedelta(hours=1)  # noqa: UP017
+        ).isoformat()
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "deleted_at": one_hour_ago, "grace_hours": 24,
+        }])
+        real_row = sc.account_deletion_row
+        calls = {"n": 0}
+
+        def _race(cp, user_id):
+            # Simulate the read-before-INSERT window: the first read sees no
+            # row, then the concurrent writer's row exists for the INSERT
+            # conflict (the fake raises 409 on the duplicate PK) and for the
+            # post-conflict re-read.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return real_row(cp, user_id)
+
+        monkeypatch.setattr(sc, "account_deletion_row", _race)
+        as_user()
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["already"] is True
+        assert body["grace_hours"] == 24        # stored, not the env 168
+        assert body["deleted_at"] == one_hour_ago
+        expected = (
+            datetime.fromisoformat(one_hour_ago) + timedelta(hours=24)
+        ).isoformat()
+        assert body["hard_delete_after"] == expected
+        assert len(fake.tables["account_deletions"]) == 1
+        ops = [e["operation"] for e in capture_audit]
+        assert ops.count("account_delete_requested") == 0
 
     def test_requires_auth(self, sb_client):
         """No session → 401 (the endpoint acts on the authenticated account).
@@ -1643,3 +1827,63 @@ class TestAccountPurge:
         monkeypatch.setattr(sc, "get_control_plane", _cp)
         ha_mod._purge_deleted_accounts()
         assert reached == []
+
+    def test_purge_keeps_ledger_on_3xx(self, sb_client, capture_audit,
+                                       monkeypatch):
+        """#4029 FIX 2: a 3xx is NOT a successful erasure — ``httpx.delete``
+        does not follow redirects, so the auth user is never deleted and the
+        ledger row is the only retry anchor.
+
+        RED condition: any sub-400 status counts as erased, so
+        ``purge_account_deletion`` removes the anchor while the auth user
+        survives permanently. MUTATION CONFIRMED RED: revert the predicate to
+        ``status >= 400 and status != 404`` — the ledger row is removed and
+        ``account_delete_purged`` is emitted.
+        """
+        tc, fake, _ = sb_client  # noqa: RUF059
+        past = (datetime.now(timezone.utc)  # noqa: UP017
+                - timedelta(days=8)).isoformat()
+        fake.seed("account_deletions", [
+            {"user_id": OWNER, "deleted_at": past,
+             "grace_hours": RESTORE_WINDOW_HOURS},
+        ])
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user",
+                            lambda uid: 302)
+
+        ha_mod._purge_deleted_accounts()
+
+        assert [d["user_id"] for d in fake.tables["account_deletions"]] == [OWNER]
+        assert "account_delete_purged" not in [
+            e["operation"] for e in capture_audit]
+
+    def test_purge_unparseable_stamp_is_purged(self, sb_client, capture_audit,
+                                               monkeypatch):
+        """#4029 FIX 4.1 (account path): a corrupt (unparseable) ``deleted_at``
+        must be PURGED, not skipped — a corrupt row must not retain the auth
+        account forever.
+
+        RED condition: ``_stored_grace_elapsed``'s defensive except returns
+        False, so the corrupt row survives and the auth user is never erased.
+        MUTATION CONFIRMED RED: change ``return True`` to ``return False`` in
+        ``_stored_grace_elapsed``'s ``except Exception`` — ``deleted`` stays
+        empty and the ledger row survives.
+
+        The stamp is ``"!!!"`` deliberately: the sweep's ``deleted_at lte
+        now`` prefilter is a lexicographic string compare, and ``'!' < '2'``
+        makes the row reach ``_stored_grace_elapsed`` (an ISO-shaped bad stamp
+        would be filtered out before the defensive branch runs).
+        """
+        tc, fake, _ = sb_client  # noqa: RUF059
+        fake.seed("account_deletions", [
+            {"user_id": OWNER, "deleted_at": "!!!", "grace_hours": 1},
+        ])
+        deleted: list[str] = []
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user",
+                            lambda uid: (deleted.append(uid), 204)[1])
+
+        ha_mod._purge_deleted_accounts()
+
+        assert deleted == [OWNER]
+        assert fake.tables["account_deletions"] == []
+        ops = [e["operation"] for e in capture_audit]
+        assert ops.count("account_delete_purged") == 1

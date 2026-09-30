@@ -16,14 +16,31 @@
 -- failure leaves the row in place for the next sweep; an ON DELETE CASCADE from
 -- auth.users would silently drop the anchor the moment the auth user is erased.
 --
+-- TWO-PHASE STAMP (code review of #4029): the row is INSERTed BEFORE the org
+-- cascade runs, carrying `org_ids` — the set this deletion intends to cascade.
+-- The cascade itself REMOVES the owner memberships `sole_owned_org_ids`
+-- discovers by, so if it failed after that removal but before the org stamp the
+-- retry could no longer rediscover the org by membership: the org would be left
+-- un-stamped AND undiscoverable, its graph intact and its pending invitations
+-- stranded. The persisted `org_ids` is that retry anchor. `deleted_at` /
+-- `grace_hours` stay NULL until the cascade COMPLETES (stamped LAST), so a
+-- partial failure leaves the account un-stamped while the intended org set
+-- survives — the same fail-closed ordering the per-org cascade uses.
+--
 -- Additive only. Service-role reads/writes only (RLS deny-by-default); the
 -- window itself is never stated here — the sole authority is
 -- `tortoise/retention.py` (see docs/retention-and-deletion.md).
 
 CREATE TABLE IF NOT EXISTS public.account_deletions (
     user_id     uuid PRIMARY KEY,
-    deleted_at  timestamptz NOT NULL,
-    grace_hours numeric NOT NULL,
+    -- The intended cascade set, persisted BEFORE the cascade. jsonb (not
+    -- uuid[]) so the anchor survives an org id the control plane did not mint
+    -- and never fails a write on a shape the rest of the row accepts.
+    org_ids     jsonb NOT NULL DEFAULT '[]'::jsonb,
+    -- NULL until the cascade completes: written LAST so a partial cascade
+    -- leaves the account un-stamped for a retry (see the header).
+    deleted_at  timestamptz,
+    grace_hours numeric,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
