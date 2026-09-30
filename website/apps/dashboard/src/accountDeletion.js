@@ -19,7 +19,7 @@ export const DELETE_ACCOUNT_WARNING =
   "Deleting your personal account will also delete any teams for which you're the only owner"
 
 export function DeleteAccountSection({
-  open, busy, graceDays, error, onOpen, onCancel, onConfirm,
+  open, busy, error, onOpen, onCancel, onConfirm,
 }) {
   const h = React.createElement
   return h(
@@ -47,8 +47,9 @@ export function DeleteAccountSection({
           h('h3', null, 'Delete your personal account?'),
           h('p', { className: 'danger-note' }, DELETE_ACCOUNT_WARNING),
           h('p', { className: 'dim small' },
-            'This is permanent once the recovery window ends. You can restore within '
-            + `${graceDays} days, or cancel now and nothing changes.`),
+            'Confirming removes your account now. Within the recovery window it can '
+            + 'be recovered by contacting support; after that it is permanently '
+            + 'erased. Cancel now and nothing changes.'),
           error ? h('p', { className: 'error', role: 'alert' }, error) : null,
           h(
             'div',

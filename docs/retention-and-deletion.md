@@ -146,9 +146,9 @@ delete, no account left in an ambiguous state. The warning is the safeguard;
 it is not cosmetic.
 
 The warning is a **product control**, not policy copy: it ships with the
-in-product deletion flow, which does not exist yet, and privacy §16 states that
-the policy does not yet promise one. The customer copy therefore states the
-**consequence** (below) without promising a UI it cannot yet show.
+in-product deletion flow that **#4029 adds**, and privacy §16 now describes that
+flow. The policy copy therefore states the **consequence** (below); the warning
+itself stays in the product, where the decision is made.
 
 A solely-owned team deleted this way goes through the **team-account** purge
 (`tortoise/hosted_api.py` `_purge_deleted_orgs`), so its nested custom-graph
@@ -269,13 +269,19 @@ this document supersedes them): `docs/plans/2026-09-06-2304-delete-trash-can.md`
 
 > **Privacy §6 is OWNER-APPROVED.** The owner ruled (2026-09-18): *"Delete =
 > gone from your view immediately · restorable for 7 days · no copy remains
-> after about four weeks."* The approved §6 bullets are quoted below and are now
-> applied to `website/privacy.html` and its mirror
-> `docs/drafts/2026-08-08-657-privacy-draft.md`. The §"Deletion scope" sentence
+> after about four weeks."* The approved §6 bullets are quoted below; each is
+> labelled **applied** or **superseded**, and `website/privacy.html` carries
+> exactly the applied text. The §"Deletion scope" sentence
 > was **applied 2026-09-30** (rulings 1B + 2B; quoted below). `website/dpa.html`
 > §11 already states the backup carve-out as *up to four weeks*, which is what
 > ruling 2B requires, so it was left **unchanged** and remains pending the
 > owner's confirmation.
+>
+> **Mirror note.** `docs/drafts/2026-08-08-657-privacy-draft.md` is **not** a
+> mirror kept in sync: it is the `doc_status: draft` snapshot taken to the
+> G-gate *before* owner approval, and `website/privacy.html` is the published
+> artifact produced from the approved version. It is deliberately left as the
+> historical draft — its old §6/§16 wording is not policy drift.
 >
 > **Division of labour.** The policy copy states the **restore window** as one
 > number (7 days), the **backup horizon** as one number (four weeks), and the
@@ -285,17 +291,25 @@ this document supersedes them): `docs/plans/2026-09-06-2304-delete-trash-can.md`
 > caveat, and the mirror note live in the sections above. The doc explains; the
 > policy states. Neither may contradict the other.
 
-**Privacy §6 — the approved list items (applied):**
+**Privacy §6 — the approved list items:**
+
+**Memory graphs (applied 2026-09-18):**
 
 > **Memory graphs.** Deleting a memory graph removes it from your view
 > immediately and revokes its API keys. It stays restorable from the
 > organization's "Trash" for 7 days. After that it is permanently erased,
 > together with its backup copies.
 
+**The original Backups bullet — SUPERSEDED 2026-09-30, NOT applied:**
+
 > **Backups.** Our backups cover the last four weeks. A backup taken while your
 > data was live can therefore still contain it for up to four weeks. A deleted
 > memory graph is not in that category — its own backups are erased when its
 > 7-day window ends.
+
+The wording above was the approved §6 Backups bullet and is kept here as
+history; ruling 2B replaced it in `website/privacy.html` with the version under
+*the backup path distinction* below, which is the applied text.
 
 **Privacy §6 — account deletion (owner ruling 2026-09-30, applied):**
 
@@ -315,8 +329,8 @@ this document supersedes them): `docs/plans/2026-09-06-2304-delete-trash-can.md`
 
 The 1B warning ("Deleting your personal account will also delete any teams for
 which you're the only owner", confirm/cancel) is deliberately **not** in the
-policy copy: it is a control on the in-product flow, which does not exist yet,
-and privacy §16 states that the policy does not promise such a feature.
+policy copy: it is a control on the in-product flow **#4029 ships**, so it
+belongs in the product, not in the policy.
 
 **Privacy §"Deletion scope" — applied 2026-09-30 (was pending confirmation):**
 

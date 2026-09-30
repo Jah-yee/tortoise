@@ -9177,7 +9177,6 @@ function claimIntentInFlight() {
           <DeleteAccountSection
             open={deleteAccountOpen}
             busy={deleteAccountBusy}
-            graceDays={TRASH_GRACE_DAYS}
             error={deleteAccountError}
             onOpen={() => { setDeleteAccountError(''); setDeleteAccountOpen(true) }}
             onCancel={() => setDeleteAccountOpen(false)}
