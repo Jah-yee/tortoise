@@ -2147,6 +2147,82 @@ class TestAccountDeletionCycle3:
         ops = [e["operation"] for e in capture_audit]
         assert ops.count("account_delete_purged") == 1
 
+    def test_purge_claims_in_window_org_before_its_access_kill(
+            self, sb_client, monkeypatch):
+        """G — the ERASURE sweep must durably CLAIM an in-window org before it
+        kills that org's access, exactly as the endpoint does.
+
+        Sole-ownership discovery reads ACTIVE owner rows, so a fault AFTER
+        ``remove_org_memberships`` makes an org unreachable by discovery
+        forever — and this sweep is the LAST chance to reach it, because the
+        endpoint early-returns once the account is stamped. Without a durable
+        claim, sweep 2 re-derives nothing, **erases the account anyway**, and
+        leaves the org un-stamped, ownerless and invisible to
+        ``_purge_deleted_orgs`` (and, when the fault lands on
+        ``revoke_org_invitations``, with a still-redeemable pending
+        invitation, since ``invitation_accept``'s kill-switch is
+        ``org.deleted_at``). This is the cycle-1 orphan shape re-entering
+        through the purge.
+
+        RED condition: the sweep cascades without claiming, so sweep 1's fault
+        leaves the org unreachable in sweep 2, which erases the account and
+        orphans it.
+        MUTATION CONFIRMED RED: delete the
+        ``claim_account_deletion_org(cp, user_id, org_id)`` call from
+        ``_purge_deleted_accounts``'s cascade loop — after sweep 2,
+        ``org["deleted_at"] is None`` while ``deleted == [OWNER]``.
+        """
+        import tortoise.supabase_control as sc
+
+        tc, fake, _ = sb_client  # noqa: RUF059
+        past = (datetime.now(timezone.utc)  # noqa: UP017
+                - timedelta(days=8)).isoformat()
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "org_ids": [], "claimed_org_ids": [],
+            "deleted_at": past, "grace_hours": 24,
+        }])
+        # A team acquired inside the window: solely owned at erasure time, in
+        # NEITHER the frozen intent set NOR (yet) the claim set.
+        fake.seed("organizations", [_account_org(ORG_ID)])
+        fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
+        fake.seed("api_keys", [_key_row()])
+        deleted: list[str] = []
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user",
+                            lambda uid: (deleted.append(uid), 204)[1])
+
+        # The access-kill faults ONCE, AFTER membership removal — the exact
+        # point that destroys discoverability.
+        real_revoke = sc.revoke_org_invitations
+        calls = {"n": 0}
+
+        def flaky(cp, org_id, now):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient control-plane fault")
+            return real_revoke(cp, org_id, now)
+
+        monkeypatch.setattr(sc, "revoke_org_invitations", flaky)
+
+        # ---- sweep 1: faults after the memberships are gone.
+        ha_mod._purge_deleted_accounts()
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org.get("deleted_at") is None, "precondition: sweep 1 did not stamp"
+        assert all(m["status"] == "removed"
+                   for m in fake.tables["org_memberships"]), "precondition"
+        assert deleted == [], (
+            "the account must NOT be erased while an org it owns is unstamped")
+        assert ORG_ID in fake.tables["account_deletions"][0]["claimed_org_ids"], (
+            "the sweep must durably claim the org BEFORE its access-kill")
+
+        # ---- sweep 2: discovery is blind now, so only the CLAIM reaches it.
+        ha_mod._purge_deleted_accounts()
+        assert deleted == [OWNER], "sweep 2 erased the account"
+        assert fake.tables["account_deletions"] == [], "ledger row gone"
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org["deleted_at"] is not None, "org outlived the erased account"
+        assert org["grace_hours"] == 24, "the account's stored promise"
+        assert all(k["revoked_at"] for k in fake.tables["api_keys"])
+
     def test_recascade_does_not_move_an_already_stamped_org_window(
             self, sb_client, as_user, monkeypatch):
         """D — a re-cascade must never move an already-stamped org's window.

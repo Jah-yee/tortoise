@@ -82,8 +82,14 @@ GRANT ALL ON public.account_deletions TO service_role;
 -- `[X]` read, A widens to `[X,W]` and access-kills W, B — holding its stale
 -- `[X]` read — writes `[X,Z]`, dropping W with W now undiscoverable).
 --
--- Guarded on `deleted_at IS NULL`: once the account is stamped its set is
--- frozen with the promise, so a late call is inert. Idempotent per org.
+-- NOT guarded on `deleted_at`: the ERASURE sweep (`_purge_deleted_accounts`) is
+-- the last chance to reach an org acquired inside the grace window, and it runs
+-- only on rows whose `deleted_at` is already stamped — so a `deleted_at IS NULL`
+-- guard made the claim structurally impossible at the one moment it is needed,
+-- leaving a fault after membership removal to orphan the org while the account
+-- was erased (#4029 cycle-3 P1). Widening `claimed_org_ids` cannot move the
+-- promise: this function never touches `deleted_at` or `grace_hours`.
+-- Idempotent per org.
 -- SECURITY DEFINER + service_role only, mirroring the other control-plane RPCs.
 -- ============================================================================
 CREATE OR REPLACE FUNCTION public.account_deletion_claim_org(
@@ -101,7 +107,6 @@ AS $$
                           THEN org_ids
                           ELSE org_ids || to_jsonb(p_org_id) END
      WHERE user_id = p_user_id
-       AND deleted_at IS NULL
        AND p_org_id IS NOT NULL
        AND btrim(p_org_id) <> ''
        AND NOT (claimed_org_ids ? p_org_id);

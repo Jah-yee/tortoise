@@ -19550,6 +19550,7 @@ def _purge_deleted_accounts() -> None:
     """
     try:
         from tortoise.supabase_control import (
+            claim_account_deletion_org,
             get_control_plane,
             is_supabase_enabled,
             purge_account_deletion,
@@ -19564,7 +19565,8 @@ def _purge_deleted_accounts() -> None:
         cp = get_control_plane()
         for row in cp.query(
             "account_deletions",
-            select=["user_id", "deleted_at", "grace_hours"],
+            select=["user_id", "deleted_at", "grace_hours",
+                    "claimed_org_ids"],
             filters=[("deleted_at", "lte", now_dt.isoformat())],
         ):
             user_id = row.get("user_id")
@@ -19586,7 +19588,24 @@ def _purge_deleted_accounts() -> None:
                 except Exception:
                     org_grace = env_grace
                 cascade_now = now_dt.isoformat()
-                for org_id in sole_owned_org_ids(cp, user_id):
+                # Claim BEFORE the access-kill, exactly as the endpoint does.
+                # The cascade destroys the membership rows a LATER sweep would
+                # rediscover the org by, and this sweep is the last chance to
+                # reach an org acquired inside the grace window (the endpoint
+                # early-returns once the account is stamped, so nothing else
+                # ever looks again). Without the claim, a fault after
+                # membership removal left the org un-stamped, ownerless and
+                # invisible to `_purge_deleted_orgs` while the account was
+                # erased — the cycle-1 orphan shape re-entering here (#4029
+                # cycle-3 P1). A failed claim RAISES: erasing the account
+                # without a durable reach to its orgs is the one ordering
+                # that cannot be recovered, so the sweep must skip the row
+                # and retry instead.
+                purge_org_ids = _merge_org_ids(
+                    _account_org_ids_from_row(row, "claimed_org_ids"),
+                    sole_owned_org_ids(cp, user_id))
+                for org_id in purge_org_ids:
+                    claim_account_deletion_org(cp, user_id, org_id)
                     _cascade_soft_delete_org_sync(org_id, cascade_now, org_grace)
                 status = _supabase_admin_delete_user(user_id)
                 # Fail-closed: a successful erasure is EXACTLY 200/204 (the
