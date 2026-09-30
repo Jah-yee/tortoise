@@ -1450,6 +1450,99 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("[remote branches]", out)
         self.assertIn("refs/remotes/origin/fix/3061-collision", out)
 
+    def test_merge_queue_hash_branch_is_not_a_claim(self):
+        # #3611 (escalation to a BLOCKING surface): `mergify/merge-queue/<hash>`
+        # is a GENERATED branch — created and deleted by the merge queue for
+        # each queued PR — so its name is a hash that can begin with the issue
+        # number. Measured instance: `mergify/merge-queue/6160bad001` made
+        # `collision_preflight 6160` report exit 1 with that queue branch as its
+        # ONLY hit, so an issue nobody held was reported as held and dropped
+        # from the queue.
+        #
+        # The number here LEADS the hex run, which the digest guard deliberately
+        # does NOT exclude (`3061cafe` must stay a live reference), so ORIGIN is
+        # the only thing that can separate these two cases — which is why the
+        # fix tests the namespace rather than loosening the number rule.
+        _git(self.repo, "update-ref",
+             "refs/remotes/origin/mergify/merge-queue/3061bad001", "HEAD")
+        rc, out = self.run_tool()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("VERDICT: CLEAN", out)
+        self.assertNotIn("do NOT dispatch", out)
+        # The ref WAS present, so a green run is not a fixture artefact.
+        self.assertNotIn("mergify/merge-queue", out)
+
+    def test_lane_branch_leading_a_hex_run_still_collides(self):
+        # Control for the test above: excluding a GENERATED namespace must not
+        # exclude a lane's branch that merely LOOKS hex-ish. `3061cafe` is a
+        # name a lane can write, so it must remain a blocking hit — this pins
+        # the fix against being widened into "nothing hex-looking counts".
+        _git(self.repo, "update-ref",
+             "refs/remotes/origin/fix/3061cafe", "HEAD")
+        rc, out = self.run_tool()
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertIn("refs/remotes/origin/fix/3061cafe", out)
+
+    def test_a_lane_branch_under_mergify_not_merge_queue_still_collides(self):
+        # ⛔ THE WIDTH OF THE FILTER IS A FAIL-CLOSED DECISION. A lane CAN create
+        # `mergify/<issue>-name` locally, and any namespace wider than
+        # `mergify/merge-queue/` renders that branch invisible on a BLOCKING
+        # surface: a false CLEAN, which for this tool is strictly worse than a
+        # false COLLISION. This pins the narrower namespace so the filter cannot
+        # be widened again without a decision.
+        for ref in (f"mergify/{ISSUE}-lane", f"mergify/{ISSUE}-lane-local"):
+            with self.subTest(ref=ref):
+                _git(self.repo, "update-ref", f"refs/remotes/origin/{ref}", "HEAD")
+                rc, out = self.run_tool()
+                self.assertNotEqual(rc, 0, f"ref={ref!r}\n{out}")
+                self.assertIn("VERDICT: COLLISION", out)
+                self.assertIn(f"refs/remotes/origin/{ref}", out)
+
+    def test_second_mergify_namespace_and_ci_bot_branch_are_not_claims(self):
+        # Two further generated namespaces exist in this repo's real refs.
+        # `mq/merge-queue/` is a second Mergify merge-queue namespace;
+        # `chore/ci-timing-refresh-` is minted by this repo's own workflow from
+        # `git rev-parse --short HEAD`, so a short SHA can LEAD with an issue
+        # number exactly like the hash this filter exists for.
+        for ref in (f"mq/merge-queue/{ISSUE}bad001",
+                    f"chore/ci-timing-refresh-{ISSUE}bad001"):
+            with self.subTest(ref=ref):
+                _git(self.repo, "update-ref", f"refs/remotes/origin/{ref}", "HEAD")
+                rc, out = self.run_tool()
+                self.assertEqual(rc, 0, f"ref={ref!r}\n{out}")
+                self.assertIn("VERDICT: CLEAN", out)
+                self.assertNotIn("do NOT dispatch", out)
+                self.assertNotIn(ref, out)
+
+    def test_worktree_on_a_generated_branch_is_still_found_by_its_path(self):
+        # ⛔ THE WORKTREE HALF IS THE LOAD-BEARING ONE. The filter skips only the
+        # BRANCH; the PATH must still be matched in full, or a real worktree on a
+        # generated branch becomes invisible on a BLOCKING surface.
+        self.add_worktree(f"{ISSUE}-queue-wt",
+                          branch=f"mergify/merge-queue/{ISSUE}bad001")
+        rc, out = self.run_tool()
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertIn("[local worktrees]", out)
+        self.assertIn(f"{ISSUE}-queue-wt", out)
+
+    def test_ci_timing_branch_with_a_descriptive_tail_is_still_a_claim(self):
+        # `chore/ci-timing-refresh-` sits under the LANE-OWNED `chore/`
+        # namespace, so the bare prefix would be too wide — a lane could write a
+        # descriptive tail. The generator mints a lowercase short SHA, so the
+        # tail is anchored to lowercase hex; anything else stays a claim, because
+        # hiding one on a BLOCKING surface is worse than a false COLLISION.
+        for ref in (f"chore/ci-timing-refresh-{ISSUE}-manual",
+                    f"chore/ci-timing-refresh-{ISSUE}",
+                    f"chore/ci-timing-refresh-{ISSUE}BAd001"):
+            with self.subTest(ref=ref):
+                _git(self.repo, "update-ref", f"refs/remotes/origin/{ref}", "HEAD")
+                rc, out = self.run_tool()
+                self.assertNotEqual(rc, 0, f"ref={ref!r}\n{out}")
+                self.assertIn("VERDICT: COLLISION", out)
+                self.assertIn(ref, out)
+
     def test_local_branch_hit(self):
         _git(self.repo, "branch", "fix/3061-collision-preflight")
         rc, out = self.run_tool()
