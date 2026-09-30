@@ -732,6 +732,52 @@ def mcp_slow_tool():
         ms._pending_mcp_wait_bound.clear()
 
 
+@pytest.fixture
+def mcp_slow_tool_wide_window():
+    """A LONGER slow tool, for the one test that must also prove the SSE began.
+
+    ⛔ Why this exists rather than reusing ``mcp_slow_tool``. That test has to
+    satisfy TWO constraints at once, and the tool's duration is what makes room
+    between them:
+
+    * the SSE response must have STARTED before the transport bound
+      (``pre_sse + transport_overhead < bound``), or the middleware answers
+      its pre-SSE ``504`` and the seam's in-band refusal is never reached —
+      which is a CORRECT refusal, just not the path under test; and
+    * the seam must still REFUSE in band, which needs the REMAINING deadline
+      (``bound - pre_sse``) to be shorter than the tool.
+
+    Those two bracket the bound: ``pre_sse + overhead < bound < pre_sse + tool``.
+    With the 0.3 s tool and a 0.2 s pre-SSE cost the whole window was 0.1 s wide,
+    so a loaded runner whose SSE-start overhead exceeded 0.1 s failed the test
+    while the code behaved correctly (measured on GitHub-hosted CI, run
+    36683819665 job 109812248686: ``assert 504 == 200``). A longer tool widens
+    the window without weakening any assertion.
+    """
+    from fastmcp.tools import FunctionTool
+
+    from tortoise import mcp_server as ms
+
+    finished: list = []
+
+    async def _bound_slower() -> dict:
+        await asyncio.sleep(1.2)
+        finished.append(True)
+        return {"ok": True}
+
+    ms.mcp.add_tool(FunctionTool.from_function(
+        _bound_slower, name="_bound_slower",
+        description="wait-bound test: slow, wide window"))
+    try:
+        yield finished
+    finally:
+        try:  # noqa: SIM105
+            ms.mcp.local_provider.remove_tool("_bound_slower")
+        except Exception:
+            pass
+        ms._pending_mcp_wait_bound.clear()
+
+
 @pytest.mark.asyncio
 async def test_mcp_dispatch_is_bounded_with_the_shipped_refusal(
         fast_bound, mcp_slow_tool, monkeypatch):
@@ -800,7 +846,7 @@ def test_mcp_http_sse_path_delivers_the_refusal(
 
 
 def test_mcp_seam_spends_the_transport_deadline_not_a_fresh_one(
-        mcp_slow_tool, monkeypatch):
+        mcp_slow_tool_wide_window, monkeypatch):
     """#3834 F1: ONE deadline, not two.
 
     The middleware's deadline is abandoned the moment ``http.response.start``
@@ -816,6 +862,19 @@ def test_mcp_seam_spends_the_transport_deadline_not_a_fresh_one(
     MCP sub-app and injects a 0.2 s pre-SSE cost, then asserts the caller only
     waits the bound (+ε). The sibling SSE test mounts the MCP app with NO parent
     middleware, which is precisely why it could not see this.
+
+    ⛔ THE SIZES ARE LOAD-BEARING — do not tighten them back. This test needs
+    the SSE response to have STARTED before the bound, or the middleware answers
+    its pre-SSE ``504`` (correct behaviour, wrong path) instead of letting the
+    seam refuse in band. That requirement and the seam's need to still refuse
+    bracket the bound as ``pre_sse + overhead < bound < pre_sse + tool``; at
+    0.2 / 0.3 / 0.3 the window was 0.1 s wide and a loaded runner whose SSE-start
+    overhead exceeded it failed this test while the code was correct (measured
+    on GitHub-hosted CI, run 36683819665 job 109812248686: ``assert 504 == 200``
+    with the bound logged as ``(0s)`` — that is ``%.0f`` of ``0.3``, not a zero
+    bound). 0.2 / 1.0 / 1.2 gives the same arithmetic a 0.8 s window, so the
+    assertions below stay exactly as strict and the outcome stops depending on
+    how fast the runner's first SSE write is.
     """
     from contextlib import asynccontextmanager
 
@@ -825,7 +884,9 @@ def test_mcp_seam_spends_the_transport_deadline_not_a_fresh_one(
 
     from tortoise import mcp_server as ms
 
-    bound = 0.3
+    # See the docstring: bound - pre_sse (0.8 s) must exceed the SSE-start
+    # overhead AND stay under the tool's 1.2 s so the seam still refuses.
+    bound = 1.0
     monkeypatch.setattr(ma, "_TRANSPORT_WAIT_BOUND_S", bound)
     monkeypatch.setattr(ha, "_track_analytics_event", lambda *a, **k: None)
 
@@ -860,7 +921,7 @@ def test_mcp_seam_spends_the_transport_deadline_not_a_fresh_one(
             # pre-SSE cost TWICE — measuring the redirect, not the deadline.
             r = client.post("/mcp/", headers=_MCP_HEADERS, json={
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "_bound_slow", "arguments": {}}})
+                "params": {"name": "_bound_slower", "arguments": {}}})
             elapsed = time.perf_counter() - t0
     finally:
         ms._pending_mcp_wait_bound.clear()
