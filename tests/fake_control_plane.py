@@ -998,6 +998,20 @@ class FakeControlPlane:
             return updated if select is not None else []
         if method == "POST":
             row = dict(json_body or {})
+            if table == "account_deletions":
+                # #4029: user_id is the PRIMARY KEY. A second INSERT (a
+                # concurrent schedule racing the first) is a unique violation
+                # → PostgREST 409, which DELETE /v1/user/account treats as
+                # already-scheduled. Without this the fake would accept a
+                # duplicate the real table rejects, and the endpoint's
+                # first-write-wins promise would be untested.
+                _uid = row.get("user_id")
+                if _uid is not None and any(
+                        str(r.get("user_id")) == str(_uid)
+                        for r in self.tables.get(table, [])):
+                    raise RuntimeError(
+                        "Supabase control-plane query failed "
+                        f"({table}): HTTP 409")
             if table == "abuse_events" and row.get("created_at") is None:
                 # mirror the DB column default now() — window gt-filters need it
                 from datetime import datetime, timezone

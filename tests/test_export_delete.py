@@ -1287,3 +1287,359 @@ class TestSensitiveRateLimit:
         assert tc.get("/v1/organizations/nope/export").status_code == 403  # budget 2
         assert tc.get("/v1/organizations/nope/export").status_code == 429  # exhausted
         ha_mod._SENSITIVE_BUCKETS.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #4029 — user-account deletion (delete my account → grace → erasure)
+#
+# Owner ruling (2026-09-30): decision 1B — the account's SOLELY-owned teams are
+# deleted with it, reusing the team cascade; decision 2B — backups age out (no
+# active backup deletion on the account path). The confirm popup is the
+# safeguard for 1B; the backend contract is what these tests pin.
+#
+# Class-B mutation evidence: each test's docstring names the mutation that was
+# run to confirm it goes RED (applied, observed, reverted).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _account_org(org_id: str, **overrides) -> dict:
+    return dict(FREE_TEAM, id=org_id, **overrides)
+
+
+class TestAccountDeletion:
+    def test_cascades_only_solely_owned_teams(self, sb_client, as_user,
+                                              capture_audit):
+        """DELETE /v1/user/account cascades the solely-owned team and ONLY it.
+
+        RED condition: the org cascade runs for an org where a second owner
+        remains (the shared team's keys/memberships would be revoked and its
+        ``deleted_at`` stamped). MUTATION CONFIRMED RED: in
+        ``sole_owned_org_ids`` replace the ``all(... owner == user_id)`` check
+        with ``True`` — ``teams_deleted`` becomes both orgs and the shared-team
+        assertions fail.
+        """
+        tc, fake, _ = sb_client
+        fake.seed("organizations", [_account_org(ORG_ID),
+                                    _account_org("team-shared")])
+        fake.seed("org_memberships", [
+            _membership_row(user_id=OWNER),                       # sole owner
+            _membership_row(org_id="team-shared", user_id=OWNER),
+            _membership_row(org_id="team-shared", user_id=_U2),   # 2nd owner
+        ])
+        fake.seed("api_keys", [_key_row(),
+                               _key_row(id="key-002", org_id="team-shared")])
+        fake.seed("invitations", [{
+            "id": "inv-1", "org_id": ORG_ID, "email": "bob@example.com",
+            "role": "member", "status": "pending", "expires_at": None,
+        }])
+        as_user()
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["teams_deleted"] == [ORG_ID]
+        assert body["grace_hours"] == RESTORE_WINDOW_HOURS
+        assert body["status"] == "delete_scheduled"
+
+        # the solely-owned org: access-kill first, stamp last
+        assert all(k["revoked_at"] for k in fake.tables["api_keys"]
+                   if k["org_id"] == ORG_ID)
+        assert all(m["status"] == "removed"
+                   for m in fake.tables["org_memberships"]
+                   if m["org_id"] == ORG_ID)
+        assert all(i["status"] == "revoked"
+                   for i in fake.tables["invitations"])
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org["deleted_at"]
+        assert org["grace_hours"] == RESTORE_WINDOW_HOURS
+
+        # the shared org is UNTOUCHED
+        assert all(k["revoked_at"] is None for k in fake.tables["api_keys"]
+                   if k["org_id"] == "team-shared")
+        assert all(m["status"] == "active"
+                   for m in fake.tables["org_memberships"]
+                   if m["org_id"] == "team-shared")
+        shared = next(o for o in fake.tables["organizations"]
+                      if o["id"] == "team-shared")
+        assert shared.get("deleted_at") is None
+
+        # the account ledger row (the account-delete promise)
+        assert [d["user_id"] for d in fake.tables["account_deletions"]] == [OWNER]
+        ops = [e["operation"] for e in capture_audit]
+        assert ops.count("account_delete_requested") == 1
+
+    def test_anon_second_owner_blocks_sole_ownership(self, sb_client, as_user):
+        """A second owner whose ``user_id`` is NULL (the anon agent anchor)
+        still makes the org NOT solely owned.
+
+        RED condition: the owner comparison is done with a ``user_id neq``
+        filter (SQL ``<>`` excludes NULL), so the NULL owner is invisible and
+        the team is wrongly deleted. MUTATION CONFIRMED RED: replace the Python
+        ``all(r.get("user_id") == user_id ...)`` owners check with an owners
+        query filtered ``("user_id", "neq", user_id)`` plus an ``if not rows``
+        test — the team is cascaded and ``teams_deleted`` is non-empty.
+        """
+        tc, fake, _ = sb_client
+        fake.seed("organizations", [_account_org(ORG_ID)])
+        fake.seed("org_memberships", [
+            _membership_row(user_id=OWNER),
+            _membership_row(user_id=None, identity="anon-agent-1"),
+        ])
+        fake.seed("api_keys", [_key_row()])
+        as_user()
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        assert r.json()["teams_deleted"] == []
+        assert fake.tables["api_keys"][0]["revoked_at"] is None
+        assert fake.tables["organizations"][0].get("deleted_at") is None
+        assert all(m["status"] == "active"
+                   for m in fake.tables["org_memberships"])
+
+    def test_placeholder_membership_is_never_an_org(self, sb_client, as_user):
+        """The signup placeholder (``org_id=''``) is not a deletable team.
+
+        RED condition: ``sole_owned_org_ids`` keeps the placeholder row, so the
+        account cascade tries to delete a non-existent org (``teams_deleted``
+        would include ``''``). MUTATION CONFIRMED RED: delete the
+        ``if not org_id: continue`` guard.
+        """
+        tc, fake, _ = sb_client
+        fake.seed("org_memberships", [
+            _membership_row(user_id=OWNER, org_id="", status="active"),
+        ])
+        as_user()
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        assert r.json()["teams_deleted"] == []
+
+    def test_replay_honors_stored_grace(self, sb_client, as_user, monkeypatch):
+        """A repeat request answers 200-already from the STORED promise, never
+        a fresh env read.
+
+        RED condition: the replay returns the current env grace instead of the
+        row's stored ``grace_hours``. MUTATION CONFIRMED RED: set
+        ``replay_grace = grace_hours`` (the env value 168) in the replay branch
+        — the assertion of 24 fails.
+        """
+        monkeypatch.setenv("TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS", "168")
+        tc, fake, _ = sb_client
+        one_hour_ago = (
+            datetime.now(timezone.utc) - timedelta(hours=1)  # noqa: UP017
+        ).isoformat()
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "deleted_at": one_hour_ago, "grace_hours": 24,
+        }])
+        as_user()
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["already"] is True
+        assert body["status"] == "delete_pending"
+        assert body["grace_hours"] == 24  # stored, not the env 168
+        assert body["teams_deleted"] == []
+        # no re-cascade on the replay
+        assert fake.tables.get("organizations", []) == []
+
+    def test_idempotent_second_call_replays(self, sb_client, as_user):
+        """Two sequential calls: 202 then 200-already (no duplicate ledger
+        row, no duplicate audit event).
+
+        RED condition: the second call re-cascades and re-INSERTs instead of
+        replaying, so it answers 202 (or a 409 escapes) instead of 200-already
+        and the ledger grows a second row. MUTATION CONFIRMED RED: delete the
+        ``if existing:`` early-return block in ``delete_user_account``.
+        """
+        tc, fake, _ = sb_client
+        fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
+        as_user()
+        first = tc.delete("/v1/user/account")
+        assert first.status_code == 202, first.text
+        second = tc.delete("/v1/user/account")
+        assert second.status_code == 200, second.text
+        assert second.json()["already"] is True
+        assert len(fake.tables["account_deletions"]) == 1
+        assert second.json()["deleted_at"] == first.json()["deleted_at"]
+
+    def test_requires_auth(self, sb_client):
+        """No session → 401 (the endpoint acts on the authenticated account).
+
+        RED condition: the route is reachable without a session, so the
+        request schedules a deletion with no authenticated actor. MUTATION
+        CONFIRMED RED: drop ``user: dict = Depends(get_current_user)`` from the
+        ``delete_user_account`` signature.
+        """
+        tc, _, _ = sb_client
+        assert tc.delete("/v1/user/account").status_code == 401
+
+    def test_registry_mode_unsupported(self, reg_client, as_user):
+        """Selfhost/registry has no hosted auth accounts → the claimed
+        ``unsupported`` shape (mirrors GET /v1/user/identity).
+
+        RED condition: the endpoint proceeds past the mode guard and answers a
+        scheduled-deletion body in registry mode. MUTATION CONFIRMED RED: delete
+        the ``if not is_supabase_enabled(): return {"unsupported": True}``
+        early return.
+        """
+        tc, _ = reg_client
+        as_user(user_id=_U2)
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"unsupported": True}
+
+    def test_account_delete_rate_limited(self, sb_client, monkeypatch, as_user):
+        """The per-IP sensitive-op budget applies (5/h → 6th is 429).
+
+        RED condition: the budget is not charged, so the 6th call is accepted
+        instead of 429. MUTATION CONFIRMED RED: delete the
+        ``await _check_sensitive_op_rate_limit(request, "account_delete")``
+        line.
+        """
+        monkeypatch.delenv("RATE_LIMIT_DISABLED", raising=False)
+        ha_mod._SENSITIVE_BUCKETS.clear()
+        tc, _, _ = sb_client
+        as_user()
+        for _ in range(5):
+            assert tc.delete("/v1/user/account").status_code in (200, 202)
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 429
+        assert "Retry-After" in r.headers
+        ha_mod._SENSITIVE_BUCKETS.clear()
+
+
+class TestAccountPurge:
+    """The erasure leg: `_purge_deleted_accounts` (boot + hourly)."""
+
+    def test_purge_erases_past_grace_and_keeps_within(self, sb_client,
+                                                      capture_audit, monkeypatch):
+        """Past-grace account → auth user erased + ledger row removed; a
+        within-grace account is untouched.
+
+        RED condition: the stored-grace decision is skipped and the
+        within-grace account is erased too. MUTATION CONFIRMED RED: delete the
+        ``if not _stored_grace_elapsed(...): continue`` guard — ``deleted``
+        gains the within-grace user and the ledger keeps only one row.
+        """
+        tc, fake, _ = sb_client  # noqa: RUF059
+        past = (datetime.now(timezone.utc)  # noqa: UP017
+                - timedelta(days=8)).isoformat()
+        recent = datetime.now(timezone.utc).isoformat()  # noqa: UP017
+        fake.seed("account_deletions", [
+            {"user_id": OWNER, "deleted_at": past,
+             "grace_hours": RESTORE_WINDOW_HOURS},
+            {"user_id": _U3, "deleted_at": recent,
+             "grace_hours": RESTORE_WINDOW_HOURS},
+        ])
+        deleted: list[str] = []
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user",
+                            lambda uid: (deleted.append(uid), 204)[1])
+
+        ha_mod._purge_deleted_accounts()
+
+        assert deleted == [OWNER]
+        assert [d["user_id"] for d in fake.tables["account_deletions"]] == [_U3]
+        ops = [e["operation"] for e in capture_audit]
+        assert ops.count("account_delete_purged") == 1
+
+    def test_purge_honors_stored_grace_over_env(self, sb_client, monkeypatch):
+        """A stored promise (168h) holds even when the env default shrinks to
+        1h; a row with NO stored grace falls back to the env.
+
+        RED condition: the env grace is applied to every row. MUTATION
+        CONFIRMED RED: pass ``env_grace`` as ``row_grace_hours`` into
+        ``_stored_grace_elapsed`` — the stored-promise account is then erased
+        and ``deleted`` contains both users.
+        """
+        monkeypatch.setenv("TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS", "1")
+        tc, fake, _ = sb_client  # noqa: RUF059
+        ten_hours_ago = (
+            datetime.now(timezone.utc) - timedelta(hours=10)  # noqa: UP017
+        ).isoformat()
+        fake.seed("account_deletions", [
+            {"user_id": OWNER, "deleted_at": ten_hours_ago, "grace_hours": 168},
+            {"user_id": _U3, "deleted_at": ten_hours_ago, "grace_hours": None},
+        ])
+        deleted: list[str] = []
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user",
+                            lambda uid: (deleted.append(uid), 204)[1])
+
+        ha_mod._purge_deleted_accounts()
+
+        assert deleted == [_U3]  # stored promise held; env fallback purged
+        assert [d["user_id"] for d in fake.tables["account_deletions"]] == [OWNER]
+
+    def test_purge_keeps_ledger_on_auth_failure(self, sb_client, capture_audit,
+                                                monkeypatch):
+        """A failed auth-user delete leaves the ledger row as the retry anchor
+        (no audit purge event); the next sweep completes it.
+
+        RED condition: the ledger row is removed before the auth delete
+        succeeds. MUTATION CONFIRMED RED: move ``purge_account_deletion``
+        BEFORE the ``_supabase_admin_delete_user`` call — the first
+        ledger-survival assertion fails.
+        """
+        tc, fake, _ = sb_client  # noqa: RUF059
+        past = (datetime.now(timezone.utc)  # noqa: UP017
+                - timedelta(days=8)).isoformat()
+        fake.seed("account_deletions", [
+            {"user_id": OWNER, "deleted_at": past,
+             "grace_hours": RESTORE_WINDOW_HOURS},
+        ])
+
+        def _boom(uid):
+            raise RuntimeError("auth-service transport failure")
+
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user", _boom)
+        ha_mod._purge_deleted_accounts()
+
+        assert [d["user_id"] for d in fake.tables["account_deletions"]] == [OWNER]
+        assert "account_delete_purged" not in [
+            e["operation"] for e in capture_audit]
+
+        # healed → the next sweep purges
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user",
+                            lambda uid: 204)
+        ha_mod._purge_deleted_accounts()
+        assert fake.tables["account_deletions"] == []
+
+    def test_purge_treats_404_as_already_erased(self, sb_client, monkeypatch):
+        """GoTrue 404 means the account is already gone — the ledger row is
+        removed (idempotent), not retried forever.
+
+        RED condition: any status >= 400 is treated as failure. MUTATION
+        CONFIRMED RED: drop the ``and status != 404`` conjunct — the ledger row
+        survives the sweep.
+        """
+        tc, fake, _ = sb_client  # noqa: RUF059
+        past = (datetime.now(timezone.utc)  # noqa: UP017
+                - timedelta(days=8)).isoformat()
+        fake.seed("account_deletions", [
+            {"user_id": OWNER, "deleted_at": past,
+             "grace_hours": RESTORE_WINDOW_HOURS},
+        ])
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user",
+                            lambda uid: 404)
+
+        ha_mod._purge_deleted_accounts()
+
+        assert fake.tables["account_deletions"] == []
+
+    def test_purge_is_a_noop_on_registry(self, reg_client, monkeypatch):
+        """Selfhost/registry has no auth accounts — the sweep returns without
+        ever resolving the Supabase control plane.
+
+        RED condition: the sweep proceeds past the ``is_supabase_enabled()``
+        guard and addresses Supabase. MUTATION CONFIRMED RED: delete that
+        guard — ``get_control_plane`` is reached and the recorded call list is
+        non-empty (the outer except swallows the raise, so the call must be
+        OBSERVED, not merely raised).
+        """
+        import tortoise.supabase_control as sc
+        tc, _ = reg_client  # noqa: RUF059
+        reached: list[int] = []
+
+        def _cp():
+            reached.append(1)
+            raise RuntimeError("registry mode must not build a Supabase client")
+
+        monkeypatch.setattr(sc, "get_control_plane", _cp)
+        ha_mod._purge_deleted_accounts()
+        assert reached == []

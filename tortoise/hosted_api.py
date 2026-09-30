@@ -138,8 +138,10 @@ from tortoise.supabase_control import _service_key  # #3677
 
 # #4179: the team-account and user-account restore windows derive from the ONE
 # authority (tortoise/retention.py). Do not hard-code a window here — see
-# docs/retention-and-deletion.md. The user-account constant records the promise
-# for the support/email deletion path (there is no self-service deletion yet).
+# docs/retention-and-deletion.md. USER_ACCOUNT_DELETE_GRACE_HOURS is the env
+# fallback for the self-service account-deletion path (#4029, DELETE
+# /v1/user/account); the env var TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS
+# overrides it, and a row's stored grace_hours always wins over both.
 TEAM_DELETE_GRACE_HOURS = _RESTORE_WINDOW_HOURS
 USER_ACCOUNT_DELETE_GRACE_HOURS = _RESTORE_WINDOW_HOURS
 
@@ -1119,6 +1121,7 @@ async def _run_boot_sweeps() -> None:
     await asyncio.sleep(0)
     for label, fn in (("event retention", _sweep_events),
                       ("deleted-team purge", _purge_deleted_orgs),
+                      ("deleted-account purge", _purge_deleted_accounts),
                       ("oauth retention", _sweep_oauth_retention)):
         try:
             await run_on_daemon_worker(fn, name="tortoise-boot-sweep")
@@ -1554,6 +1557,10 @@ async def _lifespan(app):
                                                name="tortoise-boot-sweep")
                     # #302: hard-delete past grace (sync DB work off the loop)
                     await run_on_daemon_worker(_purge_deleted_orgs,
+                                               name="tortoise-boot-sweep")
+                    # #4029: erase accounts past the stored grace (same sweep
+                    # cadence; sync DB/auth work off the loop).
+                    await run_on_daemon_worker(_purge_deleted_accounts,
                                                name="tortoise-boot-sweep")
                     # #3036: GC dead OAuth rows (sync DB work off the loop)
                     await run_on_daemon_worker(_sweep_oauth_retention,
@@ -5808,6 +5815,9 @@ _IMPORT_LEDGER_PROPS = ("last_import_sha256", "last_import_quarantined_sha256",
 
 _SENSITIVE_OP_LIMITS = {
     "export": 20, "team_delete": 5, "import": 5, "pack_manifest": 5,
+    # #4029: the account-deletion budget matches the team-delete budget —
+    # same destructiveness, same per-IP ceiling.
+    "account_delete": 5,
 }  # per hour per IP
 _SENSITIVE_BUCKETS: dict[tuple[str, str], list[float]] = defaultdict(list)
 _SENSITIVE_LOCK = asyncio.Lock()
@@ -8208,6 +8218,34 @@ def _gotrue_admin_get_user(user_id: str) -> tuple[int, dict] | None:
     except ValueError:
         body = {}
     return resp.status_code, body
+
+
+def _supabase_admin_delete_user(user_id: str) -> int:
+    """#4029: erase a Supabase auth user via the GoTrue ADMIN API (DELETE).
+
+    The account-erasure leg. Returns the HTTP status; 404 means the account is
+    already gone (the purge treats it as success — the same idempotency the
+    cleanup script's ``_gotrue_delete_user`` relies on,
+    graph-scripts/2146_e2e_live_orphan_cleanup.py). Raises RuntimeError on
+    transport failure so the purge keeps its ledger row as the retry anchor
+    instead of reporting an erasure it did not achieve.
+
+    Deleting the auth user cascades the account's ``org_memberships`` rows
+    (the FK is ON DELETE CASCADE, migration 0001/0009), so the person leaves
+    every org they merely belonged to as well.
+    """
+    import httpx
+    url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
+    try:
+        resp = httpx.delete(
+            f"{url}/auth/v1/admin/users/{user_id}",
+            headers={"Authorization": f"Bearer {key}", "apikey": key},
+            timeout=15.0,
+        )
+    except (httpx.HTTPError, httpx.TimeoutException):
+        raise RuntimeError("auth-service transport failure")  # noqa: B904
+    return resp.status_code
 
 
 def _gotrue_admin_mint_session(email: str) -> dict:
@@ -18831,6 +18869,46 @@ def _soft_delete_registry_org(org_id: str, now: str, grace_hours: float) -> None
     )
 
 
+async def _cascade_soft_delete_org(org_id: str, now: str,
+                                   grace_hours: float) -> None:
+    """The ONE org soft-delete cascade: access-kill FIRST, stamp LAST.
+
+    Extracted from ``delete_org`` (#4029) so the per-org endpoint and the
+    account-deletion cascade run the SAME sequence and cannot drift:
+
+    1. revoke every API key (``tt_`` auth fails closed),
+    2. mark active memberships removed (JWT-session access stops),
+    3. revoke pending invitations (no redemption into a deleted org),
+    4. stamp ``deleted_at`` + the promised ``grace_hours`` LAST.
+
+    Ordering is load-bearing (code-review P1, PR #873): a partial failure
+    leaves the org NOT marked deleted, so a retry re-runs the full cascade —
+    never a "deleted" org whose keys still authenticate. Mode-aware: Supabase
+    control plane vs the registry twin; sync httpx/DB work runs off the loop
+    (``to_thread``, #310 pattern).
+    """
+    from tortoise.supabase_control import (
+        get_control_plane,
+        is_supabase_enabled,
+        remove_org_memberships,
+        revoke_org_api_keys,
+        revoke_org_invitations,
+        soft_delete_org,
+    )
+    if is_supabase_enabled():
+        cp = get_control_plane()
+        await asyncio.to_thread(revoke_org_api_keys, cp, org_id, now)
+        await asyncio.to_thread(remove_org_memberships, cp, org_id, now)
+        await asyncio.to_thread(revoke_org_invitations, cp, org_id, now)
+        await asyncio.to_thread(
+            soft_delete_org, cp, org_id, now, grace_hours=grace_hours
+        )
+    else:
+        await asyncio.to_thread(
+            _soft_delete_registry_org, org_id, now, grace_hours
+        )
+
+
 @app.delete("/v1/organizations/{org_id}", status_code=202)
 async def delete_org(org_id: str, request: Request,
                       user: dict = Depends(get_current_user)):  # noqa: B008
@@ -18853,9 +18931,9 @@ async def delete_org(org_id: str, request: Request,
     owner while pending → 200 already (owner membership is removed by the
     cascade, so the replay check accepts the removed-owner state); after
     the purge the org is gone → 403 (org no longer resolvable). Supabase
-    auth user accounts are NOT deleted — no auth-admin wiring exists, and
-    a user can own multiple orgs (per-org deletion must not cascade to
-    the account).
+    auth user accounts are NOT deleted by THIS endpoint — a user can own
+    multiple orgs, so per-org deletion must not cascade to the account; the
+    account-level path is the separate ``DELETE /v1/user/account`` (#4029).
     """
     await _check_sensitive_op_rate_limit(request, "team_delete")
     org_node = await _org_node(org_id)
@@ -18890,28 +18968,10 @@ async def delete_org(org_id: str, request: Request,
         )
 
     now = datetime.now(UTC).isoformat()
-    from tortoise.supabase_control import (
-        get_control_plane,
-        is_supabase_enabled,
-        remove_org_memberships,
-        revoke_org_api_keys,
-        revoke_org_invitations,
-        soft_delete_org,
-    )
-    if is_supabase_enabled():
-        cp = get_control_plane()
-        # Access-kill first, stamp LAST (fail-closed ordering, PR #873).
-        # Sync httpx calls must not block the loop (to_thread, #310 pattern).
-        await asyncio.to_thread(revoke_org_api_keys, cp, org_id, now)
-        await asyncio.to_thread(remove_org_memberships, cp, org_id, now)
-        await asyncio.to_thread(revoke_org_invitations, cp, org_id, now)
-        await asyncio.to_thread(
-            soft_delete_org, cp, org_id, now, grace_hours=grace_hours
-        )
-    else:
-        await asyncio.to_thread(
-            _soft_delete_registry_org, org_id, now, grace_hours
-        )
+    # Access-kill first, stamp LAST (fail-closed ordering, PR #873) — the ONE
+    # cascade, shared with the account-deletion path (#4029) so they cannot
+    # drift.
+    await _cascade_soft_delete_org(org_id, now, grace_hours)
     await _async_audit(
         request, org_id, "team_delete_requested",
         resource_type="team", resource_id=org_id,
@@ -18926,6 +18986,115 @@ async def delete_org(org_id: str, request: Request,
         "note": "API keys revoked and memberships removed immediately; team "
                  "graph + control-plane rows are hard-deleted after the grace "
                  "period. Supabase auth user accounts are not deleted.",
+    }
+
+
+@app.delete("/v1/user/account", status_code=202)
+async def delete_user_account(request: Request,
+                              user: dict = Depends(get_current_user)):  # noqa: B008
+    """#4029 — self-service personal-account deletion (soft delete → grace → erasure).
+
+    Owner ruling (2026-09-30, decision 1B): the account's SOLELY-OWNED teams
+    are deleted with it, reusing the per-org cascade above — not a second
+    implementation. A team the user does not solely own (another owner
+    remains, including an anonymous agent owner) is left untouched.
+
+    Ordering mirrors the team endpoint: the org cascades (access-kill first)
+    run BEFORE the account is stamped, and the account's ``deleted_at`` +
+    ``grace_hours`` are written LAST, so a partial failure leaves the account
+    un-stamped and a retry re-runs the full, idempotent cascade. The stored
+    grace window is the sole authority for the erasure deadline; the
+    ``TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS`` env var is only the fallback
+    default for a row that carries no stored grace (#4179 contract).
+
+    Idempotent: a repeat request while pending → 200 ``already`` carrying the
+    STORED promise. AuthZ: the endpoint acts on the AUTHENTICATED account and
+    there is no account id in the request, so there is no cross-account target
+    and no existence oracle to leak; every org it touches was selected by an
+    active-owner membership. The per-IP sensitive-op budget is shared with the
+    team path's shape (``_check_sensitive_op_rate_limit``).
+
+    Registry (selfhost) mode has no hosted auth accounts → ``unsupported``,
+    mirroring ``GET /v1/user/identity``. Backups are NOT deleted on this path
+    (owner ruling 2B): they age out on the existing backup cycle; the erasure
+    below removes the auth account and the deletion ledger row.
+    """
+    await _check_sensitive_op_rate_limit(request, "account_delete")
+    from tortoise.supabase_control import (
+        account_deletion_row,
+        get_control_plane,
+        is_supabase_enabled,
+        soft_delete_account,
+        sole_owned_org_ids,
+    )
+    if not is_supabase_enabled():
+        # 200 (not the route's declared 202): nothing was scheduled. Mirrors
+        # `GET /v1/user/identity`'s `unsupported` answer.
+        return JSONResponse(status_code=200, content={"unsupported": True})
+    cp = get_control_plane()
+    user_id = user["user_id"]
+    grace_hours = float(os.environ.get(
+        "TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS",
+        str(USER_ACCOUNT_DELETE_GRACE_HOURS)))
+
+    existing = await asyncio.to_thread(account_deletion_row, cp, user_id)
+    if existing:
+        # Idempotent replay: already scheduled — answer from the STORED
+        # promise (never a fresh env read, which could move the deadline).
+        stored_grace = existing.get("grace_hours")
+        try:
+            replay_grace = float(stored_grace) if stored_grace is not None else grace_hours
+        except Exception:
+            replay_grace = grace_hours
+        try:
+            hard_delete_after = (
+                datetime.fromisoformat(str(existing.get("deleted_at")))
+                + timedelta(hours=replay_grace)
+            ).isoformat()
+        except Exception:
+            hard_delete_after = None
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "delete_pending", "already": True,
+                "deleted_at": existing.get("deleted_at"),
+                "grace_hours": replay_grace,
+                "hard_delete_after": hard_delete_after,
+                "teams_deleted": [],
+            },
+        )
+
+    now = datetime.now(UTC).isoformat()
+    org_ids = await asyncio.to_thread(sole_owned_org_ids, cp, user_id)
+    for org_id in org_ids:
+        await _cascade_soft_delete_org(org_id, now, grace_hours)
+    try:
+        # Account stamp LAST — a partial cascade above leaves this unwritten,
+        # so a retry re-runs the whole (idempotent) cascade.
+        await asyncio.to_thread(
+            soft_delete_account, cp, user_id, now, grace_hours=grace_hours)
+    except RuntimeError as exc:
+        # A concurrent request won the primary-key insert (PostgREST 409): its
+        # stored promise is the one that stands. Anything else is real.
+        if "409" not in str(exc):
+            raise
+    await _async_audit(
+        request, "", "account_delete_requested",
+        resource_type="account", resource_id=user_id,
+        actor_user_id=user_id,
+        detail={"teams_deleted": org_ids},
+    )
+    return {
+        "status": "delete_scheduled", "deleted_at": now,
+        "grace_hours": grace_hours,
+        "hard_delete_after": (
+            datetime.now(UTC) + timedelta(hours=grace_hours)
+        ).isoformat(),
+        "teams_deleted": org_ids,
+        "note": "Teams you solely own are deleted immediately (keys revoked, "
+                 "memberships removed); your account and its data are erased "
+                 "after the grace period. Backups age out on the normal backup "
+                 "cycle.",
     }
 
 
@@ -19055,6 +19224,26 @@ def _purge_registry_org(sdk, org_id: str, graph_name: str | None = None) -> None
     _drop_org_graph(org_id, graph_name)
 
 
+def _stored_grace_elapsed(row_deleted_at, row_grace_hours,
+                          env_grace: float, now_dt) -> bool:
+    """#4179: the STORED grace promised at schedule time wins over the env.
+
+    Shared by the team and account purge sweeps so the two cannot decide a
+    stored promise differently. ``env_grace`` is the fallback ONLY for a row
+    that carries no stored ``grace_hours``; an unparseable stamp purges
+    (defensive — a corrupt row must not pin data forever).
+    """
+    try:
+        deleted_dt = datetime.fromisoformat(row_deleted_at)
+    except Exception:
+        return True  # unparseable stamp → purge (defensive)
+    try:
+        gh = float(row_grace_hours) if row_grace_hours is not None else env_grace
+    except Exception:
+        gh = env_grace
+    return deleted_dt + timedelta(hours=gh) <= now_dt
+
+
 def _purge_deleted_orgs() -> None:
     """Hard-delete orgs past the soft-delete grace window (#302 E2E-6-D).
 
@@ -19094,15 +19283,8 @@ def _purge_deleted_orgs() -> None:
 
         def _past_grace(row_deleted_at, row_grace_hours) -> bool:
             """Stored grace (promised at schedule time) wins over env."""
-            try:
-                deleted_dt = datetime.fromisoformat(row_deleted_at)
-            except Exception:
-                return True  # unparseable stamp → purge (defensive)
-            try:
-                gh = float(row_grace_hours) if row_grace_hours is not None else env_grace
-            except Exception:
-                gh = env_grace
-            return deleted_dt + timedelta(hours=gh) <= now_dt
+            return _stored_grace_elapsed(
+                row_deleted_at, row_grace_hours, env_grace, now_dt)
 
         from tortoise.supabase_control import (
             get_control_plane,
@@ -19171,6 +19353,72 @@ def _purge_deleted_orgs() -> None:
                                 exc_info=True)
     except Exception as exc:
         _logger.warning("deleted-team purge sweep failed: %s", exc)
+
+
+def _purge_deleted_accounts() -> None:
+    """Erase user accounts past their stored soft-delete grace (#4029).
+
+    The account-level twin of :func:`_purge_deleted_orgs`, run on the SAME
+    boot + hourly schedule. A row in ``account_deletions`` means the account
+    was scheduled for deletion; once its STORED window elapses the account is
+    erased: the GoTrue auth user is DELETED (which cascades the person's
+    ``org_memberships`` rows in every org — ON DELETE CASCADE), then the
+    ledger row is removed.
+
+    Ordering is the retry-anchor contract (see the migration header): the auth
+    user goes FIRST and the ledger row LAST, so a failed GoTrue call leaves a
+    row the next sweep retries. A 404 from GoTrue is already-erased and counts
+    as success (idempotent).
+
+    Backup copies are NOT deleted here — the owner ruling (decision 2B on
+    #4029) leaves them to age out on the existing backup cycle. The account's
+    solely-owned orgs were already stamped at schedule time and are hard-deleted
+    by :func:`_purge_deleted_orgs` on their own stored window.
+
+    Supabase-only: selfhost has no hosted auth accounts. Fail-safe: a per-row
+    failure is logged and skipped, never crashes the loop.
+    """
+    try:
+        from tortoise.supabase_control import (
+            get_control_plane,
+            is_supabase_enabled,
+            purge_account_deletion,
+        )
+        if not is_supabase_enabled():
+            return
+        env_grace = float(os.environ.get(
+            "TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS",
+            str(USER_ACCOUNT_DELETE_GRACE_HOURS)))
+        now_dt = datetime.now(UTC)
+        cp = get_control_plane()
+        for row in cp.query(
+            "account_deletions",
+            select=["user_id", "deleted_at", "grace_hours"],
+            filters=[("deleted_at", "lte", now_dt.isoformat())],
+        ):
+            user_id = row.get("user_id")
+            if not user_id:
+                continue
+            if not _stored_grace_elapsed(
+                    row.get("deleted_at"), row.get("grace_hours"),
+                    env_grace, now_dt):
+                continue  # stored promise decides (env = fallback only)
+            try:
+                status = _supabase_admin_delete_user(user_id)
+                if status >= 400 and status != 404:
+                    raise RuntimeError(
+                        f"auth-service delete failed: HTTP {status}")
+                # Ledger row LAST — it is the retry anchor for a failed above.
+                purge_account_deletion(cp, user_id)
+                _audit_logger.append(
+                    "", user_id, "account_delete_purged",
+                    resource_type="account", resource_id=user_id,
+                )
+            except Exception:
+                _logger.warning("account purge failed for %s", user_id,
+                                exc_info=True)
+    except Exception as exc:
+        _logger.warning("deleted-account purge sweep failed: %s", exc)
 
 
 # ── Reconciliation sweep (D9 #576) — one job, three purposes ──

@@ -1935,6 +1935,65 @@ def soft_delete_org(cp, org_id: str, now: str | None = None,
     )
 
 
+# ── User-account deletion ledger (#4029) ──────────────────────────────────
+#
+# The account-level twin of the org soft-delete pair above. The account is a
+# control-plane-only concept (a Supabase auth user); selfhost has none, so the
+# caller short-circuits before these seams (mirrors /v1/user/identity).
+
+
+def account_deletion_row(cp, user_id: str) -> dict | None:
+    """The account soft-delete stamp, or None (#4029).
+
+    The idempotent-replay read: a present row means the account is already
+    delete-pending, so the endpoint answers from the STORED promise instead of
+    re-cascading. Shape-gates user_id (#1719).
+    """
+    if not _is_uuid(user_id):
+        return None
+    rows = cp.query(
+        "account_deletions",
+        select=["user_id", "deleted_at", "grace_hours"],
+        filters=[("user_id", "eq", user_id)],
+    )
+    return rows[0] if rows else None
+
+
+def soft_delete_account(cp, user_id: str, now: str | None = None,
+                        grace_hours: float = float(RESTORE_WINDOW_HOURS)) -> None:
+    """Stamp the account soft-delete ledger row (#4029).
+
+    ``grace_hours`` is persisted so the purge sweep and the idempotent replay
+    honor the ``hard_delete_after`` promised at schedule time, even if
+    ``TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS`` changes mid-grace — the same
+    stored-promise contract ``soft_delete_org`` (#302/#4179) implements.
+
+    INSERT, not upsert: the endpoint only reaches this after reading no row, so
+    a concurrent second schedule is a primary-key conflict (PostgREST 409) that
+    the caller treats as already-scheduled — a first-write-wins promise. An
+    upsert here would let the loser overwrite the winner's stored window.
+    """
+    cp.query(
+        "account_deletions",
+        method="POST",
+        json_body={"user_id": user_id, "deleted_at": now or _now_iso(),
+                   "grace_hours": grace_hours},
+    )
+
+
+def purge_account_deletion(cp, user_id: str) -> None:
+    """Hard-delete the account ledger row — the LAST erasure step (#4029).
+
+    The row is the purge's retry anchor (see the migration header): the auth
+    user is erased first, so the sweep reaches this only after that succeeded.
+    """
+    cp.query(
+        "account_deletions",
+        method="DELETE",
+        filters=[("user_id", "eq", user_id)],
+    )
+
+
 def revoke_org_api_keys(cp, org_id: str, now: str | None = None) -> None:
     """Revoke every non-revoked ``api_keys`` row for the org.
 
@@ -2525,6 +2584,50 @@ def count_owned_free_orgs(cp, user_id: str) -> int:
     twin (``count_active_free_memberships``) for callers that only need the
     count."""
     return len(owned_free_org_ids(cp, user_id))
+
+
+def sole_owned_org_ids(cp, user_id: str) -> list[str]:
+    """#4029: ids of orgs where *user_id* is the ONLY remaining owner.
+
+    The account-deletion cascade (decision 1B, owner ruling on #4029) deletes
+    the teams a departing person ALONE owns. An org qualifies when the user
+    holds an ACTIVE ``role='owner'`` membership AND no OTHER active owner row
+    exists for it.
+
+    The other owners are read as ROWS and compared in Python, deliberately NOT
+    with a ``user_id neq <id>`` PostgREST filter: SQL ``<>`` (and therefore the
+    ``neq`` op, see the query dialect note) EXCLUDES NULL, so a second owner
+    that is the anonymous agent anchor (``user_id IS NULL``) would be invisible
+    and the user would be handed a team they are NOT solely responsible for.
+    The placeholder membership (``org_id = ''``) is never an org.
+
+    Shape-gates user_id (#1719: a non-UUID literal would 22P02 → 500).
+    """
+    if not _is_uuid(user_id):
+        return []
+    owned = cp.query(
+        "org_memberships",
+        select=["org_id"],
+        filters=[("user_id", "eq", user_id), ("role", "eq", "owner"),
+                 ("status", "eq", "active")],
+        order="created_at.asc",
+    )
+    ids: list[str] = []
+    for row in owned:
+        org_id = row.get("org_id")
+        if not org_id:
+            continue
+        owners = cp.query(
+            "org_memberships",
+            select=["user_id"],
+            filters=[("org_id", "eq", org_id), ("role", "eq", "owner"),
+                     ("status", "eq", "active")],
+        )
+        # An org reached from an active-owner row always yields >=1 owner row;
+        # `owners and` keeps a defensive empty read from reading as "sole".
+        if owners and all(r.get("user_id") == user_id for r in owners):
+            ids.append(org_id)
+    return ids
 
 
 def membership_count_since(cp, *, cutoff: str, user_id: str | None = None,
