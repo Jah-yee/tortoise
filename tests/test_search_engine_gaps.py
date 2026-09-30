@@ -2089,3 +2089,83 @@ def test_source_document_partition_every_leg():
         assert [h[0] for h in s_src] == [PROV_URL], s_src
     finally:
         proj.close()
+
+
+# ── #H05: the FTS creation FORM is engine-version-dependent ────────────────
+# FalkorDB 6.0.0 (what `falkordb-server:latest` resolves to, module ver 60000)
+# rejects the historical multi-field procedure:
+#     Received 3 arguments to procedure 'db.idx.fulltext.createNodeIndex',
+#     expected at most 1
+# and the old code swallowed that into a WARNING and continued — the index was
+# simply absent and full-text search degraded silently (observed on PR #6266,
+# run 36517265610, job test-slow (b)). `CREATE FULLTEXT INDEX FOR (n:Label)
+# ON (n.f1, n.f2)` is accepted by 4.16.7 / 4.20.4 / 4.20.6 / 6.0.0, so it is
+# the primary form and the procedure stays as the fallback. These are DB-free
+# guards for that order and for the reporting level.
+
+
+class _FakeProjection:
+    """Just enough projection for the index-creation helpers."""
+
+    def __init__(self, graph):
+        self.g = graph
+
+
+class TestFulltextIndexCreationForm:
+    """#H05: DDL-first, procedure-fallback, and no silent skip."""
+
+    @staticmethod
+    def _proj(graph):
+        from tortoise.projection import FalkorProjection
+        return FalkorProjection, _FakeProjection(graph)
+
+    def test_ddl_form_is_tried_first(self):
+        proj_cls, proj = self._proj(MultiCallGraph([([], None)]))
+        proj_cls._create_fulltext_index(proj, "Point", ["content", "search_keys"])
+        assert [c[0] for c in proj.g.query_calls] == [
+            "CREATE FULLTEXT INDEX FOR (n:Point) ON (n.content, n.search_keys)",
+        ]
+
+    def test_procedure_fallback_on_the_6_0_arity_rejection(self):
+        """6.0.0's exact error must fall back to the procedure form."""
+        arity = Exception(
+            "Received 3 arguments to procedure "
+            "'db.idx.fulltext.createNodeIndex', expected at most 1")
+        proj_cls, proj = self._proj(MultiCallGraph([([], arity), ([], None)]))
+        proj_cls._create_fulltext_index(proj, "Event", ["subject", "name"])
+        assert [c[0] for c in proj.g.query_calls] == [
+            "CREATE FULLTEXT INDEX FOR (n:Event) ON (n.subject, n.name)",
+            "CALL db.idx.fulltext.createNodeIndex('Event', 'subject', 'name')",
+        ]
+
+    def test_already_indexed_re_raises_verbatim_and_skips_fallback(self):
+        """The one-time migration branches match on the 'already' text."""
+        already = Exception("Attribute 'content' is already indexed")
+        proj_cls, proj = self._proj(MultiCallGraph([([], already)]))
+        with pytest.raises(Exception, match="already indexed"):
+            proj_cls._create_fulltext_index(
+                proj, "Point", ["content", "search_keys"])
+        assert len(proj.g.query_calls) == 1
+
+    def test_both_forms_failing_raises_with_both_causes(self):
+        proj_cls, proj = self._proj(MultiCallGraph([
+            ([], Exception("Invalid input 'CREATE FULLTEXT'")),
+            ([], Exception("Unknown function 'db.idx.fulltext.createNodeIndex'")),
+        ]))
+        with pytest.raises(RuntimeError) as ei:
+            proj_cls._create_fulltext_index(proj, "Source", ["_searchText"])
+        msg = str(ei.value)
+        assert "no supported FULLTEXT index creation form" in msg
+        assert "Unknown function" in msg
+
+    def test_failure_is_reported_at_error_not_warning(self, caplog):
+        """#H05: the swallow was a WARNING; it must be an ERROR naming the
+        consequence, so a missing index is visible at the point of failure."""
+        from tortoise.projection import FalkorProjection
+        with caplog.at_level(logging.ERROR, logger="tortoise.projection"):
+            FalkorProjection._report_fulltext_index_failure(
+                "Source", ["_searchText"], RuntimeError("no such procedure"))
+        records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert records, caplog.records
+        message = records[0].getMessage()
+        assert "Source" in message and "DEGRADED" in message

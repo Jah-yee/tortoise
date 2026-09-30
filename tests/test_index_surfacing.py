@@ -255,9 +255,10 @@ def test_e2e6_server_mode_fts_text_disambiguation(tmp_path):
         g.query("MATCH (n) DETACH DELETE n")
         # #3518: the index is already created at boot. Tolerate that (the
         # pre-#3518 shape) and only skip when the engine cannot hold a
-        # fulltext index at all.
+        # fulltext index at all. #H05: the Cypher-native DDL form — FalkorDB
+        # 6.0.0 rejects the historical multi-field procedure.
         try:
-            g.query("CALL db.idx.fulltext.createNodeIndex('Source', '_searchText')")
+            g.query("CREATE FULLTEXT INDEX FOR (n:Source) ON (n._searchText)")
         except Exception as e:
             if "already" not in str(e).lower():
                 pytest.skip(f"Source FTS index creation unsupported: {e}")
