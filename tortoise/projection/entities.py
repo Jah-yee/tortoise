@@ -2449,14 +2449,14 @@ class _EntityHandlers:
             "    s.embedding=CASE WHEN $embedding IS NOT NULL THEN vecf32($embedding) ELSE s.embedding END, "
             "    s.updatedAt=$now "
             # D10 B6 (fourth door, review round 3): the retired fields must be
-            # SCRUBBED on promotion, not merely refused on write. A node can
-            # legitimately carry `content`/`objectKind` while it is still a
-            # NON-document `:Source` — the target-aware `update_entity` guard
-            # allows exactly that — and a later document creator MERGEs onto
-            # that SAME node by `url`, inheriting the retired values live AND
-            # on replay. The deny-sets above (and in `_upsert_source`) stop NEW
-            # writes; this REMOVE clears an INHERITED one. Keys =
-            # `_DOC_RETIRED_KEYS`.
+            # SCRUBBED on promotion, not merely refused on write. A PRE-RULING
+            # node can still carry `content`/`objectKind` — the write paths no
+            # longer produce one (ruling B on #3998 refuses them on EVERY
+            # `:Source`), but legacy and raw-Cypher nodes do — and a document
+            # creator MERGEs onto that SAME node by `url`, inheriting the
+            # retired values live AND on replay. The deny-sets above (and in
+            # `_upsert_source`) stop NEW writes; this REMOVE clears an
+            # INHERITED one. Keys = `_DOC_RETIRED_KEYS`.
             "REMOVE s.content, s.doc_status, s.docStatus, s.objectKind, "
             "       s.object_kind",
             params={"id": did, "title": ev.get("title", did),

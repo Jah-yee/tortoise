@@ -589,19 +589,24 @@ def test_the_generic_entity_route_cannot_reach_a_source_with_a_payload(sdk):
     s, _events = sdk
     s.create_source(RAW_URL, "conversation", contentHash="h1")
     body = "UPDATE_ROUTE_PAYLOAD " + ("raw transcript. " * 150)
-    # ⛔ `content` is deliberately NOT in this list: it is a D10-RETIRED
-    # DOCUMENT field, and main's #5026 guard for it is TARGET-AWARE
-    # (`documentKind IS NOT NULL`) — a NON-document `:Source` may carry
-    # `content`/`objectKind`, which
-    # `test_projection.py::test_5026_b6_promotion_scrubs_inherited_retired_fields`
-    # pins as a precondition. The closed surface leaves those five keys to that
-    # guard rather than overturning its decision; the raw-payload spellings
-    # below are refused on ANY `:Source`, and `create_source`'s passthrough
-    # refuses `content` unconditionally.
+    # ⛔ `content`/`objectKind` ARE in this list, and that is the ruling-B case
+    # (#3998): the D10 retirement is refused on EVERY `:Source`, not only a
+    # document one, which OVERTURNED #5026's pinned precondition ("a
+    # non-document `:Source` may legitimately carry `content` or `objectKind`",
+    # `test_projection.py::test_5026_b6_promotion_scrubs_inherited_retired_fields`).
+    # `RAW_URL` here is exactly such a non-document `:Source`
+    # (`sourceKind="conversation"`), so this pins the new behaviour rather than
+    # leaning on the document predicate. Its refusal comes from the D10/D30
+    # guard (a different message than the closed-surface one below).
+    for key in ("content", "objectKind"):
+        with pytest.raises(ValueError, match="retired field"):
+            s.update_entity(RAW_URL, **{key: body})
     for key in ("text", "transcript", "body"):
         with pytest.raises(ValueError, match="cannot be set on a :Source"):
             s.update_entity(RAW_URL, **{key: body})
     props = _source_props(s)
+    assert "content" not in props and "objectKind" not in props, (
+        "the generic entity route carried a retired field")
     assert body not in repr(props), "the generic entity route carried the payload"
     assert set(props) <= ALLOWED_SOURCE_NODE_PROPS
     # A DECLARED property is still updatable through the same route.

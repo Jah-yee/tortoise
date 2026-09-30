@@ -19041,16 +19041,16 @@ class TortoiseSDK:
                         f"the value (accepted: {sorted(RAW_ABSENT_STATES)} or "
                         f"{RAW_PRESENT!r})."
                     )
-                # ⛔ The retired DOCUMENT fields are deliberately OUT of this
-                # closed check: main's #5026 guard below is TARGET-AWARE
-                # (`documentKind IS NOT NULL`) because they are legitimate
-                # elsewhere — `objectKind` is the canonical Object kind, and a
-                # NON-document `:Source` may carry `content`/`objectKind` (pinned
-                # by `test_5026_b6_promotion_scrubs_inherited_retired_fields`,
-                # whose precondition is exactly that write succeeding). Leaving
-                # them to that guard lets it own the decision and its D10
-                # message; the closed surface still refuses every OTHER
-                # undeclared spelling, which is where a raw payload would land.
+                # ⛔ The retired fields are deliberately OUT of this closed
+                # check: they are left to the #5026/D10 guard below, which owns
+                # the decision and its message. That guard now refuses them on
+                # EVERY `:Source` (ruling B on #3998 overturned the earlier
+                # "a non-document `:Source` may carry `content`/`objectKind`"
+                # precondition), so this exclusion does not open a door —
+                # `objectKind` stays usable on non-`:Source` labels, where the
+                # target-aware guard does not fire, and the closed surface
+                # still refuses every OTHER undeclared spelling, which is where
+                # a raw payload would land.
                 _undeclared = sorted(
                     k for k in props
                     if k not in _SOURCE_NODE_PROP_NAMES
@@ -19080,38 +19080,35 @@ class TortoiseSDK:
         # not re-enter through THIS generic surface either. `_sanitize_props`
         # deliberately ACCEPTS them, because they are legitimate on other
         # labels (`objectKind` is the canonical Object kind, ONTOLOGY §5), so
-        # the denial has to be TARGET-AWARE: refuse them only when the mutation
-        # lands on a document `:Source`. Without this,
+        # the denial has to be TARGET-AWARE: refuse them when the mutation
+        # lands on a `:Source`. Without this,
         # `update_entity(<doc_id>, content=...)` wrote the retired keys and the
         # non-Point branch below JOURNALED them as `state` — which the fold
         # re-applies through `SET n += $s` — so they survived `rebuild_all`:
         # a retired-field re-write that the document-path deny-sets cannot see.
         #
-        # ⛔ The document test is `documentKind IS NOT NULL`, deliberately
-        # WITHOUT the `documents` meter's `<> 'transcript'` clause. The meter
-        # excludes transcripts because they are not counted against the
-        # `documents` cap; the RETIREMENT is not quota-scoped. The document
-        # path denies these fields on EVERY document —
-        # `_upsert_document`'s passthrough is `_SOURCE_HANDLED | _DOC_RETIRED`
-        # with no transcript filter — so copying the meter's narrower predicate
-        # here left a transcript document `:Source` as an open third door (the
-        # same field denied by one path and writable by the other on the SAME
-        # node). The parity that matters is with the retirement, not the cap.
+        # ⛔ The target test is "is this a `:Source`", with NO
+        # `documentKind IS NOT NULL` clause. Ruling B on #3998 OVERTURNED the
+        # earlier pinned precondition that "a non-document `:Source` may
+        # legitimately carry `content` or `objectKind`": the retirement applies
+        # to EVERY `:Source`. The `documents` meter's narrower predicate is
+        # deliberately not used here — the retirement is not quota-scoped, and
+        # its `<> 'transcript'` carve-out left a transcript document `:Source`
+        # as an open third door.
         _retired_hit = proj._DOC_RETIRED_KEYS.intersection(props)
         if _retired_hit:
-            _is_doc = proj.g.query(
+            _is_source = proj.g.query(
                 "MATCH (s:Source) WHERE (s.url = $id OR s.id = $id) "
-                "AND s.documentKind IS NOT NULL "
                 "RETURN count(s)",
                 params={"id": id_val},
             ).result_set[0][0]
-            if _is_doc:
+            if _is_source:
                 raise ValueError(
-                    "retired document field(s) "
+                    "retired field(s) "
                     f"{sorted(_retired_hit)} cannot be set through "
-                    "update_entity: D10 (#5026) retired "
-                    "content/doc_status/objectKind on a document, which is a "
-                    ":Source keyed by url, not a :Document node.")
+                    "update_entity on a :Source: D10 (#5026) retired "
+                    "content/doc_status/objectKind, and ruling B on #3998 "
+                    "applies the refusal to EVERY :Source.")
         # W5 Phase F (#2104, review r4): eventId is the EVENT node's identity
         # (the projection MERGEs on it; capture Events carry the DETERMINISTIC
         # _session_capture_event_id(session_id) id — ev_<sha256("sessionCaptured:"
