@@ -939,3 +939,38 @@ def test_absence_survives_a_rebuild(sdk):
     assert props[RAW_STATE_PROP] == RAW_DELETED, "the absence did not survive rebuild"
     assert props["contentHash"] == "h1", "the version anchor did not survive rebuild"
     assert raw_availability(props).permanent is True
+
+
+def test_a_url_only_stub_does_not_block_a_point_update(sdk):
+    """The D10 guard's target predicate must be the one the WRITE uses.
+
+    `_update_entity` resolves `:Source` by `{id: $id}`
+    (`_CANONICAL_ENTITY_ID_PROPS`), so a `:Source` that carries `url` and no
+    `id` is unreachable by the write. Resolving the guard by
+    `url = $id OR id = $id` therefore protects a node the write cannot reach: a
+    url-only STUB whose `url` happens to equal a Point's id refused that Point's
+    own `content` update — an error message naming a node the caller was never
+    touching. Ruling B (#3998) applies the retirement to every `:Source` the
+    write CAN reach, and `{id: $id}` covers exactly that set.
+
+    (1) FAILS if the guard is widened back to `url = $id OR id = $id`: the stub
+        minted below then refuses the Point's update, so the final assertion is
+        never reached and `update_entity` raises instead.
+    (2) REACHABLE: the stub comes from the public `extractedFrom` link and the
+        update goes through the public `update_entity`.
+    """
+    s, _events = sdk
+    pid = s.create_point("statement", "point A content")["id"]
+    # A url-only `:Source` STUB keyed by the Point's id — the shape
+    # `_link_source`/`_mint_source_stub` create (a `url`, no `id`).
+    s.create_point("statement", "sibling", extractedFrom=pid)
+    stub = s._get_proj().g.query(
+        "MATCH (s:Source {url:$u}) RETURN s.id", params={"u": pid}
+    ).result_set
+    assert stub, "no url-only stub was minted — the setup is unreachable"
+    assert stub[0][0] != pid, (
+        "the stub carries `id` == the Point's id, so it does not exercise the "
+        "url-only shape this test exists to pin")
+    # The Point's own declared field is still writable.
+    s.update_entity(pid, content="edited point A content")
+    assert s.get_point(pid)["content"] == "edited point A content"

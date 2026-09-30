@@ -19097,9 +19097,18 @@ class TortoiseSDK:
         # as an open third door.
         _retired_hit = proj._DOC_RETIRED_KEYS.intersection(props)
         if _retired_hit:
+            # The predicate MUST be the one the write below uses
+            # (`{label: {_ENTITY_ID_PROP[label]: $id}}`), or the guard protects
+            # a node the write cannot reach: a url-only `:Source` STUB (minted by
+            # `_link_source`/`_mint_source_stub`, which carry `url` and no `id`)
+            # would be refused a declared update whose write is a no-op anyway —
+            # an error message naming a node the caller was never touching. The
+            # sibling guard above resolved this same trap for the managed-props
+            # path; every `:Source` the write CAN reach is still covered, which
+            # is the whole of ruling B.
+            _src_id_prop = _ENTITY_ID_PROP.get("Source", "id")
             _is_source = proj.g.query(
-                "MATCH (s:Source) WHERE (s.url = $id OR s.id = $id) "
-                "RETURN count(s)",
+                f"MATCH (s:Source {{{_src_id_prop}:$id}}) RETURN count(s)",
                 params={"id": id_val},
             ).result_set[0][0]
             if _is_source:
