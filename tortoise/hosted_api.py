@@ -19093,7 +19093,11 @@ async def delete_user_account(request: Request,
     only while it is (a) still solely owned at replay time, or (b) already
     durably claimed by THIS deletion, so completing an interrupted cascade
     stays idempotent while an org that lost sole ownership after the anchor
-    was written is dropped rather than stamped. The cascade itself removes the
+    was written is dropped rather than stamped. A claimed id is additionally
+    gated on the caller actually holding a membership row for that org (any
+    status — the cascade sets them 'removed', never deletes them), so a
+    malformed anchor naming a stranger's team cannot drive a cascade against
+    it. The cascade itself removes the
     active-owner memberships the sole-ownership discovery reads, so the claim
     is what keeps an org reachable after membership removal. The stored grace
     window is the sole authority for the erasure deadline; the
@@ -19105,8 +19109,10 @@ async def delete_user_account(request: Request,
     (409) defers to the winner's anchor — no second cascade, no second audit.
     AuthZ: the endpoint acts on the AUTHENTICATED account and
     there is no account id in the request, so there is no cross-account target
-    and no existence oracle to leak; every org it touches was selected by an
-    active-owner membership. The per-IP sensitive-op budget is shared with the
+    and no existence oracle to leak; every org it touches was selected either
+    by an active-owner membership or by a durable claim from this same
+    deletion, itself gated on a membership row the caller holds. The per-IP
+    sensitive-op budget is shared with the
     team path's shape (``_check_sensitive_op_rate_limit``).
 
     Registry (selfhost) mode has no hosted auth accounts → ``unsupported``,
@@ -19118,6 +19124,7 @@ async def delete_user_account(request: Request,
     from tortoise.supabase_control import (
         account_deletion_row,
         begin_account_deletion,
+        caller_membership_org_ids,
         claim_account_deletion_org,
         get_control_plane,
         is_supabase_enabled,
@@ -19154,6 +19161,17 @@ async def delete_user_account(request: Request,
     # caller no longer solely owns and this deletion never began, so stamping
     # it would delete a team the contract says is left untouched.
     claimed_ids = _account_org_ids_from_row(existing, "claimed_org_ids")
+    if claimed_ids:
+        # The CLAIM's ownership gate (#4029 cycle-3): honour a claimed id only
+        # for an org the caller actually held a membership in. Normal writers
+        # only ever claim the caller's own solely-owned discovery, so this is
+        # inert in practice — it closes the cross-user shape a malformed
+        # anchor could otherwise turn into a cascade against a stranger's org.
+        # Any status: ``remove_org_memberships`` leaves a 'removed' row behind,
+        # which is exactly what a post-fault replay must still complete.
+        caller_orgs = set(await asyncio.to_thread(
+            caller_membership_org_ids, cp, user_id))
+        claimed_ids = [o for o in claimed_ids if o in caller_orgs]
     fresh_ids = await asyncio.to_thread(sole_owned_org_ids, cp, user_id)
     org_ids = _merge_org_ids(claimed_ids, fresh_ids)
 

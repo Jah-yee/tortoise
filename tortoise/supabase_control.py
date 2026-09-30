@@ -2688,6 +2688,31 @@ def sole_owned_org_ids(cp, user_id: str) -> list[str]:
     return ids
 
 
+def caller_membership_org_ids(cp, user_id: str) -> list[str]:
+    """#4029 cycle-3: org ids where *user_id* has a membership row — ANY status.
+
+    The account-deletion replay honours a durable claim
+    (``account_deletions.claimed_org_ids``) for orgs whose cascade already
+    began; ``remove_org_memberships`` sets those rows ``status='removed'`` but
+    never deletes them, so an active-only read cannot see them and the claim
+    is the only reach the org has. This read is therefore the CLAIM's
+    ownership gate: a claimed id is honoured only when the caller actually
+    holds a membership in the org, so a stale or malformed anchor naming a
+    stranger's org cannot drive a cascade against it (the cycle-3 cross-user
+    anchor shape).
+
+    Shape-gates user_id (#1719: a non-UUID literal would 22P02 → 500).
+    """
+    if not _is_uuid(user_id):
+        return []
+    rows = cp.query(
+        "org_memberships",
+        select=["org_id"],
+        filters=[("user_id", "eq", user_id)],
+    )
+    return [row.get("org_id") for row in rows if row.get("org_id")]
+
+
 def membership_count_since(cp, *, cutoff: str, user_id: str | None = None,
                            identity: str | None = None,
                            role: str | None = None) -> int:

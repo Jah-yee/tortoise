@@ -1887,3 +1887,426 @@ class TestAccountPurge:
         assert fake.tables["account_deletions"] == []
         ops = [e["operation"] for e in capture_audit]
         assert ops.count("account_delete_purged") == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #4029 cycle-3 — intent vs durable claim, purge-time re-derivation,
+# idempotent re-cascade, the 409 winner-unstamped ordering, and the
+# cross-user anchor dispute (properties A-F of the cycle-3 verification).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# The other user's team in property F; deliberately NOT owned by OWNER.
+_FOREIGN_ORG = "team-owned-by-someone-else"
+
+
+class TestAccountDeletionCycle3:
+    """The cycle-3 fix's six required properties (A-F), one test each.
+
+    Each test names the condition that fails it and carries the mutation that
+    was observed to make it RED before it was GREEN (test doctrine, Class-B).
+    """
+
+    def test_replay_drops_intent_org_the_caller_no_longer_solely_owns(
+            self, sb_client, as_user):
+        """A — a replay must never cascade a team the caller does not solely
+        own.
+
+        The anchor carries TWO sets: ``org_ids`` is the INTENT record (a cache
+        of ownership, a fact that changes) and ``claimed_org_ids`` is the
+        durable CLAIM. Cycle-2 reproduced this exact hole: anchor ``[X]`` → a
+        second ACTIVE owner is added to ``X`` → the retry cascaded and stamped
+        ``X``. The replay must therefore re-validate ownership, so a stale
+        intent id that is neither live-discovered nor claimed is DROPPED.
+
+        RED condition: the replay trusts the intent anchor (reads ``org_ids``
+        instead of ``claimed_org_ids``), so ``X`` is cascaded despite the
+        second owner and ``teams_deleted`` names a team the caller shares.
+        MUTATION CONFIRMED RED: in ``delete_user_account`` change
+        ``_account_org_ids_from_row(existing, "claimed_org_ids")`` to
+        ``_account_org_ids_from_row(existing)`` (read the intent column) —
+        ``teams_deleted`` becomes ``[ORG_ID]`` and the org is stamped.
+        """
+        tc, fake, _ = sb_client
+        fake.seed("organizations", [_account_org(ORG_ID)])
+        fake.seed("org_memberships", [
+            _membership_row(user_id=OWNER),
+            _membership_row(user_id=_U2),          # a SECOND active owner
+        ])
+        fake.seed("api_keys", [_key_row()])
+        # A prior attempt's anchor: X is in the INTENT set but was never
+        # claimed (no cascade ever began), and the account is un-stamped.
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "org_ids": [ORG_ID], "claimed_org_ids": [],
+            "deleted_at": None, "grace_hours": None,
+        }])
+        as_user()
+
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        assert r.json()["teams_deleted"] == []
+
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org.get("deleted_at") is None
+        assert all(k["revoked_at"] is None for k in fake.tables["api_keys"])
+        assert all(m["status"] == "active"
+                   for m in fake.tables["org_memberships"])
+
+    def test_claim_is_durable_before_the_access_kill(
+            self, sb_client, as_user, monkeypatch):
+        """B(i) — the claim is written BEFORE the org's access-kill, so a fault
+        after membership removal is still replayable.
+
+        The cascade destroys the active-owner rows ``sole_owned_org_ids``
+        discovers by; if the claim were written only after the cascade (or not
+        at all) a fault at ``revoke_org_invitations`` would leave the org
+        un-stamped AND undiscoverable — the replay's fresh discovery reads no
+        rows. The durable claim must still reach it, stamp it, and let the
+        post-grace purge see it.
+
+        RED condition: the durable claim is missing (or written after the
+        stamp), so the retry's cascade set is empty and the org is orphaned
+        with ``deleted_at IS NULL``.
+        MUTATION CONFIRMED RED: delete the
+        ``await asyncio.to_thread(claim_account_deletion_org, cp, user_id, org_id)``
+        call before ``_cascade_soft_delete_org`` — ``claimed_org_ids`` stays
+        ``[]``, the retry answers 202 with ``teams_deleted: []``, and the org
+        is never stamped or purged.
+        """
+        import tortoise.supabase_control as sc
+        tc, fake, _ = sb_client
+        fake.seed("organizations", [_account_org(ORG_ID)])
+        fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
+        fake.seed("api_keys", [_key_row()])
+        fake.seed("invitations", [{
+            "id": "inv-1", "org_id": ORG_ID, "email": "bob@example.com",
+            "role": "member", "status": "pending", "expires_at": None,
+        }])
+        real_revoke = sc.revoke_org_invitations
+        calls = {"n": 0}
+
+        def _flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient control-plane fault")
+            return real_revoke(*args, **kwargs)
+
+        monkeypatch.setattr(sc, "revoke_org_invitations", _flaky)
+        as_user()
+
+        with pytest.raises(RuntimeError, match="transient"):
+            tc.delete("/v1/user/account")
+
+        # partial failure: memberships removed, org NOT stamped, account NOT
+        # stamped — but the org is durably CLAIMED.
+        anchor = fake.tables["account_deletions"][0]
+        assert anchor["deleted_at"] is None
+        assert [str(x) for x in anchor["claimed_org_ids"]] == [ORG_ID]
+        assert all(m["status"] == "removed"
+                   for m in fake.tables["org_memberships"])
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org.get("deleted_at") is None
+        # The very discovery a replay would re-run is now EMPTY — the cascade
+        # removed exactly the rows it reads, so only the claim can reach X.
+        assert sc.sole_owned_org_ids(fake, OWNER) == []
+
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        assert r.json()["teams_deleted"] == [ORG_ID]
+
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org["deleted_at"]
+        assert org["grace_hours"] == RESTORE_WINDOW_HOURS
+        # …and it is punchable by the purge once its own window elapses.
+        org["deleted_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=30)  # noqa: UP017
+        ).isoformat()
+        ha_mod._purge_deleted_orgs()
+        assert all(o["id"] != ORG_ID for o in fake.tables["organizations"])
+
+    def test_claim_is_per_org_atomic_append_not_a_full_column_rewrite(
+            self, sb_client, as_user, monkeypatch):
+        """B(ii) — a concurrent narrower writer must not drop an id another
+        writer already claimed.
+
+        Cycle-2 P2: the widen was a BLIND FULL-COLUMN PATCH computed from an
+        earlier read, so an overlapping narrower writer overwrote the column
+        and dropped an org the other request had already access-killed. The
+        fix is one atomic DB-side append per org
+        (``account_deletion_claim_org``). This test interleaves a second
+        writer's claim between the first writer's read and its write — the
+        exact reproduced loss — and requires every id to survive.
+
+        RED condition: the claim is a read-then-whole-column PATCH, so the
+        interleaved writer's id is erased by the stale write.
+        MUTATION CONFIRMED RED: reimplement ``claim_account_deletion_org`` as
+        ``rows = cp.query("account_deletions", select=["claimed_org_ids"], ...);
+        cp.query("account_deletions", method="PATCH", json_body={
+        "claimed_org_ids": rows[0]["claimed_org_ids"] + [org_id]})`` — the
+        interleaved ``org-w`` is dropped and the assertion fails.
+        """
+        import tortoise.supabase_control as sc
+        tc, fake, _ = sb_client
+        # Two solely-owned orgs the endpoint will claim; org-x is also already
+        # in the anchor's claimed set.
+        fake.seed("organizations", [_account_org("org-x"),
+                                    _account_org("org-z")])
+        fake.seed("org_memberships", [
+            _membership_row(user_id=OWNER, org_id="org-x"),
+            _membership_row(user_id=OWNER, org_id="org-z"),
+        ])
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "org_ids": ["org-x"],
+            "claimed_org_ids": ["org-x"],
+            "deleted_at": None, "grace_hours": None,
+        }])
+
+        real_claim = sc.claim_account_deletion_org
+        real_rpc = fake.rpc
+        real_query = fake.query
+        injected = {"n": 0}
+
+        def _inject_writer_b_once():
+            """Writer B claims org-w at the point where, under a read-then-
+            write, its write lands between A's read and A's write."""
+            if not injected["n"]:
+                injected["n"] += 1
+                real_claim(fake, OWNER, "org-w")
+
+        def _rpc(fn, body=None, **kwargs):
+            if (fn == "account_deletion_claim_org"
+                    and (body or {}).get("p_org_id") == "org-z"):
+                _inject_writer_b_once()
+            return real_rpc(fn, body, **kwargs)
+
+        def _query(table, *args, **kwargs):
+            body = kwargs.get("json_body") or {}
+            if (table == "account_deletions"
+                    and kwargs.get("method") == "PATCH"
+                    and "org-z" in (body.get("claimed_org_ids") or [])):
+                _inject_writer_b_once()
+            return real_query(table, *args, **kwargs)
+
+        monkeypatch.setattr(fake, "rpc", _rpc)
+        monkeypatch.setattr(fake, "query", _query)
+        as_user()
+
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        assert injected["n"] == 1, "the concurrent-writer injection never fired"
+
+        claimed = [str(x) for x in
+                   fake.tables["account_deletions"][0]["claimed_org_ids"]]
+        assert set(claimed) == {"org-x", "org-w", "org-z"}
+
+    def test_purge_cascades_org_acquired_inside_the_grace_window(
+            self, sb_client, monkeypatch, capture_audit):
+        """C — no org may outlive the account's erasure.
+
+        Erasing the auth user cascades the caller's ``org_memberships`` rows —
+        the rows sole-ownership discovery reads. A team the caller became the
+        sole owner of INSIDE the grace window (the one-free-org gate permits
+        the create once the schedule cascade removed the old rows) is in
+        neither the frozen anchor nor any endpoint cascade, so the purge must
+        re-derive ownership BEFORE it erases.
+
+        RED condition: the purge erases the auth user without re-deriving, so
+        the in-window org is orphaned with ``deleted_at IS NULL`` while no
+        owner remains to reach it.
+        MUTATION CONFIRMED RED: delete the
+        ``for org_id in sole_owned_org_ids(cp, user_id):
+        _cascade_soft_delete_org_sync(...)`` block from
+        ``_purge_deleted_accounts`` — the org is never stamped and the
+        ``org["deleted_at"] is not None`` assertion fails.
+        """
+        tc, fake, _ = sb_client  # noqa: RUF059
+        past = (datetime.now(timezone.utc)  # noqa: UP017
+                - timedelta(days=8)).isoformat()
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "org_ids": [], "claimed_org_ids": [],
+            "deleted_at": past, "grace_hours": 24,
+        }])
+        # A team acquired INSIDE the window: solely owned at erasure time, in
+        # NEITHER the frozen intent set NOR the claim set.
+        fake.seed("organizations", [_account_org(ORG_ID)])
+        fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
+        fake.seed("api_keys", [_key_row()])
+        deleted: list[str] = []
+        monkeypatch.setattr(ha_mod, "_supabase_admin_delete_user",
+                            lambda uid: (deleted.append(uid), 204)[1])
+
+        ha_mod._purge_deleted_accounts()
+
+        assert deleted == [OWNER]                      # account erased
+        assert fake.tables["account_deletions"] == []  # ledger row gone
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org["deleted_at"] is not None, "org outlived the erased account"
+        assert org["grace_hours"] == 24                # the account's promise
+        assert all(k["revoked_at"] for k in fake.tables["api_keys"])
+        assert all(m["status"] == "removed"
+                   for m in fake.tables["org_memberships"])
+        ops = [e["operation"] for e in capture_audit]
+        assert ops.count("account_delete_purged") == 1
+
+    def test_recascade_does_not_move_an_already_stamped_org_window(
+            self, sb_client, as_user, monkeypatch):
+        """D — a re-cascade must never move an already-stamped org's window.
+
+        The account stamp is LAST, so a fault at the account stamp leaves the
+        row un-stamped and the retry re-runs the whole cascade. The org is
+        already stamped by then; re-stamping it with the retry's ``now`` would
+        silently extend retention past the promise (N retries → N × the
+        window). ``soft_delete_org`` is guarded on ``deleted_at IS NULL``. The
+        access-kill must still complete on the retry.
+
+        RED condition: the re-cascade re-stamps the org, moving its
+        ``deleted_at`` forward.
+        MUTATION CONFIRMED RED: drop the ``("deleted_at", "is", None)``
+        conjunct from ``soft_delete_org``'s PATCH filters — the retry stamps a
+        new ``now`` and the unchanged-stamp assertion fails.
+        """
+        import time as _time
+
+        import tortoise.supabase_control as sc
+        tc, fake, _ = sb_client
+        fake.seed("organizations", [_account_org(ORG_ID)])
+        fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
+        fake.seed("api_keys", [_key_row()])
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "org_ids": [ORG_ID], "claimed_org_ids": [ORG_ID],
+            "deleted_at": None, "grace_hours": None,
+        }])
+        real_stamp = sc.stamp_account_deletion
+        calls = {"n": 0}
+
+        def _flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient account-stamp fault")
+            return real_stamp(*args, **kwargs)
+
+        monkeypatch.setattr(sc, "stamp_account_deletion", _flaky)
+        as_user()
+
+        with pytest.raises(RuntimeError, match="transient"):
+            tc.delete("/v1/user/account")
+
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        first_stamp = org["deleted_at"]
+        assert first_stamp
+        _time.sleep(0.005)  # a re-stamp's now must be distinguishable
+
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org["deleted_at"] == first_stamp          # window unmoved
+        assert org["grace_hours"] == RESTORE_WINDOW_HOURS
+        assert all(k["revoked_at"] for k in fake.tables["api_keys"])
+        assert all(m["status"] == "removed"
+                   for m in fake.tables["org_memberships"])
+
+    def test_concurrent_schedule_409_winner_unstamped_no_recascade(
+            self, sb_client, as_user, monkeypatch, capture_audit):
+        """E — the 409 loser must not double-cascade or double-audit, even when
+        the winner holds the anchor UNSTAMPED.
+
+        The winner acquires the row at INSERT, BEFORE its cascade and its
+        stamp, so the realistic race finds ``deleted_at IS NULL``. The existing
+        ``test_concurrent_schedule_409_stored_promise_wins`` pre-seeds
+        ``deleted_at``, so it only covers the non-racing ordering. Here the
+        loser must answer 200-already from the winner's row and must NOT
+        re-cascade the caller's team nor emit a second
+        ``account_delete_requested``.
+
+        RED condition: the 409 branch falls through to the cascade, so the
+        loser re-cascades the team, returns 202 with
+        ``teams_deleted: [ORG_ID]``, and emits a second audit event.
+        MUTATION CONFIRMED RED: in the ``begin_account_deletion`` except
+        branch, replace the ``return JSONResponse(...)`` with ``pass`` —
+        ``teams_deleted`` becomes ``[ORG_ID]``, the org is stamped, and the
+        audit count is 1.
+        """
+        import tortoise.supabase_control as sc
+        tc, fake, _ = sb_client
+        # The winner's UNSTAMPED anchor: it holds the row but has not stamped.
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "org_ids": [ORG_ID], "claimed_org_ids": [],
+            "deleted_at": None, "grace_hours": None,
+        }])
+        # The caller solely owns a team: a fallen-through loser would cascade it.
+        fake.seed("organizations", [_account_org(ORG_ID)])
+        fake.seed("org_memberships", [_membership_row(user_id=OWNER)])
+        fake.seed("api_keys", [_key_row()])
+        real_row = sc.account_deletion_row
+        calls = {"n": 0}
+
+        def _race(cp, user_id):
+            # The read-before-INSERT window: the loser's first read sees no
+            # row, then the winner's row exists for the 409 and the re-read.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return real_row(cp, user_id)
+
+        monkeypatch.setattr(sc, "account_deletion_row", _race)
+        as_user()
+
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["already"] is True
+        assert body["deleted_at"] is None      # the winner has not stamped yet
+        assert body["teams_deleted"] == []
+
+        org = next(o for o in fake.tables["organizations"] if o["id"] == ORG_ID)
+        assert org.get("deleted_at") is None   # the loser did not re-cascade
+        assert all(k["revoked_at"] is None for k in fake.tables["api_keys"])
+        assert len(fake.tables["account_deletions"]) == 1
+        ops = [e["operation"] for e in capture_audit]
+        assert ops.count("account_delete_requested") == 0
+
+    def test_replay_never_cascades_another_users_org_from_the_anchor(
+            self, sb_client, as_user):
+        """F — settling the cross-user claim: an anchor row naming another
+        user's org must not cause that org to be cascaded.
+
+        Cycle-2 had one reviewer report a cross-user shape and another unable
+        to reproduce it, reasoning that every ledger read/write is
+        ``user_id``-scoped. That reasoning covers WHICH ROW is read, not which
+        ORGS the row NAMES: the claimed set was trusted as raw ids. This test
+        seeds the disputed state — an anchor for OWNER naming a team solely
+        owned by a DIFFERENT user, in both the intent and the claimed sets —
+        and pins that the stranger's team is untouched.
+
+        RED condition: the claimed set is honoured without checking that the
+        caller ever held a membership in the org, so a foreign id in the anchor
+        access-kills and stamps another user's team.
+        MUTATION CONFIRMED RED: in ``delete_user_account`` drop the
+        caller-membership filter on ``claimed_ids`` — the foreign org is
+        cascaded, its key revoked and its ``deleted_at`` stamped.
+        """
+        tc, fake, _ = sb_client
+        fake.seed("organizations", [_account_org(_FOREIGN_ORG)])
+        fake.seed("org_memberships", [
+            _membership_row(user_id=_U2, org_id=_FOREIGN_ORG),  # NOT the caller
+        ])
+        fake.seed("api_keys", [_key_row(id="key-foreign", org_id=_FOREIGN_ORG)])
+        fake.seed("account_deletions", [{
+            "user_id": OWNER, "org_ids": [_FOREIGN_ORG],
+            "claimed_org_ids": [_FOREIGN_ORG],
+            "deleted_at": None, "grace_hours": None,
+        }])
+        as_user()
+
+        r = tc.delete("/v1/user/account")
+        assert r.status_code == 202, r.text
+        assert r.json()["teams_deleted"] == []
+
+        org = next(o for o in fake.tables["organizations"]
+                   if o["id"] == _FOREIGN_ORG)
+        assert org.get("deleted_at") is None
+        assert all(k["revoked_at"] is None
+                   for k in fake.tables["api_keys"]
+                   if k["org_id"] == _FOREIGN_ORG)
+        assert all(m["status"] == "active"
+                   for m in fake.tables["org_memberships"])
