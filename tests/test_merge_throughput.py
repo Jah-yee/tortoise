@@ -3917,26 +3917,51 @@ def test_docs_job_pr_path_never_interpolates_filenames():
 
     changed = next(s for s in steps if s.get("id") == "changed")
     run = changed["run"]
-    # Produced NUL-delimited, into a file under $RUNNER_TEMP — never captured
-    # into a step output as text.
-    assert "-z" in run and "--name-only" in run
-    assert "$RUNNER_TEMP" in run
+
+    def _logical(startswith: str) -> str:
+        """The shell logical line beginning with ``startswith``, comments stripped.
+
+        Assertions must target a SPECIFIC command: matching the whole ``run``
+        block lets an UNRELATED occurrence satisfy them, which is not a pin.
+        Measured on an earlier revision of this test — a bare ``"-z" in run``
+        was satisfied by the ``sed -z`` two lines later, and a bare
+        ``"|| true" in run`` by the ``grep -c . ... || true`` in the count
+        line, so deleting ``-z`` or the tolerance from the ``git diff`` left
+        the whole suite green. Command continuations (``\``) are joined.
+        """
+        code = [ln for ln in run.splitlines() if not ln.lstrip().startswith("#")]
+        for i, ln in enumerate(code):
+            if ln.strip().startswith(startswith):
+                parts, j = [], i
+                while j < len(code):
+                    parts.append(code[j].strip())
+                    if not code[j].rstrip().endswith("\\"):
+                        break
+                    j += 1
+                return " ".join(parts)
+        raise AssertionError(f"no shell command beginning {startswith!r} in run block")
+
+    diff_cmd = _logical("git diff")
+    # NUL-delimited output on the DIFF ITSELF (not the `sed -z` below it).
+    assert "-z" in diff_cmd, diff_cmd
+    assert "--name-only" in diff_cmd, diff_cmd
+    # Only paths that exist on disk: lychee hard-errors on a nonexistent input,
+    # and under `--no-renames` a rename contributes its deleted source path.
+    assert "--diff-filter ACMR" in diff_cmd, diff_cmd
+    # The tolerance, asserted ON THIS COMMAND. `docs` is a REQUIRED status
+    # check and a shallow PR checkout has no base sha, so without it git exits
+    # 128, the step aborts under `bash -e`, and every PR reds.
+    assert "|| :" in diff_cmd or diff_cmd.rstrip().endswith("|| true"), diff_cmd
+    assert "$RUNNER_TEMP/pr-md.raw.nul" in diff_cmd, diff_cmd
+
+    # The list is never published as step-output TEXT (a later `${{ ... }}`
+    # would re-parse the filenames as shell).
     assert 'echo "files=' not in run, (
         "the PR path must not publish the filenames as step OUTPUT text: a "
         "later `${{ steps.changed.outputs.files }}` re-parses them as shell"
     )
-    assert "count=" in run
-
-    # The diff MUST stay tolerant. A shallow PR checkout has no base sha, so
-    # the diff exits 128; under Actions' `bash -e` (and this step's own
-    # `set -euo pipefail`) that aborts the step — and `docs` is a REQUIRED
-    # status check, so a hard failure reds every PR. The tolerance is the
-    # pre-existing behaviour, and it is the difference between "this path is
-    # dormant" and "this path is red".
-    assert "|| :" in run or "|| true" in run, (
-        "the PR-path diff must tolerate a missing base sha; without it the step "
-        "hard-fails on every PR and reds the REQUIRED `docs` context"
-    )
+    count_cmd = _logical("count=")
+    assert "pr-md.txt" in count_cmd, count_cmd
 
     lint = next(
         s for s in steps if str(s.get("name", "")) == "Markdownlint (changed files)"
