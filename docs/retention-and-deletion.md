@@ -103,13 +103,20 @@ Everything else is a **derived alias**, never independently set:
 |------|-------------|----------------|-------------------|
 | **Graph** | immediately (API keys revoked) | 7 days | self-service Trash in the dashboard |
 | **Team account** | immediately (keys + memberships revoked) | 7 days | support / operational (no self-service surface yet) |
-| **User account** | immediately (on deletion request) | 7 days | support (email request — privacy §16) |
+| **User account** | immediately (solely-owned teams cascaded, keys revoked) | 7 days | support / operational (no self-service restore surface yet) |
 
-The **user-account** path has no in-product self-service deletion today:
-privacy §16 says so, and the blocker for a surface is the missing Supabase
-auth-admin deletion wiring — not the deferred permissions model (D31).
-`USER_ACCOUNT_DELETE_GRACE_HOURS` records the promised window for that support
-path.
+The **user-account** path is self-service **in-product** since **#4029**:
+`DELETE /v1/user/account` cascades the teams the person ALONE owns through the
+SAME cascade the team endpoint uses (owner ruling **1B**, 2026-09-30), stamps
+the one window via `USER_ACCOUNT_DELETE_GRACE_HOURS`, and the boot + hourly
+`_purge_deleted_accounts` erases the auth account once the **STORED** window
+elapses (erasing the auth account cascades the person's memberships in every
+org). The Supabase auth-admin deletion wiring that used to be the blocker for a
+surface now exists; the deferred permissions model (D31) was never the blocker.
+**Restore** within the window is support/operational — there is no self-service
+restore surface yet, so the 7 days are an undo held for support, not a button.
+**Backups are not actively deleted on this path** (owner ruling **2B**): they
+age out on the existing ≈28-day cycle.
 
 The 7 days in the **user-account** row is the *undo* window only. After it, the
 account's **live** data is erased; the account's copies in the backup pool are
@@ -122,8 +129,8 @@ deleter is the only owner** (owner ruling **1B**, 2026-09-30): such a team is
 ## Owner decisions — the account-deletion path (2026-09-30)
 
 Two owner decisions were ruled on **#4029**, both settling questions this
-document had left open. They govern the **user-account** deletion path (built
-post-beta; today it is a support/email request — privacy §16).
+document had left open. They govern the **user-account** deletion path, which
+**#4029** builds as an in-product self-service flow.
 
 **1B — a solely-owned team is deleted with the account.** Deleting a personal
 account **deletes any team for which that person is the only owner**; the team
