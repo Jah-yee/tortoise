@@ -1925,12 +1925,17 @@ def soft_delete_org(cp, org_id: str, now: str | None = None,
     ``grace_hours`` is stored so the purge sweep and the idempotent replay
     honor the hard_delete_after the API promised at schedule time, even if
     TORTOISE_TEAM_DELETE_GRACE_HOURS changes before the sweep runs.
-    Idempotent: re-stamping an already-deleted org is a no-op PATCH.
+    Idempotent: guarded on ``deleted_at IS NULL``, so re-stamping an
+    already-deleted org is a no-op PATCH — the account-deletion cascade
+    re-runs this on every retry, and without the guard N retries retained the
+    org's content for N x its window (a retention-promise violation: the
+    advertised account ``hard_delete_after`` then preceded the org's real
+    purge). The stamp is what makes an already-claimed org idempotent.
     """
     cp.query(
         "organizations",
         method="PATCH",
-        filters=[("id", "eq", org_id)],
+        filters=[("id", "eq", org_id), ("deleted_at", "is", None)],
         json_body={"deleted_at": now or _now_iso(), "grace_hours": grace_hours},
     )
 
@@ -1948,27 +1953,31 @@ def account_deletion_row(cp, user_id: str) -> dict | None:
     A present row is the endpoint's retry anchor. When ``deleted_at`` is set
     the account is delete-pending and the endpoint answers from the STORED
     promise instead of re-cascading; when it is NULL the row is a PRIOR attempt
-    that failed mid-cascade and ``org_ids`` is the durable cascade set the
-    retry replays (the cascade itself destroys the membership discovery read).
-    Shape-gates user_id (#1719).
+    that failed mid-cascade and ``claimed_org_ids`` is the durable claim set
+    the retry replays (the cascade itself removes the membership discovery
+    reads; ``org_ids`` is only the historical intent record and never gates a
+    cascade on its own). Shape-gates user_id (#1719).
     """
     if not _is_uuid(user_id):
         return None
     rows = cp.query(
         "account_deletions",
-        select=["user_id", "deleted_at", "grace_hours", "org_ids"],
+        select=["user_id", "deleted_at", "grace_hours", "org_ids",
+                "claimed_org_ids"],
         filters=[("user_id", "eq", user_id)],
     )
     return rows[0] if rows else None
 
 
 def begin_account_deletion(cp, user_id: str, org_ids: list[str]) -> None:
-    """INSERT the account-deletion retry anchor BEFORE the cascade (#4029).
+    """INSERT the account-deletion anchor BEFORE the cascade (#4029).
 
-    Persists the org ids the deletion intends to cascade while they are still
-    discoverable — ``remove_org_memberships`` deletes the ``status='active'``
-    owner rows ``sole_owned_org_ids`` reads, so an anchor written after the
-    cascade could never rediscover a partially-failed org. ``deleted_at`` and
+    Persists ``org_ids`` (the intended set, for the record) while the orgs are
+    still discoverable — ``remove_org_memberships`` deletes the
+    ``status='active'`` owner rows ``sole_owned_org_ids`` reads, so a set
+    written after the cascade could never rediscover a partially-failed org.
+    The cascade GATE is ``claimed_org_ids``, appended per org before that
+    org's access-kill by :func:`claim_account_deletion_org`. ``deleted_at`` and
     ``grace_hours`` are deliberately left NULL: the stamp is written LAST by
     :func:`stamp_account_deletion`, so a partial failure leaves the account
     un-stamped (the fail-closed ordering the per-org cascade uses).
@@ -1982,23 +1991,29 @@ def begin_account_deletion(cp, user_id: str, org_ids: list[str]) -> None:
         "account_deletions",
         method="POST",
         json_body={"user_id": user_id, "org_ids": list(org_ids),
+                   "claimed_org_ids": [],
                    "deleted_at": None, "grace_hours": None},
     )
 
 
-def set_account_deletion_org_ids(cp, user_id: str,
-                                 org_ids: list[str]) -> None:
-    """Widen an unstamped anchor's org set with a retry's fresh discovery.
+def claim_account_deletion_org(cp, user_id: str, org_id: str) -> None:
+    """Durably claim one org for THIS account deletion — atomically (#4029).
 
-    A team the user acquired between a partial failure and the retry must
-    survive later retries too, so the union is persisted. Guarded on
-    ``deleted_at IS NULL`` — once stamped the set is frozen with the promise.
+    Called immediately BEFORE that org's access-kill. The claim is the replay
+    gate: a retry cascades an org only while it is still solely owned OR
+    already claimed, so an org whose cascade already began is completed
+    (idempotently) while one that merely sat in the intent ``org_ids`` and has
+    since lost sole ownership is dropped.
+
+    ONE DB-side union (RPC), never a read-then-PATCH: a blind full-column PATCH
+    writes a union computed from an earlier read, so two concurrent claims drop
+    each other's org (the reproduced cycle-2 P2). The RPC's single ``||``
+    statement makes the append atomic. Fail-closed: an RPC error raises, and
+    the caller aborts the org's cascade rather than cascading an unclaimed org.
     """
-    cp.query(
-        "account_deletions",
-        method="PATCH",
-        filters=[("user_id", "eq", user_id), ("deleted_at", "is", None)],
-        json_body={"org_ids": list(org_ids)},
+    cp.rpc(
+        "account_deletion_claim_org",
+        {"p_user_id": user_id, "p_org_id": str(org_id)},
     )
 
 

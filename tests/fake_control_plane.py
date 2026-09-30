@@ -260,6 +260,29 @@ class FakeControlPlane:
         abuse_suspend/abuse_unsuspend RPCs (teams.suspended_at/flagged_at).
         """
         self.rpc_calls.append((fn, dict(body or {})))
+        if fn == "account_deletion_claim_org":
+            # #4029 (cycle-2): the atomic per-org claim. Mirrors the SQL's
+            # single `||` union — appends to claimed_org_ids AND org_ids,
+            # idempotent, guarded on deleted_at IS NULL. A read-then-PATCH
+            # would lose an id when two writers overlap; this is one statement.
+            p = body or {}
+            uid = p.get("p_user_id")
+            oid = p.get("p_org_id")
+            for r in self.tables.get("account_deletions", []):
+                if str(r.get("user_id")) != str(uid):
+                    continue
+                if r.get("deleted_at") is not None:
+                    return None
+                if oid is None or not str(oid).strip():
+                    return None
+                claimed = [str(x) for x in (r.get("claimed_org_ids") or [])]
+                if str(oid) in claimed:
+                    return None
+                r["claimed_org_ids"] = claimed + [str(oid)]
+                intent = [str(x) for x in (r.get("org_ids") or [])]
+                if str(oid) not in intent:
+                    r["org_ids"] = intent + [str(oid)]
+            return None
         if fn == "abuse_suspend":
             # Mirrors the SQL: set suspended_at only when NULL; flagged_at is
             # NOT touched (the engine's flag-episode state is event-derived).

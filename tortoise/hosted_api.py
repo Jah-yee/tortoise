@@ -18869,6 +18869,33 @@ def _soft_delete_registry_org(org_id: str, now: str, grace_hours: float) -> None
     )
 
 
+def _cascade_soft_delete_org_sync(org_id: str, now: str,
+                                  grace_hours: float) -> None:
+    """The ONE org soft-delete cascade, synchronous (see below).
+
+    The blocking half of :func:`_cascade_soft_delete_org`, split out so the
+    boot + hourly account-erasure sweep (a sync thread) runs the SAME sequence
+    the async endpoints do — the account purge re-derives and cascades orgs
+    before erasing the auth account, and must not reach into the event loop.
+    """
+    from tortoise.supabase_control import (
+        get_control_plane,
+        is_supabase_enabled,
+        remove_org_memberships,
+        revoke_org_api_keys,
+        revoke_org_invitations,
+        soft_delete_org,
+    )
+    if is_supabase_enabled():
+        cp = get_control_plane()
+        revoke_org_api_keys(cp, org_id, now)
+        remove_org_memberships(cp, org_id, now)
+        revoke_org_invitations(cp, org_id, now)
+        soft_delete_org(cp, org_id, now, grace_hours=grace_hours)
+    else:
+        _soft_delete_registry_org(org_id, now, grace_hours)
+
+
 async def _cascade_soft_delete_org(org_id: str, now: str,
                                    grace_hours: float) -> None:
     """The ONE org soft-delete cascade: access-kill FIRST, stamp LAST.
@@ -18884,29 +18911,11 @@ async def _cascade_soft_delete_org(org_id: str, now: str,
     Ordering is load-bearing (code-review P1, PR #873): a partial failure
     leaves the org NOT marked deleted, so a retry re-runs the full cascade —
     never a "deleted" org whose keys still authenticate. Mode-aware: Supabase
-    control plane vs the registry twin; sync httpx/DB work runs off the loop
-    (``to_thread``, #310 pattern).
+    control plane vs the registry twin; the blocking sequence runs off the
+    loop (``to_thread``, #310 pattern) via the sync half.
     """
-    from tortoise.supabase_control import (
-        get_control_plane,
-        is_supabase_enabled,
-        remove_org_memberships,
-        revoke_org_api_keys,
-        revoke_org_invitations,
-        soft_delete_org,
-    )
-    if is_supabase_enabled():
-        cp = get_control_plane()
-        await asyncio.to_thread(revoke_org_api_keys, cp, org_id, now)
-        await asyncio.to_thread(remove_org_memberships, cp, org_id, now)
-        await asyncio.to_thread(revoke_org_invitations, cp, org_id, now)
-        await asyncio.to_thread(
-            soft_delete_org, cp, org_id, now, grace_hours=grace_hours
-        )
-    else:
-        await asyncio.to_thread(
-            _soft_delete_registry_org, org_id, now, grace_hours
-        )
+    await asyncio.to_thread(
+        _cascade_soft_delete_org_sync, org_id, now, grace_hours)
 
 
 @app.delete("/v1/organizations/{org_id}", status_code=202)
@@ -18989,16 +18998,19 @@ async def delete_org(org_id: str, request: Request,
     }
 
 
-def _account_org_ids_from_row(row: dict | None) -> list[str]:
-    """The persisted cascade set of an account-deletion anchor (#4029).
+def _account_org_ids_from_row(row: dict | None,
+                              column: str = "org_ids") -> list[str]:
+    """A persisted org-id list of an account-deletion anchor (#4029).
 
-    Tolerant by design: the value is ``jsonb`` (a list in the control-plane
-    row), but a legacy/odd shape must never break the retry — an unreadable
-    anchor degrades to the fresh membership discovery.
+    ``column`` selects which set: ``org_ids`` (the intent record) or
+    ``claimed_org_ids`` (the durable cascade gate). Tolerant by design: the
+    value is ``jsonb`` (a list in the control-plane row), but a legacy/odd
+    shape must never break the retry — an unreadable set degrades to the fresh
+    membership discovery.
     """
     if not row:
         return []
-    raw = row.get("org_ids")
+    raw = row.get(column)
     if not raw:
         return []
     if isinstance(raw, str):
@@ -19013,10 +19025,10 @@ def _account_org_ids_from_row(row: dict | None) -> list[str]:
 
 
 def _merge_org_ids(stored: list[str], fresh: list[str]) -> list[str]:
-    """Stored anchor ids first, then any freshly discovered solely-owned org.
+    """Stored ids first, then any freshly discovered solely-owned org.
 
-    The union keeps a team the user acquired between a partial failure and the
-    retry without dropping the durable set the anchor exists to carry.
+    The union keeps an org the cascade already claimed (completing it stays
+    idempotent) without dropping a team the user solely owns at replay time.
     """
     out = list(stored)
     seen = set(stored)
@@ -19072,19 +19084,26 @@ async def delete_user_account(request: Request,
     Ordering mirrors the team endpoint: the org cascades (access-kill first)
     run BEFORE the account is stamped, and the account's ``deleted_at`` +
     ``grace_hours`` are written LAST, so a partial failure leaves the account
-    un-stamped and a retry re-runs the full, idempotent cascade. The org ids
-    the deletion intends to cascade are persisted in the ledger row BEFORE the
-    cascade runs (``org_ids``): the cascade itself removes the active-owner
-    memberships the sole-ownership discovery reads, so without that anchor a
-    failure after membership removal but before the org stamp would leave the
-    org un-stamped AND undiscoverable — its graph intact and its pending
-    invitations stranded. The stored grace window is the sole authority for
-    the erasure deadline; the ``TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS`` env
-    var is only the fallback default for a row that carries no stored grace
-    (#4179 contract).
+    un-stamped and a retry re-runs the full, idempotent cascade.
+
+    TWO SETS, and the difference is load-bearing (cycle-2 review of #4029):
+    ``org_ids`` is the INTENDED set (a cache of ownership, a fact that
+    changes) and ``claimed_org_ids`` is the durable CLAIM — one org appended
+    atomically immediately BEFORE its access-kill. A replay cascades an org
+    only while it is (a) still solely owned at replay time, or (b) already
+    durably claimed by THIS deletion, so completing an interrupted cascade
+    stays idempotent while an org that lost sole ownership after the anchor
+    was written is dropped rather than stamped. The cascade itself removes the
+    active-owner memberships the sole-ownership discovery reads, so the claim
+    is what keeps an org reachable after membership removal. The stored grace
+    window is the sole authority for the erasure deadline; the
+    ``TORTOISE_USER_ACCOUNT_DELETE_GRACE_HOURS`` env var is only the fallback
+    default for a row that carries no stored grace (#4179 contract).
 
     Idempotent: a repeat request while pending → 200 ``already`` carrying the
-    STORED promise. AuthZ: the endpoint acts on the AUTHENTICATED account and
+    STORED promise. A concurrent schedule that loses the anchor INSERT race
+    (409) defers to the winner's anchor — no second cascade, no second audit.
+    AuthZ: the endpoint acts on the AUTHENTICATED account and
     there is no account id in the request, so there is no cross-account target
     and no existence oracle to leak; every org it touches was selected by an
     active-owner membership. The per-IP sensitive-op budget is shared with the
@@ -19099,9 +19118,9 @@ async def delete_user_account(request: Request,
     from tortoise.supabase_control import (
         account_deletion_row,
         begin_account_deletion,
+        claim_account_deletion_org,
         get_control_plane,
         is_supabase_enabled,
-        set_account_deletion_org_ids,
         sole_owned_org_ids,
         stamp_account_deletion,
     )
@@ -19124,17 +19143,24 @@ async def delete_user_account(request: Request,
             content=_account_replay_body(existing, grace_hours),
         )
 
-    # The durable retry anchor. A row whose ``deleted_at`` is NULL is a PRIOR
-    # attempt that failed mid-cascade; its stored org set survives the cascade
-    # (which removes the owner rows discovery reads), so replay it — unioned
-    # with any solely-owned team acquired since.
-    stored_ids = _account_org_ids_from_row(existing)
+    # The cascade set is a union of TWO independent facts, never the raw
+    # anchor (#4029 cycle-2):
+    #   (a) orgs the caller SOLELY owns right now — discovery is live, so a
+    #       team acquired between attempts reaches this cascade;
+    #   (b) orgs THIS deletion already durably CLAIMED — the claim is written
+    #       before each org's access-kill, so a cascade interrupted after
+    #       membership removal is completed idempotently on the retry.
+    # A stale ``org_ids`` entry that is neither is DROPPED: it is an org the
+    # caller no longer solely owns and this deletion never began, so stamping
+    # it would delete a team the contract says is left untouched.
+    claimed_ids = _account_org_ids_from_row(existing, "claimed_org_ids")
     fresh_ids = await asyncio.to_thread(sole_owned_org_ids, cp, user_id)
-    org_ids = _merge_org_ids(stored_ids, fresh_ids)
+    org_ids = _merge_org_ids(claimed_ids, fresh_ids)
 
     if existing is None:
         try:
-            # Persist the anchor BEFORE the cascade begins: the cascade
+            # Persist the intent anchor BEFORE the cascade begins (it is
+            # widened atomically per org by the claim RPC): the cascade
             # destroys the membership rows a retry would rediscover the org by.
             await asyncio.to_thread(
                 begin_account_deletion, cp, user_id, org_ids)
@@ -19145,21 +19171,26 @@ async def delete_user_account(request: Request,
             if "409" not in str(exc):
                 raise
             won = await asyncio.to_thread(account_deletion_row, cp, user_id)
-            if won and won.get("deleted_at"):
-                return JSONResponse(
-                    status_code=200,
-                    content=_account_replay_body(won, grace_hours),
-                )
-            stored_ids = _account_org_ids_from_row(won)
-            org_ids = _merge_org_ids(stored_ids, fresh_ids)
-    elif org_ids != stored_ids:
-        # Widen the durable anchor so a team acquired mid-grace reaches the
-        # cascade on a later retry too.
-        await asyncio.to_thread(
-            set_account_deletion_org_ids, cp, user_id, org_ids)
+            if won is None:
+                raise
+            # The winner holds the anchor from the moment it INSERTs the row —
+            # BEFORE its cascade and its stamp. So this loser must NOT
+            # re-cascade or emit a second ``account_delete_requested``; it
+            # answers 200 ``already`` from the stored row. That row may not be
+            # stamped yet (``deleted_at``/``grace_hours`` NULL while the
+            # winner is mid-cascade), in which case the honest answer is the
+            # pending shape with a NULL deadline rather than the loser's own.
+            return JSONResponse(
+                status_code=200,
+                content=_account_replay_body(won, grace_hours),
+            )
 
     now = datetime.now(UTC).isoformat()
     for org_id in org_ids:
+        # Claim BEFORE the access-kill: if the cascade then fails after the
+        # memberships are removed, this org is still reachable by a retry.
+        await asyncio.to_thread(
+            claim_account_deletion_org, cp, user_id, org_id)
         await _cascade_soft_delete_org(org_id, now, grace_hours)
     # Account stamp LAST — a partial cascade above leaves this unwritten, so a
     # retry re-runs the whole (idempotent) cascade. First-write-wins: the seam
@@ -19477,10 +19508,24 @@ def _purge_deleted_accounts() -> None:
     row the next sweep retries. A 404 from GoTrue is already-erased and counts
     as success (idempotent).
 
+    RE-DERIVE BEFORE ERASING (cycle-2 review of #4029). Erasing the auth user
+    cascades the person's ``org_memberships`` rows — the rows the sole-ownership
+    discovery reads. A team the caller created INSIDE the grace window is in
+    neither the frozen ``org_ids`` nor any cascade the endpoint ran, so erasing
+    the account first would orphan it: its ``deleted_at`` stays NULL,
+    ``_purge_deleted_orgs`` (which selects on that stamp) never sees it, and no
+    owner is left to reach it. So the sole-ownership discovery is re-run HERE,
+    while the caller's owner rows are still active, and each such org is
+    cascaded BEFORE the auth erase. The org cascade runs in the per-row ``try``
+    with the erase: a cascade failure skips the row (leaving the auth user and
+    the ledger row for the next sweep), so a failed claim never precedes an
+    erasure.
+
     Backup copies are NOT deleted here — the owner ruling (decision 2B on
     #4029) leaves them to age out on the existing backup cycle. The account's
-    solely-owned orgs were already stamped at schedule time and are hard-deleted
-    by :func:`_purge_deleted_orgs` on their own stored window.
+    solely-owned orgs are stamped by the endpoint (or the re-derivation above)
+    and are hard-deleted by :func:`_purge_deleted_orgs` on their own stored
+    window.
 
     Supabase-only: selfhost has no hosted auth accounts. Fail-safe: a per-row
     failure is logged and skipped, never crashes the loop.
@@ -19490,6 +19535,7 @@ def _purge_deleted_accounts() -> None:
             get_control_plane,
             is_supabase_enabled,
             purge_account_deletion,
+            sole_owned_org_ids,
         )
         if not is_supabase_enabled():
             return
@@ -19511,6 +19557,19 @@ def _purge_deleted_accounts() -> None:
                     env_grace, now_dt):
                 continue  # stored promise decides (env = fallback only)
             try:
+                # Re-derive and cascade BEFORE erasing the account: the
+                # memberships that make the org discoverable are the ones the
+                # auth erase destroys. The org is stamped with the SAME stored
+                # promise this sweep used for the account.
+                try:
+                    org_grace = (float(row.get("grace_hours"))
+                                 if row.get("grace_hours") is not None
+                                 else env_grace)
+                except Exception:
+                    org_grace = env_grace
+                cascade_now = now_dt.isoformat()
+                for org_id in sole_owned_org_ids(cp, user_id):
+                    _cascade_soft_delete_org_sync(org_id, cascade_now, org_grace)
                 status = _supabase_admin_delete_user(user_id)
                 # Fail-closed: a successful erasure is EXACTLY 200/204 (the
                 # auth user was deleted) or 404 (already gone — idempotent).
