@@ -7499,14 +7499,21 @@ class FalkorProjection(
                                   # vocabulary the FTS surface does not read.
                 try:
                     self._create_fulltext_index(label, fields)
-                    if label == "Point":
-                        # R2 (#1541) D3: a FRESH DB created the two-field
-                        # index directly — mark the migration done so a later
-                        # boot (create → "already") never re-enters the
-                        # drop→recreate path (marker guards churn).
+                    # #5440: a FRESH DB created the index directly — mark the
+                    # migration done so a later boot (create → "already") never
+                    # re-enters the drop→recreate path (marker guards churn).
+                    # Point did this already; Event did not, so the fresh Event
+                    # index was dropped and recreated on the NEXT construction
+                    # (the drop→recreate window the marker exists to close), and
+                    # the graph's node count depended on whether the first or
+                    # the second construction minted the marker. Both labels
+                    # now record "this index is v2" at creation.
+                    marker = {"Point": "point_fts_v2",
+                              "Event": "event_fts_v2"}.get(label)
+                    if marker:
                         try:  # noqa: SIM105
                             self.g.query(
-                                "MERGE (m:Meta {key:'point_fts_v2'}) SET m.v = true"
+                                "MERGE (m:Meta {key:'%s'}) SET m.v = true" % marker
                             )
                         except Exception:
                             pass

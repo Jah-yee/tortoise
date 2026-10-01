@@ -687,18 +687,29 @@ def test_sequential_same_path_redirect_mints_are_wiped(monkeypatch, tmp_path):
         assert p2.graph_name == p1.graph_name, "same path must derive the same graph"
         # DIVERGENCE (documented in the epic changelog): the plan's Step 1
         # entry assert is `count == 0`, but a server construction's
-        # _ensure_indexes re-mints its Meta marker node (MERGE, e.g.
-        # key:'event_fts_v2') on the graph — so a freshly-constructed graph
-        # carries exactly 1 Meta node. The P1-4 pollution marker is test 1's
-        # Point t1: its ABSENCE is the invariant; the count is bounded by the
-        # construction marker alone (≤ 1).
+        # _ensure_indexes MINTS its Meta marker nodes on the graph. The P1-4
+        # pollution marker is test 1's Point t1: its ABSENCE is the invariant.
+        # The remaining nodes are the construction markers and NOTHING else.
+        # Asserted as a property (every survivor is a known marker), never as
+        # a count: there is one marker per FTS migration — `point_fts_v2` and
+        # `event_fts_v2` — and #5440 made the Event one reachable on the CI
+        # engine (4.20.4 registers `db.idx.fulltext.drop`; the hardcoded
+        # `dropIndex` never existed there), so a literal "≤ 1" would red a
+        # correctly-migrated graph and pin an accident of engine version.
         assert p2.g.query(
             "MATCH (n:Point {id:'t1'}) RETURN count(n)"
         ).result_set[0][0] == 0, \
             "test 1's data survived into test 2 — the redirect mint was NOT in the wipe delta (P1-4)"
         n = p2.g.query("MATCH (n) RETURN count(n)").result_set[0][0]
-        assert n <= 1, \
-            f"graph should hold only the construction Meta marker, got {n} nodes"
+        non_marker = p2.g.query(
+            "MATCH (n) WHERE NOT n:Meta RETURN count(n)").result_set[0][0]
+        assert non_marker == 0, \
+            (f"graph should hold only the construction Meta markers, got "
+             f"{n} nodes ({non_marker} of them non-Meta)")
+        marker_keys = {r[0] for r in p2.g.query(
+            "MATCH (n:Meta) RETURN n.key").result_set}
+        assert marker_keys <= {"point_fts_v2", "event_fts_v2"}, \
+            f"unexpected Meta markers survived the wipe: {sorted(marker_keys)}"
     finally:
         p2.close()
 
