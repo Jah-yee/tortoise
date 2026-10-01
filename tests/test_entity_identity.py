@@ -818,6 +818,15 @@ _ALLOWED_OPERATOR = {
 _ALLOWED_KEYED = {
     'tortoise/commit_ops.py': {
         'sb_rows = proj.g.query( "MATCH (o:Object {name:$sb}) RETURN o.id, o.name, o.status", params={"sb": supersedes_by}, ).result_set': 1,
+        # #1370 (PR #5230, on `main` after this branch forked): NOT a fold and
+        # not a name-KEYED identity read — it RETURNS count(s), a cardinality
+        # test reached only when no Object holds the name (the `if not
+        # sb_rows:` branch above). It selects no identity, and a count is
+        # invariant to how many carriers hold the name, so it cannot fold two
+        # into one. Routed here it would be a semantics change (a refusal for
+        # >1 carrier would report "dangling successor" instead of "is a
+        # :Subject"), which is another lane's call — enumerated by #5509.
+        '_subj = proj.g.query( "MATCH (s:Subject {name:$sb}) RETURN count(s)", params={"sb": supersedes_by}, ).result_set': 1,
     },
     'tortoise/hosted_api.py': {
         # §A hosted session-capture about-edge anchor (S1).
@@ -866,6 +875,18 @@ _ALLOWED_FSTRING = {
         'q = (f"MATCH (x:{label} {{name:$key}}) " f"RETURN ID(x), x.id LIMIT 1")': 1,
         'r = self.g.query( f"MATCH (e:{label} {{name:$name}}) RETURN e.name LIMIT 1", params={"name": target_name}, ).result_set': 1,
         'self.g.query( f"MATCH (n:{n[\'label\']} {{{n[\'key\']}:$sid}}), (e:{label} {{name:$name}}) " f"MERGE (n)-[:{edge_type}]->(e)", params={"sid": n["value"], "name": target_name}, )': 1,
+    },
+    'tortoise/subject_binding.py': {
+        # #5509: NOT a fold, and NOT this PR's route. The write-time
+        # Point->Subject binder (#1370, PR #5230) landed on `main` after this
+        # branch forked. Its probe is `LIMIT 2` and treats anything but a
+        # single row as unresolved (`len(rows) != 1 -> (None, None)`), so two
+        # same-name carriers refuse rather than fold. Only this sweep sees it
+        # (the label is an f-string, so the literal `:Subject` keyed pattern
+        # does not match). Routing it through `entity_identity` would be a
+        # behaviour change in another lane's module, not a conflict
+        # resolution; the site is enumerated for disposition by #5509.
+        'rows = proj.g.query( f"MATCH (n:{label} {{name:$name}}) " f"RETURN n.id, n.{kind_prop} LIMIT 2", params={"name": name}).result_set': 1,
     },
     'tortoise/sdk.py': {
         # #5509: `_create_entity` canonical-id re-fetch — plan §B P1-A
