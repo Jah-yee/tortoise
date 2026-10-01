@@ -12,10 +12,35 @@ ownedBy: epistemic-team
 
 # AI Review Merge Gate
 
-`main` branch protection requires the `ai-review-gate` status check on every
-pull request. It replaces the human-approval requirement: merges proceed when
-the code-review skill's AI review is recorded and all required checks are
-green.
+`ai-review-gate` **is** a branch-protection required status context on `main`, and an
+ENTRY condition of the Mergify merge queue, as of 2026-09-29 (#5433). Verified: the live
+required contexts are `pricing-artifact`, `docs`, `test-isolation`, `license-surface`,
+`legal-e2e`, `python-ci-gate`, `ai-review-gate`, and `.mergify.yml` names
+`- check-success=ai-review-gate` in `queue_conditions`. Entry is evaluated against the
+**author PR head** — where this check actually reports — while the synthetic
+`mergify/merge-queue/*` batch deliberately PASSES instead of being evaluated (#5426), so
+naming it at entry cannot deadlock the queue.
+
+Because a required check must also appear in the config guard's record
+(`docs/ci/required-contexts.json`), the queue condition and the record's re-cut must move
+together: the guard's clause-(iv) agreement sub-check reds if the config and the record
+disagree (it is active under `merge` injection). I1 itself — the config's check names vs the
+**live** required set — is read only by `--live` (admin credential), and no workflow runs it,
+so the live half is a deliberate step rather than something CI keeps in sync.
+
+⚠️ **Qualified by #3091:** the check is required, its *harness* is not. Because the gate is
+`pull_request_target`, a PR that weakens it is evaluated by the base revision; with a recorded
+marker it can merge while `ai-review-gate-tests` is red-but-unrequired, after which the weakened
+required check reports Success on later PRs. The enforcement therefore holds only while the gate
+itself is uncompromised — that detection is #3091's open item.
+
+Before #5433 none of that was true — the check was not required and no queue condition
+named it, so nothing on the server-side merge path acted on its conclusion: the enforcers
+were all local (the rail `scripts/admin-merge.sh`, which computes the failing set and
+refuses on a red; `scripts/atomic-land.sh`; and the `review-enforcer` extension). The check
+still ran and read the body; a merge through the queue, or a bare `gh pr merge`, carried an
+unreviewed (or review-invalidated) tree to `main` because no step consulted that verdict. The
+entry condition closes that path.
 
 ## How it works
 
@@ -29,18 +54,27 @@ green.
   ```
 
   The second form is emitted when the PR diff can be fetched from the REST
-  API. The `diff=<sha256>` segment is optional (added producer-side by #2982)
-  and is part of the SIGNED text — it records the sha256 of the PR's three-dot
-  diff **after normalization** (#1362), so a review stays tied to the reviewed
-  artifact rather than only the commit sha. The gate must accept BOTH shapes: a
+  API and the stale-sha guard has not degraded the record to the legacy
+  sha-only shape (the `--force-stale` and head-fetch fail-open arms — see
+  "What the diff-match path does and does not verify" below).
+  The `diff=<sha256>` segment is optional (added producer-side by #2982)
+  and is part of the SIGNED text — it binds the review to the PR's three-dot
+  diff, so a review stays tied to the reviewed artifact rather than only the
+  commit sha. It is **defined** to be the post-normalization digest (#1362);
+  today's deployed producer still emits the raw digest — see the
+  producer-status note below. The gate must accept BOTH shapes: a
   regex that omits the optional segment rejects every correctly-signed
   post-#2982 marker before the HMAC check is ever reached (#3076).
 
-  > **Producer dependency.** The `diff=` form ships in the producer half of
-  > #2982 (`record-review.sh` in agent-infra, PR #767). Until that producer is
-  > deployed, `record-review.sh` emits the legacy sha-only form and only the
-  > sha-match path is exercised in production — the diff-match path is
-  > covered by the gate harness below.
+  > **Producer status.** The `diff=` form ships in the producer half of #2982
+  > (`record-review.sh` in agent-infra, PR #767), which **is deployed** (merged
+  > 2026-09-23; the installed `~/.pi/agent/scripts/record-review.sh` is
+  > byte-identical to agent-infra `main` and emits `diff=<raw sha256>` on its
+  > normal path). The
+  > **raw** digest is therefore the live stale-sha carry-forward arm; the
+  > **normalized** digest stays inert until the #1362 producer half
+  > (agent-infra#1431) lands *and* the farm refreshes
+  > `scripts/lib/diff-normalize.py` — see the binary carve-out below.
 
 - The `ai-review-gate` workflow (`.github/workflows/ai-review-gate.yml`,
   `pull_request_target`) recomputes the HMAC signature with the
@@ -49,7 +83,7 @@ green.
   signed `@ <sha>` is the PR's current head, OR its signed `diff=<sha256>`
   equals the diff hash the gate computes live from the GitHub REST API for
   this PR. The diff-match arm fails closed: if the live diff hash cannot be
-  computed (API blip, missing `gh`/`openssl`), a *stale-sha* `diff=` marker is
+  computed (API blip, missing `gh`/`openssl`/`python3`), a *stale-sha* `diff=` marker is
   not accepted. The gate computes TWO digests from the same fetched bytes and
   accepts a marker whose signed `diff=` equals EITHER — the normalized digest
   (#1362) or the legacy raw digest, so existing markers keep working. A marker
@@ -59,28 +93,34 @@ green.
 
 ## Why the diff, not just the head sha (#2982)
 
-`strict: true` branch protection requires a PR branch to be up to date with
-`main`. Updating it (`gh pr update-branch`) inserts a merge commit and moves
-the head — but the PR's three-dot diff is byte-identical **whenever `main`'s
+Branch protection on `main` has `strict: false` (verified 2026-09-29), so a PR branch is
+not *required* to be up to date with `main` before merging — a rebase or
+`gh pr update-branch` is a convenience here, not a precondition. The diff-key still earns
+its place, because it is what makes the evidence survive a head move when one happens:
+updating the branch inserts a merge commit and moves the head, but the PR's three-dot
+diff is byte-identical **whenever `main`'s
 advancement did not touch a file the PR also changes** (if it did, the hunk
 context/blob ids change and the evidence is genuinely stale, so a re-record is
-correct). When evidence was keyed only to the head sha, even an untouched
+correct). With evidence keyed only to the head sha, even an untouched
 diff invalidated a still-correct verdict,
-so a green PR could never reach a terminal mergeable state. Keying evidence to
+so a green PR could never reach a terminal mergeable state under `strict: true` (the
+setting this repo does not use). Keying evidence to
 the diff lets the verdict carry forward across a merge-only update. A change
 that actually changes the reviewed diff still invalidates it.
 
-The producer half (agent-infra PR #767, **not yet deployed**) also carries a
-verdict forward itself: asked to record a now-stale sha whose diff is unchanged
-from what was recorded, it re-records against the current head, and it refuses
-a stale sha whose diff changed (exit 3). Until it ships, the deployed
-`record-review.sh` still refuses *any* stale sha and emits no `diff=` — see the
-producer-dependency note above.
+The producer half (agent-infra PR #767, **deployed**) also carries a verdict
+forward itself: asked to record a now-stale sha whose diff is unchanged from
+what was recorded, it re-records against the current head, and it refuses a
+stale sha whose diff changed (exit 3). It emits `diff=<raw sha256>` today; the
+normalized digest appears only once agent-infra#1431 lands and the farm
+refreshes `scripts/lib/diff-normalize.py` — see the producer-status note above.
 
 Both the producer and the gate hash the bytes returned by the REST API
 (`Accept: application/vnd.github.v3.diff`) — never a local `git diff`, whose
-output would not byte-match the API's. Those bytes are normalized before
-hashing (#1362, below).
+output would not byte-match the API's. The gate normalizes those bytes before
+hashing (#1362, below); the producer hashes them RAW until the #1362 producer
+half (agent-infra#1431) lands and the farm is refreshed — see the
+producer-status note above.
 
 ### Diff normalization (#1362)
 
@@ -94,23 +134,49 @@ matched; the shipped raw digest did not, and the reviewed PR was refused. The
 owner ruling (2026-09-23) is to compute the digest over a **normalized** diff.
 
 The normalization is a signed cross-repo contract with
-`record-review.sh` (agent-infra#1362); both sides implement exactly the same
-spec. Process the diff as lines (split on `\n`, preserve the final line's
-trailing-newline state):
+`record-review.sh` / its `scripts/lib/diff-normalize.py` (agent-infra#1362);
+both sides MUST implement exactly the same predicate below (the producer half
+is agent-infra#1431 — if the two halves diverge, every freshly-signed marker
+stops matching fleet-wide, the #3076 shape). Process the diff **entry-scoped**
+(entry boundaries are `^diff --git ` lines), as lines (split on `\n`, preserve
+the final line's trailing-newline state):
 
-1. **Drop** every `^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]{6})?$` line.
-2. **Rewrite** every
+1. **Drop** an `^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]{6})?$` line **only when its
+   entry contains at least one hunk line** (`^@@ `).
+2. **Keep** the `index` line **verbatim** when the entry contains **no** hunk
+   line — a binary entry (`^Binary files .* differ$` / `^GIT binary patch$`) or
+   a hunk-less empty-file add/delete.
+3. **Rewrite** every
    `^@@ -([0-9]+)(,([0-9]+))? \+([0-9]+)(,([0-9]+))? @@(.*)$` to
    `@@ -0,<old-count> +0,<new-count> @@<heading>`, each count defaulting to `1`
-   when its group is absent (`@@ -5 +5 @@` means one line each).
-3. Every other line passes through unchanged.
+   when its group is absent (`@@ -5 +5 @@` means one line each) — this applies
+   to every entry.
+4. Every other line passes through unchanged.
+
+The contract sentence: **drop the `index` line exactly when the hunk content
+already carries the change.**
+
+> **Binary carve-out (amendment to the 2026-09-23 ruling).** A binary entry has
+> no hunks and `Binary files … differ` carries no content, so its `index` line
+> is the **only** content-bearing field. Dropping it made two *distinct* binary
+> revisions normalize identically: review binary v1, sign the marker, swap in
+> v2, and the gate **accepted** an unreviewed binary — a fail-open.
+> The amendment is required by the ruling's own rationale ("the `index` line is
+> redundant with hunk content" — false precisely when there is no hunk content)
+> and is recorded on agent-infra#1362, comment 5806797023. The producer must
+> mirror it with the **same hunk-presence predicate** (agent-infra#1431) — a
+> binary-marker-presence predicate would diverge on a hunk-less *non-binary*
+> entry (the empty-file add/delete in step 2).
 
 Hunk **content**, hunk **counts**, and the `diff --git` / `---` / `+++` / mode /
 rename / binary lines and section heading are deliberately **not** normalized —
-counts derive from content, so they move only when content moves. Implement
-this with a line filter (`sed`), never with `git patch-id`: `--stable` and the
-default both **ignore whitespace**, so a whitespace-only change would carry a
-stale verdict forward (a false accept). sha256 over normalized bytes does not.
+counts derive from content, so they move only when content moves. The
+transformation needs has-this-entry-seen-a-hunk state, so it is a line filter
+**with state** (the consumer uses an inline `python3` block mirroring the
+producer's `split("\n")` / `"\n".join(…)`; a stateless `sed` one-liner cannot
+express it). Never use `git patch-id`: `--stable` and the default both
+**ignore whitespace**, so a whitespace-only change would carry a stale verdict
+forward (a false accept). sha256 over normalized bytes does not.
 
 The gate computes **both** digests from the same fetched bytes and accepts a
 marker whose signed `diff=` equals either:
@@ -121,7 +187,7 @@ marker whose signed `diff=` equals either:
   recorded.
 
 The legacy arm is mandatory: without it every existing marker breaks and the
-required check reddens fleet-wide. This is a **consumer-first land order** —
+check reddens fleet-wide. This is a **consumer-first land order** —
 the gate is safe to land before or after the producer, and changes nothing
 until the producer starts emitting the normalized digest.
 
@@ -132,12 +198,11 @@ the marker is signed and that the signed `diff=` equals this PR's diff at check
 time. The binding between a recorded sha and the diff actually reviewed is
 enforced by `record-review.sh`'s stale-sha guard, not by the gate.
 
-That matters once the producer half lands (agent-infra PR #767). Its
-`--force-stale` (and its head-fetch fail-open arm) will compute `diff=` from the
-PR's **current** diff while keeping the caller-supplied stale sha, so a marker
-minted that way IS accepted here even though the reviewed artifact cannot be
-shown unchanged. Closing that trust gap is producer-side work
-(agent-infra#784).
+The producer half (agent-infra PR #767) is deployed and closes this gap
+producer-side (agent-infra#784, closed): in the `--force-stale` and head-fetch
+fail-open arms `record-review.sh` drops the diff binding (`DIFF_HASH=""`), so
+the marker degrades to the legacy sha-only shape and rule (b) cannot carry it —
+the gate still cannot tell which revision a reviewer saw (see the note above).
 
 Do **not** "fix" it here by requiring the recorded sha to be an ancestor of the
 current head: this repo's documented refresh path is `git rebase origin/main` +
@@ -152,7 +217,7 @@ The gate's shell logic runs inline in the workflow (this workflow has no
 checkout step, so it cannot reference a repo script), so
 `.github/scripts/ai-review-gate.test.sh` **extracts the `run:` block verbatim**
 and drives it with a stubbed `gh` and a fabricated HMAC key. It also asserts the
-non-runtime invariants — the required job carries no
+non-runtime invariants — the job carries no
 `if:`/`needs:`/`continue-on-error:`, the trigger stays `pull_request_target`
 with no `paths:` filter, the permissions still grant `pull-requests: read`, and
 the step declares `GH_TOKEN`.
@@ -192,7 +257,7 @@ moves after a record because of new review-fix commits, re-run the code-review
 skill and re-record at the new head. If it moves only because the branch was
 updated against `main` — whether by a merge commit or by a rebase plus
 `--force-with-lease` — the three-dot diff is unchanged and the recorded
-evidence remains valid **for this required check**.
+evidence remains valid **for this check**.
 
 > The local `review-enforcer` extension keeps its own, head-bound merge gate, so
 a plain local merge is still blocked after a merge-only update. That is tracked
@@ -212,6 +277,8 @@ is unambiguous:
 | `normalises to an empty value` | the configured secret is whitespace-only, so the HMAC key would be the empty (public) string | set a real `AI_REVIEW_GATE_KEY` |
 | `HMAC mismatch` | key or signed text differs; prints `sha256` prefixes of the text it checked | compare the prefix with the recording machine, then re-record |
 | `is stale` | marker is for another head sha, and its `diff=` is absent, could not be hashed live, or matches neither the normalized nor the raw digest | re-run the review, re-record at the new head |
+| `NO marker in this PR's body is bound to <head>` | the stale verdict, stated as what it examined: prints `candidate marker(s): N` (with their shas), the head it expected, and `body=<rest-live\|event-snapshot>` | if `body=event-snapshot`, the run judged a body frozen at the event, so re-run the check before acting — a record posted afterwards is invisible to that run; otherwise re-record at the head |
+| `the LIVE body could not be used (…)` | the run fell back to the event payload: the REST read failed, or it succeeded and returned an empty body | re-run the check before acting on the verdict; the evidence may still be valid |
 | `live diff hash could not be computed` | the REST diff fetch failed; a `diff=` marker fails closed rather than carrying forward | re-run the job once the API is reachable — the evidence may still be valid |
 | `carries no well-formed 40-hex recorded sha` | marker's `@` field is not a full sha | re-record with a full 40-char head sha |
 | `malformed marker` | signed, but the line shape drifted from what this gate accepts | update the gate/producer together |

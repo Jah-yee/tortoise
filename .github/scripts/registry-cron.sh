@@ -21,7 +21,9 @@
 #      SWEEP_NO_COVERAGE, job red (#2796/#2823)
 #   5. POST /backups/purge + /reconcile ride-along (skipped when the sweep
 #      reported already_running; #2304 purge erases expired trash on the hourly
-#      cadence — wired by #2317)
+#      cadence — wired by #2317). #4612: a failed leg is filed as a dedup'd
+#      PURGE_FAILED / RECONCILE_FAILED incident (and resolved by the leg's own
+#      success), so a persistent ride-along failure is no longer log-only.
 #   6. POST /driver/heartbeat
 #   7. self-heal: close an incident only on the evidence that proves it gone —
 #      APP_DOWN / resolved SWEEP_CONFIG_ERROR / SWEEP_OFF_STALE on a completed
@@ -50,13 +52,19 @@ export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-auto}"
 log() { echo "[backup-driver] $*"; }
 fail() { echo "[backup-driver] ERROR: $*" >&2; }
 # #2796 (review guidance P2-3): the job must be RED whenever the pipeline is
-# broken — i.e. whenever an incident was filed this run, not only on the four
-# kill-switch/no-coverage states. `file_alert` sets LOUD and every terminal
-# exit goes through finish(). Silent ⟺ nothing was filed this run.
+# broken — i.e. whenever an incident was DETECTED this run, not only on the four
+# kill-switch/no-coverage states. `file_alert` sets LOUD and every terminal exit
+# goes through finish() or an explicit `exit 1` (#4612 corrected the earlier
+# "every terminal exit goes through finish()" claim: the incidents that exit
+# before finish() — the sweep-coverage arms and, since #4612, the ride-along
+# arms — exit 1 directly). Silent ⟺ nothing was detected this run.
+# #3907 review (P2): LOUD records the DETECTION, not a successful filing — a
+# failed create keeps the job red while filing nothing — so the message must not
+# claim "an incident was filed".
 LOUD=0
 finish() {
   if [ "${LOUD:-0}" = "1" ]; then
-    log "loud run: an incident was filed — exiting RED"
+    log "loud run: a broken pipeline was detected — exiting RED"
     exit 1
   fi
   exit 0
@@ -138,6 +146,11 @@ if [ -z "$GH_TOKEN" ]; then
 fi
 
 # ── dedup helpers (R2 create-once + GH-search fallback) ─────────────────────
+GH_SEARCH_FAILED_SENTINEL="__gh_search_failed__"
+r2_head() { # key -> 0 when the object EXISTS
+  aws s3api head-object --endpoint-url "$R2_ENDPOINT" \
+    --bucket "$R2_BUCKET" --key "$1" >/dev/null 2>&1
+}
 # Alert dedup keys (#2844). A subject-less (platform-scoped) incident is written
 # by TWO implementations: this driver and the server-side AlertStore
 # (tortoise/alert_store.py). They must agree on ONE key, or the R2 create-once is
@@ -160,6 +173,14 @@ kind_owner() { # kind -> the writer whose probes cover this kind's recovery (#31
   case "$1" in
     # driver: its own R2 preflight + /status.storage_error + a measured pool.
     R2_DOWN|APP_DOWN|WATCHER_DOWN|SWEEP_CONFIG_ERROR|SWEEP_OFF_STALE|SWEEP_NO_COVERAGE|LIVENESS_NO_WORK)
+      echo driver ;;
+    # #4612: a ride-along leg's OWN success is the recovery evidence — the
+    # driver is the only surface that invokes the leg, so it is the only writer
+    # whose probe covers the recovery condition. The kind and the run-scoped
+    # shell FLAG of the same spelling (PURGE_FAILED/RECONCILE_FAILED, declared in
+    # §4) are different layers: the flag drives the terminal exit, the kind drives
+    # the issue. They are set together in one branch — never one without the other.
+    PURGE_FAILED|RECONCILE_FAILED)
       echo driver ;;
     # watcher: archive/stamp freshness + the driver heartbeat, read in-process.
     STALE|NEVER_BACKED_UP|METADATA_LOST|BACKUP_SET_MISSING|DRIVER_DOWN)
@@ -194,9 +215,40 @@ alert_keys_all() { # kind id -> the canonical key + every legacy spelling
     printf 'ops/alerts/%s/global.json\n' "$kind"
   fi
 }
-r2_put_once() { # key body_file
-  aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
-    --bucket "$R2_BUCKET" --key "$1" --body "$2" --if-none-match "*" >/dev/null 2>&1
+r2_put_once() { # key body_file -> 0 created, 1 already exists, 2 UNRESOLVED (loud)
+  # #3032: mirror the Python twin (hosted_backup.create_if_not_exists) — a
+  # rejected conditional write must never silently degrade the dedup AUTHORITY
+  # into the fail-open GitHub title search. The pre-#3032 shape collapsed every
+  # failure (412 race, unsupported `--if-none-match`, transport error, proxy)
+  # into "the object already exists", so on a runner whose client rejects the
+  # flag NO dedup object was ever created and dedup rested entirely on the
+  # unverified search (the #2828 class).
+  local out=""
+  if out="$(aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
+    --bucket "$R2_BUCKET" --key "$1" --body "$2" --if-none-match "*" 2>&1)"; then
+    return 0
+  fi
+  case "$out" in
+    # The expected create-once race: the object already exists (S3 412).
+    # Match the ERROR MARKERS only — a bare `*412*` would also match a
+    # request-id / byte-count / timestamp in an unrelated failure and report
+    # "exists" without ever HEAD-checking (review).
+    *PreconditionFailed*|*"At least one of the pre-conditions"*) return 1 ;;
+  esac
+  # Conditional writes unsupported (or another error): fall back to the
+  # HEAD-check — the object's EXISTENCE decides, exactly like the Python twin
+  # (hosted_backup.create_if_not_exists). An AMBIGUOUS HEAD (absent read or a
+  # read that failed) must NOT be followed by a blind unconditional put: it
+  # could overwrite a concurrent writer's object and reset its issue_number to
+  # null — the duplicate-risk class #3029 removes. Report unresolved instead.
+  if r2_head "$1"; then return 1; fi
+  # Include the (truncated) AWS cause: "conditional write rejected" alone cannot
+  # distinguish an aws CLI that lacks --if-none-match (where this runner files
+  # NOTHING and is red every hour) from broken creds or a transient network
+  # fault — each needs a different operator action (final-cycle review P2).
+  cause="$(printf '%s' "${out:-}" | tr '\n' ' ' | cut -c1-200)"
+  fail "r2_put_once: could not create nor confirm $1 — conditional write rejected (${cause:-no output}) and the HEAD-check could not confirm absence. Dedup is unverified; refusing a blind put."
+  return 2
 }
 r2_get() { # key -> body (empty on failure)
   aws s3api get-object --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$1" /dev/stdout 2>/dev/null || true
@@ -204,7 +256,66 @@ r2_get() { # key -> body (empty on failure)
 r2_delete() { # key — delete-to-resolve (the alert_store lifecycle contract)
   aws s3api delete-object --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$1" >/dev/null 2>&1 || true
 }
-gh_find_open() { # kind id(subject) -> first open issue number whose TITLE subject matches exactly (or empty)
+# ── the ONE GitHub HTTP primitive ───────────────────────────────────────────
+# EVERY GitHub call in this driver goes through `_gh_curl`/`gh_request`. A bare
+# `curl -sS` exits 0 on an HTTP 4xx/5xx — the #2140 deaf-monitor class: a 403
+# was reported as a successful write, and a failed SEARCH read as "no open
+# issue" → a duplicate (#2706). The status is therefore captured and REQUIRED;
+# a transport failure collapses to `000` and is refused the same way.
+#
+# This driver keeps its OWN single primitive (curl, not `gh api`) rather than a
+# fourth one-off per call site. #5019 owns re-pointing the remaining inline
+# filers — this one included, whose dedupe is R2-object-aware — at the shared
+# `auto-file-issue.sh` substrate; until then status-checking exists ONCE here.
+GH_API="https://api.github.com"
+
+_gh_curl() { # <out-file> <method> <path> [curl args…] -> HTTP code on stdout
+  local out="$1" method="$2" path="$3"; shift 3
+  curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+    -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+    "$@" "${GH_API}${path}" 2>/dev/null || echo 000
+}
+
+gh_request() { # <method> <path> [curl args…] -> body on stdout; 0 ONLY on 2xx
+  local method="$1" path="$2"; shift 2
+  local tmp code
+  tmp="$(mktemp)"
+  code="$(_gh_curl "$tmp" "$method" "$path" "$@")"
+  case "$code" in
+    2[0-9][0-9]) cat "$tmp"; rm -f "$tmp"; return 0 ;;
+  esac
+  rm -f "$tmp"
+  return 1
+}
+
+# EVERY page of a search query, concatenated into ONE JSON array. A non-2xx on
+# ANY page is a FAILURE (non-zero): a partial pool must never be read as "the
+# issue is not there", which files a duplicate. GitHub caps search at 1000
+# results (10 pages of 100), which bounds the walk. Search ranking is
+# relevance-based, NOT equality-first, so a single-page read can miss the exact
+# issue and duplicate it (the class already fixed in the substrate's
+# af_open_issue).
+gh_search_items() { # <url-encoded-query> -> JSON array of items; non-zero on failure
+  local q="$1" page=1 items="[]" json n tmp code
+  tmp="$(mktemp)"
+  while [ "$page" -le 10 ]; do
+    code="$(_gh_curl "$tmp" GET "/search/issues?q=${q}&per_page=100&page=${page}")"
+    case "$code" in
+      2[0-9][0-9]) ;;
+      *) rm -f "$tmp"; return 1 ;;
+    esac
+    json="$(cat "$tmp" 2>/dev/null || true)"
+    n="$(printf '%s' "$json" | jq -r 'if (.items|type) == "array" then (.items|length) else "ERR" end' 2>/dev/null || echo ERR)"
+    case "$n" in ''|*[!0-9]*) rm -f "$tmp"; return 1 ;; esac
+    items="$(printf '%s\n%s' "$items" "$(printf '%s' "$json" | jq -c '.items' 2>/dev/null || echo '[]')" | jq -cs 'add')"
+    [ "$n" -eq 100 ] || break
+    page=$((page + 1))
+  done
+  rm -f "$tmp"
+  printf '%s' "$items"
+}
+
+gh_find_open() { # kind id(subject) -> open issue number, "" when none, $GH_SEARCH_FAILED_SENTINEL when the search FAILED
   # #2375: subject-scoped — a bare kind search lets a per-graph issue
   # ("[DR] STALE — team_a:g_x") be adopted by a team-level file ("… team_a")
   # and vice versa (the bare team subject is a PREFIX of the per-graph
@@ -216,50 +327,175 @@ gh_find_open() { # kind id(subject) -> first open issue number whose TITLE subje
   # subject-less incident but is NOT aliased here — a real subject literally
   # named `global` must match on its own TITLE, or it could adopt (and later
   # close) an unrelated platform incident.
+  #
+  # #3029: the search index is a RECALL filter, never an identity proof.
+  # GitHub tokenizes punctuation away, so `in:title "[DR] R2_DOWN"` also matches
+  # an ordinary bug report whose title merely contains the tokens — verified
+  # live: the production query resolved to #2844, a bug report ABOUT R2_DOWN,
+  # which the resolver would then have adopted and closed. Every hit is verified
+  # against the incident's OWN title shape (the same contract the server
+  # enforces in tortoise/github_issue.py::incident_title_matches): the kind must
+  # follow `[DR] ` immediately, and a subject must be the EXACT ` — ` segment
+  # after it. Subject-less ids ("") accept the bare `[DR] KIND` title plus any
+  # trailing ` — prose`.
+  #
+  # The search is FAIL-CLOSED: a transport failure or an error body (a 403
+  # rate-limit response is valid JSON with no `items`) prints the
+  # GH_SEARCH_FAILED_SENTINEL instead of nothing, so no caller can read it as
+  # "no incident" — the pre-#3029 `|| true` collapsed both into empty, which
+  # made `file_alert` file a duplicate and let `resolve_global` close an
+  # unverified target. The sentinel rides STDOUT (not a global) because callers
+  # read this function through a command substitution, i.e. in a subshell.
   [ -n "$GH_TOKEN" ] || return 0
-  local kind="$1" id="${2:-}"
-  if [ -z "$id" ]; then
-    curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/search/issues?q=repo:${REPO}+is:issue+is:open+label:%22dr:backup%22+in:title+%22%5BDR%5D+$kind%22" \
-      | jq -r '.items[0].number // empty' 2>/dev/null || true
+  local kind="$1" id="${2:-}" q items
+  # One query shape for BOTH branches; the verification is applied to the
+  # TITLE after the walk — the walk PAGES (a single page can miss the exact
+  # subject, the #2706 class) and REFUSES on a failed search ("" would read as
+  # "no incident" → duplicate).
+  q="repo:${REPO}+is:issue+is:open+label:%22dr:backup%22+in:title+%22%5BDR%5D+$kind%22"
+  if ! items="$(gh_search_items "$q")"; then
+    printf '%s' "$GH_SEARCH_FAILED_SENTINEL"
     return 0
   fi
-  curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/search/issues?q=repo:${REPO}+is:issue+is:open+label:%22dr:backup%22+in:title+%22%5BDR%5D+$kind%22&per_page=20" \
-    | jq -r --arg suf " — $id" \
-      '[.items[] | select(.title | endswith($suf))][0].number // empty' 2>/dev/null || true
+  printf '%s' "$items" | jq -r --arg k "$kind" --arg id "$id" '
+    ("[DR] " + $k) as $p
+    | [ .[]
+        | (.title // "") as $t
+        | select($t | startswith($p))
+        | ($t[($p | length):]) as $rest
+        | select(
+            if ($id == "" or $id == "global") then
+              ($rest == "" or ($rest | startswith(" — ")))
+            else
+              ($rest | startswith(" — "))
+              and (($rest | ltrimstr(" — ") | split(" — ")[0]) == $id)
+            end
+          )
+        | .number
+      ][0] // empty' 2>/dev/null || { printf '%s' "$GH_SEARCH_FAILED_SENTINEL"; return 0; }
 }
 gh_issue_open() { # number -> 0 when OPEN or unknown; 1 when confirmed closed OR missing
   # #2796 (review R3/R4): the 412 dedup branch must trust the object over a GH
   # search, and must be able to tell a DELETED issue (404) from a transient
   # blip. A 404 is definitively gone → re-file (otherwise the recurrence is
   # swallowed forever). Rate-limit/5xx/network → assume OPEN, never duplicate.
-  local n="${1:-}" code="" state=""
+  # ONE status-checked call via the primitive (the body and the code arrive
+  # together, so the state read can never disagree with the code that admitted
+  # it — the pre-fix code made TWO bare calls, the second of which could
+  # answer a different body than the first).
+  local n="${1:-}" tmp code state
   [ -n "$GH_TOKEN" ] && [ -n "$n" ] || return 0
-  code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO}/issues/${n}" 2>/dev/null || echo 000)"
+  tmp="$(mktemp)"
+  code="$(_gh_curl "$tmp" GET "/repos/${REPO}/issues/${n}")"
   case "$code" in
-    404) return 1 ;;   # definitively missing → re-file
-    200) : ;;
-    *)   return 0 ;;   # transport / rate-limit / 5xx → assume open
+    404) rm -f "$tmp"; return 1 ;;   # definitively missing → re-file
+    2[0-9][0-9]) : ;;
+    *)   rm -f "$tmp"; return 0 ;;   # transport / rate-limit / 5xx → assume open
   esac
-  state="$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO}/issues/${n}" | jq -r '.state // empty' 2>/dev/null || true)"
+  state="$(jq -r '.state // empty' "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
   case "$state" in
     open) return 0 ;;
     "")   return 0 ;;   # unparseable body on a 200 → assume open
     *)    return 1 ;;   # closed
   esac
 }
-gh_close() { # number comment kind id
+gh_comment() { # number body -> 0 ONLY when GitHub answered 2xx
+  # #3907 review (P1): a bare `curl -sS …` exits 0 on an HTTP 4xx/5xx — the
+  # comments endpoint answered 403 (secondary rate limit / missing `issues:
+  # write` / abuse detection) with exit 0 in review, and with core quota at
+  # 4,998. Called as `if gh_comment …`, that made gh_record_occurrence log
+  # "recorded recurrence #N … (no duplicate filed)" while the issue carried NO
+  # record at all — the #2140 deaf-monitor class this file already calls out.
+  # So capture the status code and require a REAL 2xx via the ONE primitive
+  # above; a transport failure (curl exits non-zero, no code) collapses to
+  # `000` and is refused the same way.
   [ -n "$GH_TOKEN" ] || return 0
-  local kind="${3:-}" id="${4:-}"
+  gh_request POST "/repos/${REPO}/issues/$1/comments" \
+    -d "$(jq -nc --arg b "$2" '{body:$b}')" >/dev/null
+}
+# #3907: a dedup no-op must still RECORD the occurrence. The pre-#3907 dedup
+# paths logged and returned, so a driver firing hourly on ONE unchanged fault
+# looked like a single quiet run in the issue — dedupe that hides the
+# escalation converts "noisy" into "blind", and #3907's acceptance requires the
+# recurrence to be visible on the issue. The count is read from the ISSUE (our
+# own marked comments), never from the R2 dedup object: the object is shared
+# with the server-side AlertStore, which rewrites it, so a counter kept there
+# would be reset by the other writer.
+OCCURRENCE_MARKER='<!-- dr-occurrence -->'
+# The only author whose marked comment may be counted. The marker is not secret
+# (the public comments API returns it verbatim), so a bare `contains($m)` let ANY
+# third party post the marker and inflate the recurrence number — the one field
+# of #3907 an outsider can corrupt. Filtering on the reserved bot login closes
+# the over-count direction; the count may still under-report on a read failure,
+# which only re-states a lower N (harmless).
+OCCURRENCE_BOT_LOGIN='github-actions[bot]'
+OCCURRENCE_MAX_PAGES=20
+gh_occurrence_count() { # number -> integer (0 when unreadable: under-count, never fabricate)
+  local n="${1:-}" page=1 total=0 body cnt len
+  [ -n "$GH_TOKEN" ] && [ -n "$n" ] || { printf '0'; return 0; }
+  while [ "$page" -le "$OCCURRENCE_MAX_PAGES" ]; do
+    if ! body="$(gh_request GET "/repos/${REPO}/issues/${n}/comments?per_page=100&page=${page}")"; then
+      printf '%s' "$total"; return 0
+    fi
+    cnt="$(printf '%s' "$body" | jq -r --arg m "$OCCURRENCE_MARKER" --arg login "$OCCURRENCE_BOT_LOGIN" \
+      '[.[]? | select(((.user.login // "") == $login) and ((.body // "") | contains($m)))] | length' 2>/dev/null || true)"
+    len="$(printf '%s' "$body" | jq -r 'if type == "array" then length else -1 end' 2>/dev/null || echo -1)"
+    case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+    case "$len" in ''|*[!0-9]*) len=-1 ;; esac
+    total=$((total + cnt))
+    [ "$len" -eq 100 ] || break
+    page=$((page + 1))
+  done
+  printf '%s' "$total"
+}
+gh_record_occurrence() { # number kind id
+  # Additive only: it comments and logs, and NEVER changes LOUD or the incident
+  # lifecycle. A failing comment is logged, not fatal — the run is already RED
+  # (file_alert set LOUD before any dedup branch), so the escalation the comment
+  # records is never the sole carrier of the signal.
+  local n="${1:-}" kind="${2:-}" id="${3:-}" count next
+  [ -n "$n" ] || return 0
+  count="$(gh_occurrence_count "$n")"
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  next=$((count + 1))
+  if gh_comment "$n" "$(printf '🔁 **Recurrence #%s** — `[DR] %s — %s` observed again at `%s`. This incident is already tracked by this issue, so no duplicate was filed.\n\n%s' \
+      "$next" "$kind" "${id:-_}" "$(date -u +%FT%TZ)" "$OCCURRENCE_MARKER")"; then
+    log "dedup: recorded recurrence #${next} on issue #${n} (no duplicate filed)"
+  else
+    # Never fatal: LOUD is already set, so the run is RED without the comment —
+    # the next run re-records (the count is derived from the issue, so nothing
+    # is skipped). Say so rather than claiming a record that did not happen.
+    log "dedup: recurrence comment on issue #${n} FAILED — the run is still RED; the next run re-records"
+  fi
+}
+gh_close() { # number comment kind id -> 0 ONLY when the close was CONFIRMED 2xx
+  [ -n "$GH_TOKEN" ] || return 0
+  local kind="${3:-}" id="${4:-}" code=""
+  # #3907 review (P2) / #3029-#3031 class, cycle-2 review P1 — the shell twin of
+  # the Python fix in alert_store.resolve_incident. The pre-fix close was
+  # `curl … >/dev/null 2>&1 || true`, so a 403/5xx (or a transport failure) left
+  # the issue OPEN while the driver believed it resolved — AND deleted the R2
+  # sentinel, so the next recurrence re-adopted a stale issue and a human saw
+  # "unresolved" indefinitely. The close must SUCCEED before we drop the dedup
+  # object: deleting on a failed PATCH leaves the object gone while the issue
+  # stays OPEN — the next run re-creates the object, adopts the still-open issue
+  # and pages again, and `resolve_global` has already set the run green, so the
+  # false all-clear is invisible. On a non-2xx the object is KEPT and the failure
+  # is LOUD so the next hourly run retries.
   curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/${REPO}/issues/$1/comments" \
     -d "$(jq -nc --arg b "$2" '{body:$b}')" >/dev/null 2>&1 || true
-  curl -sS -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO}/issues/$1" -d '{"state":"closed"}' >/dev/null 2>&1 || true
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+    -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${REPO}/issues/$1" -d '{"state":"closed"}' 2>/dev/null)" || code=""
+  case "$code" in
+    2*) : ;;
+    *)
+      LOUD=1
+      fail "gh_close: closing issue #$1 returned HTTP ${code:-<no response>} — keeping the dedup object so the next run retries (the issue is still OPEN)"
+      return 1 ;;
+  esac
   # delete-to-resolve: drop the R2 dedup object so a RECURRENCE is a new
   # incident. Without this, file_alert's 412 branch would adopt the stale
   # object and silently swallow the recurrence (the #2796 class).
@@ -270,6 +506,7 @@ gh_close() { # number comment kind id
     local _k
     while IFS= read -r _k; do r2_delete "$_k"; done < <(alert_keys_all "$kind" "$id")
   fi
+  return 0
 }
 resolve_global() { # kind comment — close an open global incident (no-op if none)
   local kind="$1" comment="$2" num="" owner=""
@@ -286,16 +523,114 @@ resolve_global() { # kind comment — close an open global incident (no-op if no
     log "self-heal: refusing to close ${kind} — it is owned by the ${owner}, whose probes cover its recovery condition"
     return 0
   fi
+  # #2844: the platform incident is written under the canonical `_` spelling;
+  # every platform call site passes `""` (never the literal "global", which is a
+  # real subject's own key and a legacy READ alias).
   num="$(gh_find_open "$kind" "")"
-  if [ -n "$num" ]; then gh_close "$num" "$comment" "$kind" ""; fi
+  case "$num" in
+    "$GH_SEARCH_FAILED_SENTINEL")
+      # #3029 fail-closed: a failed search cannot tell "no incident" from
+      # "cannot see incidents", so the target is unverifiable and closing is a
+      # guess — the pre-#3029 fuzzy search closed whatever it returned (the
+      # #2844 class). Close nothing; the next run retries. LOUD, never silent.
+      fail "GitHub search failed for ${kind} — skipping resolve (target unverifiable, not guessing); the next run retries"
+      LOUD=1
+      return 0 ;;
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  if ! gh_close "$num" "$comment" "$kind" ""; then
+    log "self-heal: could NOT close issue #${num} for ${kind} — it stays OPEN with its dedup object"
+  fi
+}
+# ── the ride-along curl-outcome vocabulary (#4612) ──────────────────────────
+# The two ride-along legs must not grow a private vocabulary each for the same
+# fact, so how a curl outcome is NAMED is declared once, here, from curl's OWN
+# exit status plus the body:
+#   driver_timeout   curl rc 28 — the caller's own `-m` ceiling was hit
+#   transport_error  any other non-zero rc — the exchange did not complete
+#   empty_response   rc 0 with no body
+#   http             rc 0 with a body (the HTTP code is then meaningful)
+# The SWEEP leg (#5028) deliberately keeps its own `rc -eq 28` test: its STATUS
+# vocabulary (`driver_timeout`/`empty_response`) is that shipped contract, and
+# the `transport_error` case it cannot yet express is the sweep's own
+# incident-body truthfulness gap, tracked by #5114. Routing it through this
+# helper would unify nothing — it consumes one token of the four.
+leg_shape() { # <curl_rc> <body> -> shape label on stdout
+  if [ "${1:-99}" -eq 28 ]; then
+    printf 'driver_timeout'
+  elif [ "${1:-99}" -ne 0 ]; then
+    printf 'transport_error'
+  elif [ -z "${2:-}" ]; then
+    printf 'empty_response'
+  else
+    printf 'http'
+  fi
+}
+
+# Ride-along request (#4612) — the purge/reconcile legs' ONE curl call site.
+# Pre-#4612 each leg ran curl inline as `-w '%{http_code}' … || echo '000'`: a
+# `-m` timeout makes curl write its OWN `000` (with no trailing newline) and exit
+# 28, so the `||` branch appended a SECOND `000` — the log read `HTTP 000000`, a
+# server-error claim for a client-side give-up. The same timeout leaves the body
+# empty, and `printf '' | jq -r '.status // "error"'` prints NOTHING and exits 0
+# (the `//` default fires only for a PRESENT-but-null field), so the status read
+# blank. #4612 makes these failures FILE, so the shape they publish must be TRUE;
+# deriving it here keeps that fix in one place instead of one-per-leg.
+#
+# OUTPUT CONTRACT — the helper writes these GLOBALS (never `local`, so the caller
+# sees them) and ALWAYS returns 0, so `set -e` can never abort the driver at a
+# ride-along leg: curl's own non-zero status is captured into RIDE_RC (consumed
+# by leg_shape), never propagated.
+#   RIDE_CODE     the exact `-w` HTTP code, normalised to `000` when absent
+#   RIDE_BODY     the response body ("" when none)
+#   RIDE_RC       curl's OWN exit status
+#   RIDE_ELAPSED  whole seconds the call took
+#   RIDE_SHAPE    the leg_shape label for (RIDE_RC, RIDE_BODY)
+ride_along_request() { # <timeout_s> <curl args…>
+  local timeout_s="$1"; shift
+  local resp start rc=0
+  resp="$(mktemp)"
+  start="$(date +%s)"
+  # `|| rc=$?` captures curl's exit; NEVER `|| echo '000'`, which CONCATENATES
+  # a second code onto curl's own write-out.
+  RIDE_CODE="$(curl -sS -o "$resp" -w '%{http_code}' -m "$timeout_s" "$@" 2>/dev/null)" || rc=$?
+  RIDE_ELAPSED=$(( $(date +%s) - start ))
+  RIDE_BODY="$(cat "$resp" 2>/dev/null || true)"
+  rm -f "$resp"
+  RIDE_RC="$rc"
+  # A failed transport can leave the write-out empty or non-numeric — normalize.
+  case "$RIDE_CODE" in
+    ''|*[!0-9]*) RIDE_CODE="000" ;;
+  esac
+  RIDE_SHAPE="$(leg_shape "$RIDE_RC" "$RIDE_BODY")"
+  return 0
 }
 telegram() { # text
   [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] \
     && curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=$1" >/dev/null 2>&1 || true
 }
+# Create ONE issue, status-checked, and return its number ("" when UNFILED).
+# This is the SINGLE create call both file_alert branches used to duplicate
+# (#3907 review P2): the pre-fix bare `curl … | jq -r '.number // empty'`
+# conflated an HTTP failure with "no number", so a 403/5xx filed nothing while
+# `finish()` claimed "an incident was filed".
+gh_create_issue() { # <title> <body> -> issue number on stdout, "" when UNFILED
+  local title="$1" body="$2" resp n
+  if ! resp="$(gh_request POST "/repos/${REPO}/issues" \
+      -d "$(jq -nc --arg t "$title" --arg b "$body" '{title:$t, body:$b, labels:["dr:backup"]}')")"; then
+    fail "GitHub issue CREATE failed (HTTP error) — the '${title}' finding is UNFILED; the dedup object is kept so the next run re-files it"
+    printf ''
+    return 0
+  fi
+  n="$(printf '%s' "$resp" | jq -r '.number // empty' 2>/dev/null || true)"
+  if [ -z "$n" ]; then
+    fail "GitHub issue CREATE answered 2xx without an issue number — treating the finding as UNFILED"
+  fi
+  printf '%s' "$n"
+}
 file_alert() { # kind title body dedup_id
-  local kind="$1" title="$2" body="$3" id="$4" num="" tmp="" issue_num="" key="" filed=0
+  local kind="$1" title="$2" body="$3" id="$4" num="" tmp="" issue_num="" key="" filed=0 rc=0
   LOUD=1
   tmp="$(mktemp)"
   key="$(alert_key "$kind" "$id")"
@@ -309,18 +644,40 @@ file_alert() { # kind title body dedup_id
     alias_num="$(printf '%s' "$(r2_get "$_k")" | jq -r '.issue_number // empty' 2>/dev/null || true)"
     if [ -n "$alias_num" ] && [ -z "${alias_num//[0-9]/}" ] && gh_issue_open "$alias_num"; then
       log "dedup: ${kind} already tracked by open issue #${alias_num} (alias ${_k}) — no-op"
+      gh_record_occurrence "$alias_num" "$kind" "$id"
       rm -f "$tmp"
       return 0
     fi
   done < <(alert_keys_all "$kind" "$id")
   printf '{"kind":"%s","issue_number":null,"filed_at":"%s"}' "$kind" "$(date -u +%FT%TZ)" > "$tmp"
+  # #3032: three outcomes, not two — 0 created, 1 already exists (the 412
+  # race), 2 dedup UNRESOLVED (unsupported conditional write + no provable
+  # object). Only 0/1 may proceed; 2 must never reach the search-only path.
   if r2_put_once "$key" "$tmp"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" = "2" ]; then
+    fail "dedup unresolved for ${kind}/${id:-_} — refusing to continue on search-only dedup"
+    LOUD=1
+    rm -f "$tmp"
+    return 0
+  fi
+  if [ "$rc" = "0" ]; then
     num="$(gh_find_open "$kind" "$id")"
-    if [ -z "$num" ]; then
-      num="$(curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${REPO}/issues" \
-        -d "$(jq -nc --arg t "$title" --arg b "$body" '{title:$t, body:$b, labels:["dr:backup"]}')" \
-        | jq -r '.number // empty' 2>/dev/null || true)"
+    if [ "$num" = "$GH_SEARCH_FAILED_SENTINEL" ]; then
+      # #3029 fail-closed (#2706 direction): the create succeeded but the search
+      # could not run, so whether an issue for this incident already exists is
+      # UNKNOWN. A failed search must never read as "no incident" — filing now
+      # could duplicate the open issue. The placeholder object stays with
+      # issue_number:null, so the next run's 412 branch retries. LOUD, never
+      # silent. The create-once object above is already written.
+      num=""
+      fail "dedup: the issue search FAILED for ${kind}/${id:-_} — refusing to file a possible duplicate; filing DEFERRED (a failed search is not 'no incident'); the dedup object remains for the next run"
+      LOUD=1
+    elif [ -z "$num" ]; then
+      num="$(gh_create_issue "$title" "$body")"
       [ -n "$num" ] && filed=1
     fi
     if [ -n "$num" ]; then
@@ -357,15 +714,19 @@ file_alert() { # kind title body dedup_id
     issue_num="$(printf '%s' "$(r2_get "$key")" | jq -r '.issue_number // empty' 2>/dev/null || true)"
     if [ -n "$issue_num" ] && [ -z "${issue_num//[0-9]/}" ] && gh_issue_open "$issue_num"; then
       log "dedup: ${kind}/${id:-_} already tracked by open issue #${issue_num} — no-op"
+      gh_record_occurrence "$issue_num" "$kind" "$id"
       rm -f "$tmp"
       return 0
     fi
     num="$(gh_find_open "$kind" "$id")"
-    if [ -z "$num" ]; then
-      num="$(curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${REPO}/issues" \
-        -d "$(jq -nc --arg t "$title" --arg b "$body" '{title:$t, body:$b, labels:["dr:backup"]}')" \
-        | jq -r '.number // empty' 2>/dev/null || true)"
+    if [ "$num" = "$GH_SEARCH_FAILED_SENTINEL" ]; then
+      # Same refusal as the create-once branch above: a failed search must never
+      # become a duplicate issue; the dedup object is kept for the next run.
+      num=""
+      fail "dedup: the issue search FAILED for ${kind}/${id:-_} — refusing to file a possible duplicate; filing DEFERRED (412 branch); the dedup object is kept for the next run"
+      LOUD=1
+    elif [ -z "$num" ]; then
+      num="$(gh_create_issue "$title" "$body")"
       [ -n "$num" ] && filed=1
     fi
     if [ -n "$num" ]; then
@@ -634,6 +995,13 @@ LAST_SWEEP_AT="$(printf '%s' "$STATUS" | jq -r '.last_sweep.last_sweep_at // emp
 # per-graph exception text) and is published in an incident body — redact it.
 LAST_SWEEP_SAFE="$(redact "$(printf '%s' "$STATUS" | jq -c '.last_sweep' 2>/dev/null || echo null)")"
 log "status: enabled=$ENABLED storage_error=${STORAGE_ERR_SAFE:-none} config_error=${CONFIG_ERR_SAFE:-none}"
+# #5028: `per_team` (the whole org census) is serialized BEFORE `last_sweep`, so
+# a 600-char truncation of the raw blob ALWAYS cuts the sweep OUTCOME off the
+# end — the one field a diagnosis needs. Log the outcome untruncated on its own
+# line so it can never be hidden behind the roster.
+ORG_COUNT="$(printf '%s' "$STATUS" | jq -r 'if (.per_team|type)=="object" then (.per_team|length|tostring) else "unknown" end' 2>/dev/null || echo unknown)"
+[ -n "$ORG_COUNT" ] || ORG_COUNT=unknown
+log "sweep outcome: last_sweep=$LAST_SWEEP_SAFE orgs=$ORG_COUNT"
 log "raw status: $(redact_truncate "$STATUS" 600)"
 
 if [ "$ENABLED" = "unknown" ]; then
@@ -738,9 +1106,13 @@ fi
 # has no server-side ceiling). Name the shape instead of letting it masquerade.
 RUN=""
 CURL_RC=0
+# #5028: time the call. "driver_timeout" alone hid a 600s-vs-260s inversion —
+# the elapsed seconds make budget exhaustion self-evident.
+SWEEP_START="$(date +%s)"
 RUN="$(curl -sS -m 600 -X POST -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" -d '{}' \
   "${API}/v1/internal/backups/sweep" 2>/dev/null)" || CURL_RC=$?
+SWEEP_ELAPSED=$(( $(date +%s) - SWEEP_START ))
 if [ "$CURL_RC" -eq 28 ]; then
   RUN='{"status":"driver_timeout"}'
 elif [ -z "$RUN" ]; then
@@ -754,7 +1126,7 @@ RUN_STATUS_SAFE="$(redact "$RUN_STATUS")"
 # reads as 0. `graph_totals.backed_up` is the real coverage signal.
 GRAPHS_BACKED_UP="$(printf '%s' "$RUN" | jq -r '.graph_totals.backed_up // 0' 2>/dev/null || echo 0)"
 [ -n "$GRAPHS_BACKED_UP" ] || GRAPHS_BACKED_UP=0
-log "sweep status: $RUN_STATUS_SAFE"
+log "sweep status: $RUN_STATUS_SAFE (took ${SWEEP_ELAPSED}s, curl rc=${CURL_RC})"
 
 # ── 4b. enabled-but-backing-up-nothing (#2823 shape, #2796) ─────────────────
 # A sweep that backed up ZERO teams while the R2 pool already holds team
@@ -835,9 +1207,9 @@ case "$RUN_STATUS" in
     # sweep may still hold the per-org locks. SWEEP_NO_COVERAGE stays the right
     # KIND: this run produced no coverage, and any run that does back up
     # auto-resolves it. The TEXT is what had to become true.
-    log "sweep ${RUN_STATUS} (curl rc=${CURL_RC}) — filing SWEEP_NO_COVERAGE with a timeout claim (job red)"
+    log "sweep ${RUN_STATUS_SAFE} (curl rc=${CURL_RC}, took ${SWEEP_ELAPSED}s) — filing SWEEP_NO_COVERAGE with a timeout claim (job red)"
     file_alert SWEEP_NO_COVERAGE "[DR] SWEEP_NO_COVERAGE — sweep did not finish within the driver's budget" \
-      "the driver gave up on POST /v1/internal/backups/sweep after 600s (curl exit ${CURL_RC}, status=${RUN_STATUS_SAFE}). The sweep may still be RUNNING server-side — this leg cannot tell — so this is not evidence that the sweep failed, only that it did not report in time. Last known last_sweep=${LAST_SWEEP_SAFE}." ""
+      "the driver gave up on POST /v1/internal/backups/sweep after ${SWEEP_ELAPSED}s (curl exit ${CURL_RC}, status=${RUN_STATUS_SAFE}). The sweep may still be RUNNING server-side — this leg cannot tell — so this is not evidence that the sweep failed, only that it did not report in time. Last known last_sweep=${LAST_SWEEP_SAFE}." ""
     NO_COVERAGE=1
     ;;
   *)
@@ -852,16 +1224,19 @@ case "$RUN_STATUS" in
 esac
 
 # ── 4. trash purge ride-along (#2304, wired #2317) + reconcile ride-along (#654) ──
-# Both are skipped when the sweep reported already_running (the lock-holder is
-# running; purge/reconcile would only queue behind it). Non-2xx is a hard failure for
+# Both are skipped when the sweep's own locks may still be unresolved:
+# already_running (the lock-holder is running; purge/reconcile would only queue
+# behind it) or driver_timeout/empty_response (the pass may still hold the
+# per-org locks server-side — see the #4939 note at the guard). Non-2xx is a hard failure for
 # reconcile (the cron driver MUST NOT blind the pipeline — a silently skipped
 # reconcile step is the same class of silent-no-op that left this endpoint
 # uninvoked before #654). The purge erases EXPIRED trash tombstones (> 7-day
 # grace) so the runbook's "erased within a day of expiry" claim stays true;
 # a purge body of status "errors" (per-tombstone failures) is loud too — the
-# per-team lock/retry anchors keep it safe to re-run next hour. We track both
-# failures and exit AFTER heartbeat + self-heal so the driver still files
-# health signals.
+# per-team lock/retry anchors keep it safe to re-run next hour. #4612: both legs
+# now file a dedup'd incident (PURGE_FAILED / RECONCILE_FAILED) at detection and
+# resolve it on their OWN success evidence; we still track the run-scoped flags
+# and exit AFTER heartbeat + self-heal so the driver still files health signals.
 PURGE_FAILED=0
 RECONCILE_FAILED=0
 # #4939: a timed-out sweep may still hold the per-org locks server-side, so the
@@ -869,33 +1244,116 @@ RECONCILE_FAILED=0
 if [ "$RUN_STATUS" != "already_running" ] \
    && [ "$RUN_STATUS" != "driver_timeout" ] \
    && [ "$RUN_STATUS" != "empty_response" ]; then
-  PURGE_RESP="$(mktemp)"
-  PURGE_CODE="$(curl -sS -o "$PURGE_RESP" -w '%{http_code}' -m 300 -X POST \
+  # #4612: each leg's OWN outcome is now filed as an incident, so a persistent
+  # ride-along failure is no longer log-only. The shape comes from
+  # ride_along_request (one place), because once these failures FILE a body
+  # claiming `HTTP 000000` would publish a lie. Filing happens HERE (at
+  # detection), not at the terminal exit arm: those arms are sequential, so
+  # purge's `exit 1` would otherwise pre-empt a reconcile failure in the same
+  # run. `file_alert` only sets LOUD — heartbeat + self-heal still run below.
+  ride_along_request 300 -X POST \
     -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{}' \
-    "${API}/v1/internal/backups/purge" 2>/dev/null || echo '000')"
-  PURGE_BODY="$(cat "$PURGE_RESP" 2>/dev/null || true)"
-  rm -f "$PURGE_RESP"
-  PURGE_ST="$(printf '%s' "$PURGE_BODY" | jq -r '.status // "error"' 2>/dev/null || echo error)"
-  PURGE_ST_SAFE="$(redact "$PURGE_ST")"
-  if [ "$PURGE_CODE" = "200" ] && { [ "$PURGE_ST" = "ok" ] || [ "$PURGE_ST" = "already_running" ]; }; then
-    log "purge ride-along OK (status=$PURGE_ST_SAFE teams_purged=$(redact "$(printf '%s' "$PURGE_BODY" | jq -r '.teams_purged // 0')"))"
+    "${API}/v1/internal/backups/purge"
+  PURGE_CODE="$RIDE_CODE"
+  PURGE_RC="$RIDE_RC"
+  PURGE_ELAPSED="$RIDE_ELAPSED"
+  PURGE_SHAPE="$RIDE_SHAPE"
+  PURGE_BODY="$RIDE_BODY"
+  # A body we did not receive cannot carry a `.status`: name the SHAPE instead
+  # of letting jq's empty-input behaviour read as a blank status.
+  if [ "$PURGE_SHAPE" = "http" ]; then
+    PURGE_ST="$(printf '%s' "$PURGE_BODY" | jq -r '.status // "error"' 2>/dev/null || echo error)"
   else
-    # Security review: the purge body is app-controlled and can carry a raw
-    # exception string — redact it like the sweep body (it goes to a public log).
-    log "purge ride-along FAILED (HTTP $PURGE_CODE status=$PURGE_ST_SAFE): $(redact_truncate "$PURGE_BODY" 300)"
+    PURGE_ST="$PURGE_SHAPE"
+  fi
+  [ -n "$PURGE_ST" ] || PURGE_ST="error"
+  PURGE_ST_SAFE="$(redact "$PURGE_ST")"
+  # Security review: the purge body is app-controlled and can carry a raw
+  # exception string — redact it before it reaches the public log OR the public
+  # issue body.
+  PURGE_BODY_SAFE="$(redact_truncate "$PURGE_BODY" 300)"
+  if [ "$PURGE_CODE" = "200" ] && { [ "$PURGE_ST" = "ok" ] || [ "$PURGE_ST" = "already_running" ]; }; then
+    log "purge ride-along OK (status=$PURGE_ST_SAFE teams_purged=$(redact "$(printf '%s' "$PURGE_BODY" | jq -r '.teams_purged // 0' 2>/dev/null || echo 0)") took ${PURGE_ELAPSED}s)"
+    # #3127/#4612: resolve ONLY on the strongest evidence — a purge that
+    # ACTUALLY ran (status=ok). `already_running` means this leg queued behind a
+    # held lock and proves NOTHING about erasure, so it neither files nor
+    # resolves — and the reason is logged, so an incident left open by a stuck
+    # lock is auditable rather than silent.
+    if [ "$PURGE_ST" = "ok" ]; then
+      # The count is redact()ed here because the response body is app-controlled.
+      resolve_global PURGE_FAILED "Resolved — the purge leg answered 200 status=ok (teams_purged=$(redact "$(printf '%s' "$PURGE_BODY" | jq -r '.teams_purged // 0' 2>/dev/null || echo 0)"))."
+    else
+      log "purge ride-along queued (status=already_running) — a held lock is not erasure evidence; leaving PURGE_FAILED unchanged"
+    fi
+  else
+    log "purge ride-along FAILED (HTTP $PURGE_CODE curl_rc=$PURGE_RC shape=$PURGE_SHAPE status=$PURGE_ST_SAFE took ${PURGE_ELAPSED}s): $PURGE_BODY_SAFE"
+    PURGE_ALERT_BODY="the hourly trash purge did not complete: HTTP ${PURGE_CODE}, curl exit ${PURGE_RC}, shape=${PURGE_SHAPE}, status=${PURGE_ST_SAFE}, after ${PURGE_ELAPSED}s on POST /v1/internal/backups/purge. Response: ${PURGE_BODY_SAFE}"
+    case "$PURGE_SHAPE" in
+      driver_timeout)
+        PURGE_ALERT_BODY="$PURGE_ALERT_BODY The driver's own -m 300 ceiling was hit, so the purge may still be RUNNING server-side: this is not evidence it failed, only that it did not report in time, and expired trash is UNVERIFIED as erased for this run." ;;
+      empty_response)
+        # The exchange COMPLETED (rc 0) and a status code came back; only the body
+        # is missing — so this is not "never reached a response".
+        PURGE_ALERT_BODY="$PURGE_ALERT_BODY The endpoint answered HTTP ${PURGE_CODE} without a response body, so expired trash is UNVERIFIED as erased for this run." ;;
+      transport_error)
+        PURGE_ALERT_BODY="$PURGE_ALERT_BODY The request never reached a response (curl exit ${PURGE_RC}), so expired trash is UNVERIFIED as erased for this run." ;;
+    esac
+    if [ "$PURGE_ST" = "errors" ]; then
+      PURGE_ALERT_BODY="$PURGE_ALERT_BODY The endpoint ran and reported per-org/per-graph failures, so expired rows for those orgs remain unerased — the per-org lock and the surviving tombstone row are the retry anchor, and the next hourly run retries them."
+    fi
+    # #4412/#4612: a 504 is answered WITH a body, so shape=http and the shape
+    # `case` above cannot name it — and it is the shape the reporter observed.
+    # A gateway timeout is an over-budget answer from a control plane that IS
+    # answering (the reconcile leg's 2xx in the same run proves it), never a
+    # general outage: the work may still complete server-side, so erasure is
+    # UNVERIFIED, not disproven. The app's OWN wait-bound refusal (#4412) has
+    # this shape; #4939 has since exempted `/v1/internal/` from that bound, so a
+    # 504 here now most likely comes from the edge proxy — either way the
+    # driver's reading is the same.
+    if [ "$PURGE_CODE" = "504" ]; then
+      PURGE_ALERT_BODY="$PURGE_ALERT_BODY HTTP 504 is a gateway timeout — an over-budget answer, not a general control-plane outage (the server's own wait-bound refusal has this shape, #4412); the purge may still be RUNNING server-side and erasure is UNVERIFIED for this run."
+    fi
+    file_alert PURGE_FAILED "[DR] PURGE_FAILED — the hourly trash purge did not complete" "$PURGE_ALERT_BODY" ""
     PURGE_FAILED=1
   fi
-  RECONCILE_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -m 120 -X POST \
-    -H "Authorization: Bearer $KEY" \
-    "${API}/v1/internal/reconcile" 2>/dev/null || echo '000')"
-  if [ "$RECONCILE_CODE" -ge 200 ] 2>/dev/null && [ "$RECONCILE_CODE" -lt 300 ]; then
-    log "reconcile ride-along OK ($RECONCILE_CODE)"
+  ride_along_request 120 -X POST -H "Authorization: Bearer $KEY" \
+    "${API}/v1/internal/reconcile"
+  RECONCILE_CODE="$RIDE_CODE"
+  RECONCILE_RC="$RIDE_RC"
+  RECONCILE_ELAPSED="$RIDE_ELAPSED"
+  RECONCILE_SHAPE="$RIDE_SHAPE"
+  RECONCILE_BODY="$RIDE_BODY"
+  # This route's only success signal is the 2xx — its body carries counters, no
+  # `status` — so there is nothing stronger to resolve on. #4612 review: resolve
+  # ONLY on a COMPLETED exchange. A `-m` timeout can still have received the 2xx
+  # headers before stalling (curl writes its own `%{http_code}` and exits 28), so a
+  # bare code test would read a transport failure as success and close a real
+  # incident. rc 0 + a body (shape=http) + 2xx is the strongest evidence available.
+  if [ "$RECONCILE_RC" = "0" ] && [ "$RECONCILE_SHAPE" = "http" ] \
+     && [ "$RECONCILE_CODE" -ge 200 ] 2>/dev/null && [ "$RECONCILE_CODE" -lt 300 ]; then
+    log "reconcile ride-along OK ($RECONCILE_CODE took ${RECONCILE_ELAPSED}s)"
+    resolve_global RECONCILE_FAILED "Resolved — the reconcile leg answered 2xx ($RECONCILE_CODE)."
   else
-    log "reconcile ride-along FAILED (HTTP $RECONCILE_CODE)"
+    RECONCILE_BODY_SAFE="$(redact_truncate "$RECONCILE_BODY" 300)"
+    log "reconcile ride-along FAILED (HTTP $RECONCILE_CODE curl_rc=$RECONCILE_RC shape=$RECONCILE_SHAPE took ${RECONCILE_ELAPSED}s): $RECONCILE_BODY_SAFE"
+    RECONCILE_ALERT_BODY="the hourly reconcile did not complete: HTTP ${RECONCILE_CODE}, curl exit ${RECONCILE_RC}, shape=${RECONCILE_SHAPE}, after ${RECONCILE_ELAPSED}s on POST /v1/internal/reconcile. Response: ${RECONCILE_BODY_SAFE}"
+    if [ "$RECONCILE_SHAPE" = "driver_timeout" ]; then
+      RECONCILE_ALERT_BODY="$RECONCILE_ALERT_BODY The driver's own -m 120 ceiling was hit; the reconcile may still be running server-side."
+    fi
+    if [ "$RECONCILE_CODE" = "504" ]; then
+      RECONCILE_ALERT_BODY="$RECONCILE_ALERT_BODY HTTP 504 is a gateway timeout — an over-budget answer, not a general control-plane outage; the reconcile may still be running server-side."
+    fi
+    file_alert RECONCILE_FAILED "[DR] RECONCILE_FAILED — the hourly reconcile did not complete" "$RECONCILE_ALERT_BODY" ""
     RECONCILE_FAILED=1
   fi
 else
-  log "sweep reported already_running (lock held) — skipping purge/reconcile to avoid racing a restore"
+  # #5028: name the ACTUAL status. This branch covers three distinct causes;
+  # asserting a held lock for all of them sent an investigation after a stale
+  # lock that did not exist (0 of 14 sampled runs reported already_running, and
+  # /status.lock was null). A non-lock skip is not a lock.
+  # #4612: a skip gathers NO leg evidence, so it neither files nor resolves —
+  # say so, so an incident left open across skipped runs is auditable.
+  log "sweep skipped (status=$RUN_STATUS_SAFE) — skipping purge/reconcile ride-along; leaving PURGE_FAILED/RECONCILE_FAILED unchanged (no leg evidence was gathered)"
 fi
 
 # ── 5. driver heartbeat (carries r2_ok so the R2_DOWN signal is auditable) ──
@@ -953,12 +1411,12 @@ if [ "$RUN_STATUS" = "backed_up" ] || [ "$RUN_STATUS" = "degraded" ]; then
 fi
 
 if [ "$PURGE_FAILED" = "1" ]; then
-  fail "purge ride-along failed — investigate (expired trash not erased)"
+  fail "purge ride-along failed — erasure UNVERIFIED this run (see the PURGE_FAILED incident)"
   exit 1
 fi
 
 if [ "$RECONCILE_FAILED" = "1" ]; then
-  fail "reconcile ride-along failed — investigate"
+  fail "reconcile ride-along failed — see the RECONCILE_FAILED incident"
   exit 1
 fi
 

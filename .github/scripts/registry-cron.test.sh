@@ -77,6 +77,15 @@
 #      not enter flat classification and blank a measured default archive
 #  62. an unparseable top-level listing is UNKNOWN, never an empty pool
 #  63. the top-level listing stderr is captured (not /dev/null'd)
+#  64. #3029: a FAILED search is not "no incident" — defer, never duplicate
+#  65. #3029: an ERROR BODY (403 rate-limit) is not an empty result
+#  66. #3029: an issue that merely MENTIONS the kind is never adopted
+#  67. #3029: the kind must follow `[DR] ` immediately (boundary)
+#  68. #3029: the subject must be the EXACT ` — ` segment
+#  69. #3032: unsupported IfNoneMatch + ambiguous HEAD → LOUD, never a blind put
+#  69b. #3032: a bare `412` in an unrelated error is NOT "already exists"
+#  70. #3032: unsupported IfNoneMatch + EXISTING object → adopt, no duplicate
+#  71. #3032: an UNRESOLVED dedup write fails LOUD, never search-only
 #  64. a subject-less incident is written ONCE, under the CANONICAL `_.json`
 #      (the AlertStore's spelling) — never the legacy `global.json` (#2844)
 #  65. a legacy sentinel holding a CLOSED issue still lets the incident re-file
@@ -88,6 +97,56 @@
 #      subject literally named `global`/`_` keeps its own single key and is
 #      never an alias set — the round-7 P2 that otherwise gave one real team
 #      two create-once points across bash and AlertStore (#2844)
+#  68. a dedup no-op RECORDS the recurrence on the tracked issue (#3907) — a
+#      repeat is never a silent no-op, and never a second issue
+#  69. the recurrence counter is read from the ISSUE's own marked comments, so
+#      it advances (#3 after two) and cannot be reset by the shared R2 object
+#  70. the safety properties survive: a FIRST-TIME fault still files (and
+#      records no recurrence), and a RECOVERED fault still self-heals (closes
+#      the incident and deletes its dedup object)
+#  71. a FAILED recurrence comment is never fatal and never duplicates: the run
+#      stays RED, no second issue is filed, and the driver says the record did
+#      not happen (so it cannot claim a comment it did not post). The failure is
+#      modelled as the shape that ACTUALLY occurs — HTTP 403 with curl exit 0
+#      (secondary rate limit / missing issues:write) — not a transport failure;
+#      a stub that exits 1 makes the "no false record" assertion vacuous for
+#      every error a real GitHub returns.
+#  72. an OUTSIDER marker comment cannot inflate the recurrence counter (P2:
+#      the marker is public; only the Actions bot's marked comments count)
+#  77. #5028: the ride-along skip names the ACTUAL status — already_running is
+#      the lock case; a non-lock skip (driver_timeout/empty_response) must
+#      never assert a held lock
+#  78. #5028: a sweep --max-time timeout (curl rc 28) names driver_timeout and
+#      reports the elapsed seconds in the log line AND the filed incident body;
+#      the ride-along stays skipped
+#  79. #5028: an empty sweep body names empty_response (not a held lock)
+#  80. #5028: the sweep OUTCOME is logged untruncated even when `per_team`
+#      (the org census) precedes it in the payload
+#  81. #5028: the outcome's org census is `unknown` (never blank) when /status
+#      carries no object `per_team`; an object still reports the real count
+#  82. #4612: a purge `-m` timeout (curl rc 28) is named truthfully — `HTTP 000`
+#      + `curl_rc=28` + `shape=driver_timeout`, and the pre-fix concatenated
+#      `000000` appears in neither the log nor the filed body
+#  83. #4612: the same for a reconcile timeout
+#  84. #4612: BOTH legs failing in one run files BOTH incidents (the reason
+#      filing is inline at detection, not at the first terminal exit arm)
+#  85. #4612: a completed purge (`status:ok`) resolves an open PURGE_FAILED and
+#      delete-to-resolves its dedup object
+#  86. #4612: `already_running` is NOT erasure evidence — it neither files nor
+#      resolves, and says so
+#  87. #4612: a 2xx reconcile resolves an open RECONCILE_FAILED
+#  88. #4612: a SKIPPED ride-along gathers no evidence — it files and resolves
+#      nothing, and the log states that
+#  89. #4612: the ride-along curl-outcome vocabulary is declared ONCE
+#      (leg_shape), so the two ride-along legs cannot drift into private tokens
+#  90. #4612: the OBSERVED failure shape — a wait-bound 504 answered WITH a body
+#      (shape=http) — is named as an over-budget refusal from a control plane
+#      that IS answering, never a general outage; both ride-along legs
+#  91. #4612 review P1: a 2xx received before a `-m` transport timeout (rc 28) is
+#      NOT success — the reconcile resolve requires the exchange to complete
+#      (rc 0 + shape=http + 2xx), and the purge gate likewise
+#  92. #4612 review P2: empty_response (rc 0, no body) and transport_error (non-zero
+#      rc) are DIFFERENT facts and the filed body says so
 #
 # Fixtures are simulated; the real driver defers nothing.
 
@@ -111,6 +170,13 @@ assert_not_contains() { # <haystack> <needle> <label>
 }
 assert_match() { # <haystack> <regex> <label>
   if printf '%s' "$1" | grep -qE -- "$2"; then ok "$3"; else bad "$3 (no match: $2)"; fi
+}
+# Grep a FILE rather than a string: `printf '%s' "$huge" | grep -q` is racy under
+# `set -o pipefail` — grep -q exits at the first match, printf takes SIGPIPE, and
+# the pipeline's status becomes the failed printf even though grep MATCHED. A
+# whole-source scan must therefore never pipe the source through printf.
+assert_file_match() { # <file> <regex> <label>
+  if grep -qE -- "$2" "$1"; then ok "$3"; else bad "$3 (no match: $2)"; fi
 }
 assert_not_match() { # <haystack> <regex> <label>
   if printf '%s' "$1" | grep -qE -- "$2"; then bad "$3 (unexpected match: $2)"; else ok "$3"; fi
@@ -207,12 +273,36 @@ case "$op" in
       *)            printf '' ;;
     esac
     ;;
-  put-object)   [ "${STUB_412:-0}" = "1" ] && exit 1 || exit 0 ;;
+  put-object)
+    # #3032 knobs: a client that rejects the conditional flag, a store that
+    # fails the write outright, and an unrelated error that merely contains the
+    # digits 412. All three are distinguished from the real 412 race.
+    if [ "${STUB_NO_IFNONEMATCH:-0}" = "1" ] && printf '%s' "${args[*]}" | grep -q -- '--if-none-match'; then
+      echo "Unknown options: --if-none-match" >&2
+      exit 2
+    fi
+    if [ "${STUB_PUT_412_SUBSTRING:-0}" = "1" ] && printf '%s' "${args[*]}" | grep -q -- '--if-none-match'; then
+      echo "An error occurred (InternalError) when calling the PutObject operation: RequestId 4120xyz" >&2
+      exit 1
+    fi
+    if [ "${STUB_PUT_FAIL:-0}" = "1" ]; then
+      echo "An error occurred (InternalError) when calling the PutObject operation" >&2
+      exit 1
+    fi
+    [ "${STUB_412:-0}" = "1" ] && exit 1 || exit 0 ;;
+  head-object)  [ "${STUB_HEAD_EXISTS:-${STUB_412:-0}}" = "1" ] && exit 0 || exit 1 ;;
   get-object)
     # STUB_INDEX_FAIL emulates a NON-404 failure reading the legacy-flat index
     # (a transient S3 error) so the driver must treat the pool as unmeasured.
     if [ "${STUB_INDEX_FAIL:-0}" = "1" ] && case "$(argval --key)" in *legacy-flat-index*) true ;; *) false ;; esac; then
       echo "An error occurred (InternalError) when calling the GetObject operation" >&2
+      exit 1
+    fi
+    # STUB_GET_ONLY_CANONICAL: answer STUB_GET_BODY for the CANONICAL `_.json`
+    # object only. A test that must exercise the create-once write
+    # (`r2_put_once`) uses this so `file_alert`'s #2844 legacy-alias pre-read
+    # (which consults `global.json`) does not adopt the object first.
+    if [ "${STUB_GET_ONLY_CANONICAL:-0}" = "1" ] && ! printf '%s' "${args[*]}" | grep -q '/_\.json'; then
       exit 1
     fi
     printf '%s' "${STUB_GET_BODY:-}" ;;
@@ -238,7 +328,7 @@ DATE_EOF
 # ── stub: curl ──────────────────────────────────────────────────────────────
 cat > "$BIN/curl" <<'CURL_EOF'
 #!/usr/bin/env bash
-out_file=""; write_fmt=""; url=""; data=""; method="GET"
+out_file=""; write_fmt=""; url=""; data=""; method="GET"; fail=0
 args=("$@"); i=0
 while [ $i -lt ${#args[@]} ]; do
   a="${args[$i]}"
@@ -248,7 +338,8 @@ while [ $i -lt ${#args[@]} ]; do
     -X) method="${args[$((i+1))]:-GET}"; i=$((i+2)) ;;
     -d) data="${args[$((i+1))]:-}"; i=$((i+2)) ;;
     -H|-m|--data-urlencode|--data|--header|--max-time|-u) i=$((i+2)) ;;
-    -s|-sS|-S|-L|-k|-f|--fail) i=$((i+1)) ;;
+    -f|--fail) fail=1; i=$((i+1)) ;;
+    -s|-sS|-S|-L|-k) i=$((i+1)) ;;
     *) url="$a"; i=$((i+1)) ;;
   esac
 done
@@ -273,25 +364,80 @@ case "$url" in
     gh_log
     case "$url" in
       */search/issues*)
-        items="[]"
-        for kind in SWEEP_CONFIG_ERROR SWEEP_OFF_STALE SWEEP_NO_COVERAGE WATCHER_DOWN APP_DOWN R2_DOWN STALE; do
-          var="GH_ISSUE_$kind"
-          val="${!var:-}"
-          if [ -n "$val" ] && printf '%s' "$url" | grep -q "$kind"; then
-            items="[{\"number\":$val,\"title\":\"[DR] $kind\"}]"
-            break
+        # #3029/#3032 knobs: a transport failure, an error body (403 rate-limit),
+        # a hand-written result set, or an unrelated issue whose title merely
+        # mentions the kind (the #2844 adoption shape). `emit` carries the HTTP
+        # status: the merged `gh_find_open` reads it through gh_search_items, so
+        # a stub that printed a body raw would be read as a code-less failure.
+        if [ "${STUB_GH_SEARCH_FAIL:-0}" = "1" ]; then
+          exit 1
+        elif [ -n "${STUB_GH_SEARCH_BODY:-}" ]; then
+          emit "$STUB_GH_SEARCH_BODY" "${STUB_SEARCH_CODE:-200}"
+        else
+          items="[]"
+          for kind in SWEEP_CONFIG_ERROR SWEEP_OFF_STALE SWEEP_NO_COVERAGE WATCHER_DOWN APP_DOWN R2_DOWN STALE PURGE_FAILED RECONCILE_FAILED; do
+            var="GH_ISSUE_$kind"
+            val="${!var:-}"
+            if [ -n "$val" ] && printf '%s' "$url" | grep -q "$kind"; then
+              items="[{\"number\":$val,\"title\":\"${GH_ISSUE_TITLE:-[DR] $kind}\"}]"
+              break
+            fi
+          done
+          # GH_SEARCH_FILLER=1: page 1 is a FULL page of 100 machine-authored
+          # look-alikes, so the exact match can only be found on page 2 — a
+          # single-page read files a duplicate. NB the match must be `&page=1`:
+          # `page=1` is also a substring of `per_page=100`.
+          if [ "${GH_SEARCH_FILLER:-0}" = "1" ]; then
+            case "$url" in
+              *'&page=1')
+                filler="$(python3 -c 'import json;print(",".join(json.dumps({"number":1000+i,"title":"[DR] OTHER — filler %d" % i}) for i in range(100)))')"
+                emit "{\"items\":[$filler]}" "${STUB_SEARCH_CODE:-200}"
+                exit 0 ;;
+            esac
           fi
-        done
-        printf '{"items":%s}' "$items" ;;
-      */issues/*/comments*) printf '{}' ;;
+          emit "{\"items\":$items}" "${STUB_SEARCH_CODE:-200}"
+        fi ;;
+      */issues/*/comments*)
+        # #3907: occurrence counting GETs the issue's comments; the comment
+        # POST is the recording write. Distinguish by method so the counting
+        # walk is actually exercised (a stub that answered the POST shape here
+        # would make the counter read 0 forever).
+        if [ "$method" = "GET" ]; then
+          # emit honours -o/-w: the counter reads the body through the
+          # status-checked primitive, so a stub that printed the body raw would
+          # hand the JSON to the code parser and silently count 0.
+          emit "${STUB_COMMENTS_JSON:-[]}" "${STUB_COMMENTS_CODE:-200}"
+        else
+          # REAL curl exits 0 on an HTTP 4xx/5xx; only `--fail` turns that into
+          # exit 22. This stub therefore models the HTTP STATUS (default 201),
+          # NOT the exit code: a stub that `exit 1`s here is a TRANSPORT failure
+          # and makes case 71's assertion vacuous for the shape that actually
+          # occurs (a 403 from the comments endpoint, exit 0).
+          #   STUB_COMMENT_CODE=403  → HTTP 403, exit 0 (the real failure shape)
+          #   STUB_COMMENT_FAIL=1    → transport failure, exit 1 (curl itself died)
+          [ "${STUB_COMMENT_FAIL:-0}" = "1" ] && exit 1
+          emit '{}' "${STUB_COMMENT_CODE:-201}"
+          case "${STUB_COMMENT_CODE:-201}" in
+            2[0-9][0-9]) ;;
+            *) [ "$fail" = "1" ] && exit 22 ;;
+          esac
+        fi ;;
       */issues/*)
         if [ "$method" = "GET" ]; then
-          # emit honours -o/-w: gh_issue_open asks for the code first, then the body.
+          # emit honours -o/-w: gh_issue_open asks for the code AND the body in
+          # ONE status-checked call.
           emit "{\"state\":\"${GH_ISSUE_STATE:-open}\"}" "${STUB_ISSUE_CODE:-200}"
         else
-          printf '{}'
+          # PATCH (close). emit honours -w so gh_close's HTTP-code check works;
+          # STUB_GH_CLOSE_CODE / STUB_CLOSE_CODE both simulate a rate-limit/5xx
+          # close failure (the two suites spell the knob differently).
+          cbody='{}'; emit "$cbody" "${STUB_GH_CLOSE_CODE:-${STUB_CLOSE_CODE:-200}}"
         fi ;;
-      */issues) printf '{"number":%s}' "${GH_NEW_ISSUE:-900}" ;;
+      */issues)
+        # A real POST returns the created issue; the HTTP status (not the exit
+        # code) is what the status-checked primitive reads. STUB_CREATE_CODE
+        # models a 403/5xx answered with exit 0.
+        emit "{\"number\":${GH_NEW_ISSUE:-900}}" "${STUB_CREATE_CODE:-201}" ;;
       *) printf '{}' ;;
     esac
     ;;
@@ -299,10 +445,23 @@ case "$url" in
     [ "${STUB_APP_DOWN:-0}" = "1" ] && exit 0
     sbody="${STUB_STATUS_BODY:-$DEFAULT_STATUS}"; emit "$sbody" ;;
   *"/v1/internal/backups/sweep"*)
+    # STUB_SWEEP_RC models curl's OWN exit for the sweep call. 28 = --max-time
+    # exceeded (a real timeout writes NO body and returns non-zero); 0 with an
+    # empty body models the empty_response shape. Without this the driver's
+    # driver_timeout / empty_response arms are unreachable and any assertion
+    # about them is vacuous (#5028).
+    if [ -n "${STUB_SWEEP_RC:-}" ]; then printf ''; exit "$STUB_SWEEP_RC"; fi
     sbody="${STUB_SWEEP_BODY:-$DEFAULT_SWEEP}"; emit "$sbody" ;;
   *"/v1/internal/backups/purge"*)
+    # #4612: STUB_PURGE_RC models curl's OWN exit for the purge call. A real
+    # `-m` timeout writes `000` to the `-w` stream (no trailing newline) AND
+    # exits 28 — without this knob the driver's ride-along timeout shape is
+    # unreachable and any assertion about it is vacuous (the #5028 precedent
+    # for STUB_SWEEP_RC).
+    if [ -n "${STUB_PURGE_RC:-}" ]; then printf '%s' "${STUB_PURGE_CODE:-000}"; exit "$STUB_PURGE_RC"; fi
     sbody="${STUB_PURGE_BODY:-$DEFAULT_PURGE}"; emit "$sbody" "${STUB_PURGE_CODE:-200}" ;;
   *"/v1/internal/reconcile"*)
+    if [ -n "${STUB_RECONCILE_RC:-}" ]; then printf '%s' "${STUB_RECONCILE_CODE:-000}"; exit "$STUB_RECONCILE_RC"; fi
     emit '{}' "${STUB_RECONCILE_CODE:-200}" ;;
   *"/v1/internal/driver/heartbeat"*) printf '{}' ;;
   *) printf '{}' ;;
@@ -332,15 +491,22 @@ unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID || true
 
 reset_case() {
   : > "$LOG"
-  unset STUB_STATUS_BODY STUB_SWEEP_BODY STUB_PURGE_BODY STUB_PURGE_CODE \
-        STUB_RECONCILE_CODE STUB_412 STUB_APP_DOWN STUB_R2_DOWN STUB_GET_BODY \
-        SIMULATE_APP_DOWN \
+  unset STUB_STATUS_BODY STUB_SWEEP_BODY STUB_SWEEP_RC STUB_PURGE_BODY STUB_PURGE_CODE \
+        STUB_PURGE_RC STUB_RECONCILE_CODE STUB_RECONCILE_RC STUB_412 STUB_APP_DOWN STUB_R2_DOWN STUB_GET_BODY \
+        SIMULATE_APP_DOWN STUB_GH_SEARCH_FAIL STUB_GH_SEARCH_BODY \
+        STUB_NO_IFNONEMATCH STUB_HEAD_EXISTS STUB_PUT_FAIL STUB_PUT_412_SUBSTRING \
+        STUB_GET_ONLY_CANONICAL \
+        STUB_GH_CLOSE_CODE \
         STUB_LIST_FAIL STUB_LIST_FAIL_TEAM STUB_FLAT_FAIL STUB_INDEX_FAIL GH_ISSUE_STATE STUB_ISSUE_CODE \
         STUB_TOP_NOT_JSON \
+        STUB_SEARCH_CODE STUB_CREATE_CODE STUB_CLOSE_CODE GH_SEARCH_FILLER \
+        GH_ISSUE_TITLE STUB_COMMENTS_CODE \
         GH_SEARCH_JSON GH_NEW_ISSUE R2_TEAMS R2_DEFAULT_LIST R2_FLAT_LIST \
         R2_DEFAULT_LIST_Z R2_DEFAULT_LIST_A \
         GH_ISSUE_SWEEP_CONFIG_ERROR GH_ISSUE_SWEEP_OFF_STALE GH_ISSUE_SWEEP_NO_COVERAGE \
-        GH_ISSUE_WATCHER_DOWN GH_ISSUE_APP_DOWN GH_ISSUE_R2_DOWN GH_ISSUE_STALE || true
+        GH_ISSUE_WATCHER_DOWN GH_ISSUE_APP_DOWN GH_ISSUE_R2_DOWN GH_ISSUE_STALE \
+        GH_ISSUE_PURGE_FAILED GH_ISSUE_RECONCILE_FAILED \
+        STUB_COMMENTS_JSON STUB_COMMENT_FAIL STUB_COMMENT_CODE || true
   export R2_FLAT_LIST="[]"
 }
 
@@ -609,7 +775,7 @@ assert_eq "$RC" 1 "23. no_work is still RED (1)"
 assert_filed "$(cat "$LOG")" SWEEP_NO_COVERAGE "23. no_work files SWEEP_NO_COVERAGE"
 assert_match "$(cat "$LOG")" "GH PATCH .*/issues/66" "23. a fresh heartbeat still clears WATCHER_DOWN"
 
-# ── 24. purge ride-along failure → RED ──────────────────────────────────────
+# ── 24. purge ride-along failure → RED **and** a dedup'd incident (#4612) ───
 reset_case
 export R2_TEAMS=$'backups/teamA/'
 export R2_DEFAULT_LIST="$TS_RECENT"
@@ -619,8 +785,10 @@ export STUB_PURGE_CODE=500
 run_driver
 assert_eq "$RC" 1 "24. purge failure exits RED (1)"
 assert_contains "$OUT" "purge ride-along failed" "24. the failure names the purge leg"
+# #4612: pre-fix this class was log-only. The incident is the durable half.
+assert_filed "$(cat "$LOG")" PURGE_FAILED "24. purge failure files PURGE_FAILED"
 
-# ── 25. reconcile ride-along failure → RED ──────────────────────────────────
+# ── 25. reconcile ride-along failure → RED **and** an incident (#4612) ─────
 reset_case
 export R2_TEAMS=$'backups/teamA/'
 export R2_DEFAULT_LIST="$TS_RECENT"
@@ -630,6 +798,7 @@ export STUB_RECONCILE_CODE=500
 run_driver
 assert_eq "$RC" 1 "25. reconcile failure exits RED (1)"
 assert_contains "$OUT" "reconcile ride-along failed" "25. the failure names the reconcile leg"
+assert_filed "$(cat "$LOG")" RECONCILE_FAILED "25. reconcile failure files RECONCILE_FAILED"
 
 # ── 26. bare/unquoted secret runs are redacted too (security review) ────────
 reset_case
@@ -686,6 +855,23 @@ run_driver
 assert_eq "$RC" 0 "29. healthy run exits 0"
 assert_match "$(cat "$LOG")" "AWS delete-object key=ops/alerts/APP_DOWN/_.json" "29. the driver dedup object is deleted on resolve"
 assert_match "$(cat "$LOG")" "AWS delete-object key=ops/alerts/APP_DOWN/global.json" "29. the legacy spelling is deleted too (#2844)"
+
+# ── 29b. a FAILED close keeps the dedup object (cycle-2 review P1) ─────────
+# The shell twin of the Python P0: deleting the object on a failed PATCH leaves
+# the object gone while the issue stays OPEN, so the next run re-creates it,
+# adopts the still-open issue and pages again — while the run reports green.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export GH_ISSUE_APP_DOWN=99
+export STUB_GH_CLOSE_CODE=500
+run_driver
+assert_eq "$RC" 1 "29b. a failed self-heal close exits RED (1), not a silent green"
+assert_match "$OUT" "closing issue #99 returned HTTP 500" "29b. the failed close is LOUD"
+assert_not_match "$(cat "$LOG")" "AWS delete-object key=ops/alerts/APP_DOWN/global.json" "29b. the driver dedup object is KEPT"
+assert_not_match "$(cat "$LOG")" "AWS delete-object key=ops/alerts/APP_DOWN/_.json" "29b. the server-side dedup object is KEPT"
 
 # ── 30. missing .watcher block neither files nor self-heals WATCHER_DOWN ────
 reset_case
@@ -833,6 +1019,11 @@ run_driver
 assert_eq "$RC" 1 "40. a purge failure is RED (1)"
 assert_not_contains "$OUT" "TESTONLYTOKENAbCdEfGhIjKlMnOpQrSt" "40. the purge body secret is NOT published"
 assert_match "$OUT" "<redacted>" "40. the purge failure body is redacted in the log"
+# #4612: the body now also reaches a durable PUBLIC issue, so the redaction must
+# hold on the create-POST too — asserting only on stdout would be vacuous for
+# the surface that persists.
+assert_filed "$(cat "$LOG")" PURGE_FAILED "40. the purge failure files PURGE_FAILED"
+assert_not_contains "$(cat "$LOG")" "TESTONLYTOKENAbCdEfGhIjKlMnOpQrSt" "40. the secret is NOT in the create POST"
 
 # ── 41. storage_error while ENABLED is loud and blocks R2_DOWN self-heal ───
 reset_case
@@ -1134,6 +1325,140 @@ run_driver
 assert_eq "$RC" 1 "63. a failed top-level listing exits RED (1)"
 assert_contains "$OUT" "AccessDenied" "63. the top-level CLI stderr is captured, not discarded"
 
+# ── 64. #3029: a FAILED search is not "no incident" — defer, never duplicate ─
+# The alerter's dedup authority is the create-once object; the search is the
+# fallback that decides whether an issue already exists. When the search does
+# not run, treating it as empty files a DUPLICATE — so filing is deferred (the
+# placeholder object keeps issue_number:null, so the next run's 412 branch
+# retries) and the run goes RED rather than silent.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_GH_SEARCH_FAIL=1
+run_driver
+assert_eq "$RC" 1 "64. a failed search exits RED (1)"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "64. a failed search never files a duplicate"
+assert_contains "$OUT" "filing DEFERRED" "64. the deferral is loud and explicit"
+assert_match "$(cat "$LOG")" "AWS put-object key=ops/alerts/SWEEP_CONFIG_ERROR" "64. the dedup object is still created (the next run retries)"
+
+# ── 65. #3029: an ERROR BODY (403 rate-limit) is not an empty result ─────────
+# GitHub answers a rate-limited search with HTTP 200-ish JSON that carries no
+# `items`, and curl exits 0 — the pre-#3029 `.items[0] // empty` read that as
+# "no open incident".
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_GH_SEARCH_BODY='{"message":"API rate limit exceeded"}'
+run_driver
+assert_eq "$RC" 1 "65. a rate-limit body exits RED (1)"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "65. a rate-limit body is not read as 'no incident'"
+assert_contains "$OUT" "filing DEFERRED" "65. the rate-limit body is treated as a search failure"
+
+# ── 66. #3029: an issue that merely MENTIONS the kind is never adopted ───────
+# The live production shape: the platform-scoped query for `[DR] R2_DOWN`
+# resolved to #2844 — a bug report ABOUT R2_DOWN (title "bug(dr): R2_DOWN is
+# deduped under two different R2 keys…"). Adoption would have closed it.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_GH_SEARCH_BODY='{"items":[{"number":2844,"title":"bug(dr): R2_DOWN is deduped under two different R2 keys by the driver and the app watcher"},{"number":2845,"title":"bug(dr): SWEEP_CONFIG_ERROR mentions this kind in prose"}]}'
+run_driver
+assert_eq "$RC" 1 "66. a prose mention does not suppress filing (still RED)"
+assert_filed "$(cat "$LOG")" "SWEEP_CONFIG_ERROR" "66. the driver files its OWN issue instead of adopting #2844"
+assert_not_match "$(cat "$LOG")" "issues/2844" "66. the unrelated issue is never touched (not closed, not commented)"
+
+# ── 67. #3029: the kind must follow `[DR] ` immediately (boundary) ───────────
+# `[DR] SWEEP_CONFIG_ERROR_EXTRA` must not be adopted for kind
+# SWEEP_CONFIG_ERROR — a bare startswith would accept it.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_GH_SEARCH_BODY='{"items":[{"number":777,"title":"[DR] SWEEP_CONFIG_ERROR_EXTRA — a different kind"},{"number":778,"title":"[DR] SWEEP_CONFIG_ERRORish"}]}'
+run_driver
+assert_filed "$(cat "$LOG")" "SWEEP_CONFIG_ERROR" "67. a kind-prefix collision is not adopted"
+assert_not_match "$(cat "$LOG")" "issues/777" "67. the colliding kind's issue is untouched"
+
+# ── 68. #3029: the subject must be the EXACT ` — ` segment ────────────────
+# A bare team subject is a literal PREFIX of its per-graph subjects, so
+# `[DR] STALE — teamA:g_x` must never satisfy a search for subject teamA —
+# adopting it would let teamA's recovery close the custom graph's live issue
+# (#2413/#2375 cross-talk).
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_STALE"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_GH_SEARCH_BODY='{"items":[{"number":555,"title":"[DR] STALE — teamA:g_x — last backup 3h"}]}'
+run_driver
+assert_filed "$(cat "$LOG")" STALE "68. a per-graph subject does not satisfy the team subject"
+assert_not_match "$(cat "$LOG")" "issues/555" "68. the per-graph issue is not adopted by the team incident"
+
+# ── 69. #3032: unsupported IfNoneMatch + ambiguous HEAD → LOUD, never a blind put
+# The Python twin RAISES in this case (`hosted_backup.create_if_not_exists`:
+# "a blind-put would weaken the dedup linearization point"); the shell twin must
+# not create an object it cannot prove absent — that could overwrite a
+# concurrent writer's object and null its issue_number.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_NO_IFNONEMATCH=1
+export STUB_HEAD_EXISTS=0
+run_driver
+assert_eq "$RC" 1 "69. an ambiguous dedup write exits RED (1)"
+assert_match "$(cat "$LOG")" "AWS head-object key=ops/alerts/SWEEP_CONFIG_ERROR" "69. the fallback HEAD-checks the object"
+assert_contains "$OUT" "refusing a blind put" "69. an unconfirmable object is never blind-put"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "69. nothing is filed on an unverified dedup"
+
+# ── 69b. #3032: a bare `412` in an unrelated error is NOT "already exists" ──
+# The pre-review glob `*412*` matched any request-id/byte-count, reporting
+# "exists" without ever HEAD-checking. Only the real AWS markers may shortcut.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_PUT_412_SUBSTRING=1
+export STUB_HEAD_EXISTS=1
+export STUB_GET_BODY='{"kind":"SWEEP_CONFIG_ERROR","issue_number":42}'
+# The alias pre-read (main's #2844 `file_alert`) would otherwise adopt the
+# object from the legacy `global.json` spelling and never reach the create-once
+# write this case is guarding.
+export STUB_GET_ONLY_CANONICAL=1
+run_driver
+assert_match "$(cat "$LOG")" "AWS head-object key=ops/alerts/SWEEP_CONFIG_ERROR" "69b. an unrelated 412 substring still HEAD-checks"
+assert_contains "$OUT" "already tracked by open issue #42" "69b. the existing object is adopted (not a false exists)"
+
+# ── 70. #3032: unsupported IfNoneMatch + EXISTING object → adopt, no duplicate
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_NO_IFNONEMATCH=1
+export STUB_HEAD_EXISTS=1
+export STUB_GET_BODY='{"kind":"SWEEP_CONFIG_ERROR","issue_number":42}'
+export GH_ISSUE_SWEEP_CONFIG_ERROR=42
+run_driver
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "70. an existing object is adopted (no duplicate filed)"
+assert_contains "$OUT" "already tracked by open issue #42" "70. the open issue is adopted from the object"
+
+# ── 71. #3032: an UNRESOLVED dedup write fails LOUD, never search-only ──────
+# Conditional write rejected AND HEAD cannot confirm the object AND the
+# unconditional put fails: dedup is unverifiable, so the run must not proceed
+# on the fail-open search.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_PUT_FAIL=1
+run_driver
+assert_eq "$RC" 1 "71. an unresolved dedup write exits RED (1)"
+assert_contains "$OUT" "Dedup is unverified" "71. the failure is loud and names the cause"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "71. nothing is filed on an unverified dedup"
+
 # ── 64. a subject-less incident is written ONCE, under the canonical spelling ─
 # #2844: the driver's pre-fix spelling was `global.json` while the server-side
 # AlertStore writes `_.json`. Two spellings = two create-once points = two issues
@@ -1171,7 +1496,7 @@ assert_match "$(cat "$LOG")" "AWS put-object key=ops/alerts/R2_DOWN/_.json" "65.
 reset_case
 RESOLVE_EXT="$(mktemp)"
 RESOLVE_LOG="$(mktemp)"
-sed -n '/^kind_owner()/,/^}/p; /^resolve_global()/,/^}/p' "$DRIVER" > "$RESOLVE_EXT"
+sed -n '/^GH_SEARCH_FAILED_SENTINEL=/p; /^kind_owner()/,/^}/p; /^resolve_global()/,/^}/p' "$DRIVER" > "$RESOLVE_EXT"
 run_resolve() { # kind — real kind_owner/resolve_global + stubbed log/gh/r2
   local kind="$1"
   : > "$RESOLVE_LOG"
@@ -1228,6 +1553,526 @@ assert_eq "$(run_keys alert_keys_all global)" "ops/alerts/STALE/global.json" \
 assert_eq "$(run_keys alert_keys_all _)" "ops/alerts/STALE/_.json" \
   "67. a REAL subject named _ is never an alias set"
 rm -f "$KEY_EXT"
+
+# ── 68. a dedup no-op RECORDS the recurrence (#3907) ───────────────────────
+# The pre-#3907 dedup branches logged "already tracked … — no-op" and returned,
+# so an hourly driver on ONE unchanged fault left NO trace on the issue: the
+# finding was filed, but the escalation was invisible. Dedupe that hides the
+# escalation converts "noisy" into "blind". The recurrence is now recorded as a
+# marked comment, and its NUMBER is read from the issue's own prior occurrence
+# comments (not from the R2 object, which the server-side AlertStore rewrites).
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_412=1
+export STUB_GET_BODY='{"kind":"SWEEP_CONFIG_ERROR","issue_number":42}'
+export GH_ISSUE_STATE=open
+export STUB_COMMENTS_JSON='[]'
+run_driver
+assert_eq "$RC" 1 "68. the repeat is still RED (1) — dedupe never silences the run"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "68. the repeat still files NO duplicate issue"
+assert_match "$(cat "$LOG")" "GH GET .*/issues/42/comments" "68. the occurrence count is read from the ISSUE"
+assert_match "$(cat "$LOG")" "GH POST .*/issues/42/comments .*Recurrence #1" "68. occurrence #1 is recorded on the issue"
+assert_match "$(cat "$LOG")" "GH POST .*/issues/42/comments .*dr-occurrence" "68. the comment carries the counting marker"
+
+# ── 69. the recurrence counter ADVANCES from the issue's own comments ───────
+# Two marked comments already on #42 → the next record is #3. This pins that
+# the number is derived from the durable, visible record, so a re-run (or the
+# AlertStore rewriting the shared R2 object) cannot reset it.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_412=1
+export STUB_GET_BODY='{"kind":"SWEEP_CONFIG_ERROR","issue_number":42}'
+export GH_ISSUE_STATE=open
+export STUB_COMMENTS_JSON='[{"body":"🔁 Recurrence #1 <!-- dr-occurrence -->","user":{"login":"github-actions[bot]","type":"Bot"}},{"body":"a human comment","user":{"login":"someone","type":"User"}},{"body":"🔁 Recurrence #2 <!-- dr-occurrence -->","user":{"login":"github-actions[bot]","type":"Bot"}}]'
+run_driver
+assert_eq "$RC" 1 "69. the repeat is still RED (1)"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "69. no duplicate issue is filed"
+assert_match "$(cat "$LOG")" "GH POST .*/issues/42/comments .*Recurrence #3" "69. the counter advances to #3 (2 prior + this one)"
+assert_eq "$(grep -c 'GH POST .*/issues/42/comments' "$LOG" || true)" "1" "69. exactly ONE occurrence comment is posted per run"
+
+# ── 70. a first-time fault still files; a recovered fault still self-heals ──
+# The safety property #3907 must NOT break: the very first incident files (and
+# is not mislabelled as a recurrence of itself), and a recovered fault still
+# closes its incident and deletes its dedup object so the next occurrence is a
+# genuinely new incident.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+run_driver
+assert_eq "$RC" 1 "70a. a first-time fault exits RED (1)"
+assert_match "$(cat "$LOG")" "GH POST .*/issues \{" "70a. a first-time fault still FILES"
+assert_not_match "$(cat "$LOG")" "GH POST .*/comments .*Recurrence" "70a. a first-time fault records no recurrence"
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false null null)"
+export GH_ISSUE_SWEEP_CONFIG_ERROR=42
+run_driver
+assert_eq "$RC" 0 "70b. a recovered config error exits 0"
+assert_match "$(cat "$LOG")" "GH PATCH .*/issues/42" "70b. a recovered fault still self-heals (the incident closes)"
+assert_match "$(cat "$LOG")" "AWS delete-object key=ops/alerts/SWEEP_CONFIG_ERROR/_.json" "70b. the dedup object is deleted on resolve"
+
+# ── 71. a FAILED recurrence comment is never fatal and never duplicates ─────
+# The recording is additive: the run is already RED (LOUD was set before any
+# dedup branch), so a failed comment must not abort the self-heal or the other
+# incidents, and must never be replaced by a duplicate issue. The driver also
+# must not claim a record it did not write.
+# The failure is an HTTP 403 answered by the comments endpoint with curl exit 0
+# — the shape a real GitHub returns under a secondary rate limit or a missing
+# `issues: write` permission. The pre-fix `gh_comment` reported that as success
+# (a bare `curl -sS` exits 0 on 4xx/5xx) and the driver logged a recorded
+# recurrence the issue never carried.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_412=1
+export STUB_GET_BODY='{"kind":"SWEEP_CONFIG_ERROR","issue_number":42}'
+export GH_ISSUE_STATE=open
+export STUB_COMMENTS_JSON='[]'
+export STUB_COMMENT_CODE=403
+run_driver
+assert_eq "$RC" 1 "71. a 403 recurrence comment still exits RED (1)"
+assert_match "$(cat "$LOG")" "GH POST .*/issues/42/comments" "71. the comment POST was actually attempted (the 403 path is live)"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "71. a failed comment never produces a duplicate issue"
+assert_match "$OUT" "recurrence comment on issue #42 FAILED" "71. the driver does not claim a record it did not write"
+assert_not_match "$OUT" "recorded recurrence #1" "71. no false 'recorded' claim on a 403 (exit-0) comment"
+
+# ── 72. an OUTSIDER marker cannot inflate the recurrence counter (P2) ──────
+# The occurrence marker is NOT secret: the public comments API returns it
+# verbatim, so a bare `contains($m)` let ANY account inflate the number by
+# posting the marker. One legitimate bot recurrence plus three outsider
+# markers (a human and a foreign bot) once published `Recurrence #5` instead of
+# #2 — and the recurrence number is the ONE field of #3907 an outsider can
+# corrupt. Only the reserved `github-actions[bot]` login may be counted.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_412=1
+export STUB_GET_BODY='{"kind":"SWEEP_CONFIG_ERROR","issue_number":42}'
+export GH_ISSUE_STATE=open
+export STUB_COMMENTS_JSON='[{"body":"🔁 Recurrence #1 <!-- dr-occurrence -->","user":{"login":"github-actions[bot]","type":"Bot"}},{"body":"<!-- dr-occurrence -->","user":{"login":"attacker","type":"User"}},{"body":"<!-- dr-occurrence -->","user":{"login":"attacker","type":"User"}},{"body":"<!-- dr-occurrence -->","user":{"login":"renovate[bot]","type":"Bot"}}]'
+run_driver
+assert_eq "$RC" 1 "72. the repeat is still RED (1)"
+assert_match "$(cat "$LOG")" "GH POST .*/issues/42/comments .*Recurrence #2" "72. an outsider marker does NOT inflate the counter (1 legit → #2)"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues/42/comments .*Recurrence #5" "72. the P2 over-count direction is closed (incl. a foreign bot)"
+
+# ── 73. a FAILED dedupe search refuses to file (P1) ───────────────────────
+# The search API has a separate, LOWER rate limit. A 403/429 answered with
+# curl exit 0 previously made `jq -r '.items[0].number // empty'` yield empty,
+# which read as "no open issue" → a DUPLICATE (the #2706 direction) inside the
+# very guard #3907 exists for. The primitive requires a real 2xx, and the file
+# path REFUSES on __ERR__ ("no incident" and "cannot see incidents" are
+# different facts).
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_SEARCH_CODE=403
+run_driver
+assert_eq "$RC" 1 "73. a 403 search exits RED (1)"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "73. a failed search files NO duplicate"
+assert_contains "$OUT" "refusing to file a possible duplicate" "73. the refusal says why"
+assert_match "$(cat "$LOG")" "AWS put-object key=ops/alerts/SWEEP_CONFIG_ERROR/_.json" "73. the create-once sentinel is kept for the next run"
+
+# ── 74. the dedupe search PAGES to an exact match beyond page 1 (P1) ──────
+# GitHub's search ranking is relevance-based, NOT equality-first: a key query
+# can fill page 1 with other subjects and leave the EXACT subject on page 2.
+# The pre-fix single-page `per_page=20` search returned "none" and filed a
+# duplicate; page 2 is only reachable when the walk pages.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=500)).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export GH_SEARCH_FILLER=1
+export GH_ISSUE_STALE=42
+export GH_ISSUE_TITLE='[DR] STALE — teamA'
+export GH_ISSUE_STATE=open
+export STUB_COMMENTS_JSON='[]'
+run_driver
+assert_eq "$RC" 1 "74. a page-2 exact match exits RED (1)"
+assert_match "$(cat "$LOG")" "GH GET .*search/issues.*page=2" "74. the search walk reached page 2"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "74. the page-2 exact match files NO duplicate"
+assert_match "$(cat "$LOG")" 'AWS put-object body=\{"kind":"STALE","issue_number":42' "74. the page-2 issue number is adopted (only the walk could see it)"
+
+# ── 75. a FAILED issue CREATE files nothing and claims no filing (P2) ─────
+# The pre-fix create was a bare curl whose `.number // empty` conflated an HTTP
+# failure with "no number": nothing was filed, no line was logged, and
+# finish() still printed "an incident was filed — exiting RED".
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false '"REGISTRY_STREAM_KEY not set"' null)"
+export STUB_CREATE_CODE=403
+run_driver
+assert_eq "$RC" 1 "75. a failed create exits RED (1)"
+assert_match "$(cat "$LOG")" "GH POST .*/issues \{" "75. the create POST was attempted"
+assert_contains "$OUT" "issue CREATE failed" "75. the failed create is logged loudly"
+assert_not_contains "$OUT" "an incident was filed" "75. no false claim of a filing that did not happen"
+assert_not_match "$(cat "$LOG")" "issue_number\":[0-9]" "75. no issue number is backfilled into the sentinel"
+
+# ── 76. a FAILED close leaves the issue OPEN and KEEPS the sentinel (P2) ──
+# The pre-fix close was `curl … >/dev/null 2>&1 || true`: on 403/5xx the issue
+# stayed OPEN while the driver believed it resolved AND deleted the R2
+# sentinel, so a human saw "unresolved" indefinitely and the next recurrence
+# re-adopted a stale issue.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body false null null)"
+export GH_ISSUE_SWEEP_CONFIG_ERROR=42
+export STUB_CLOSE_CODE=403
+run_driver
+# The merged runbook (docs/ops/registry-backup-dr.md) states the driver's
+# `gh_close` "keeps the dedup object and marks the run red" on a non-2xx PATCH —
+# PR #3405's contract, asserted by case 29b. The run is therefore RED even
+# though the sweep itself was healthy; the issue is NOT silently green.
+assert_eq "$RC" 1 "76. a failed close keeps the sentinel AND marks the run RED (runbook/29b)"
+assert_match "$(cat "$LOG")" "GH PATCH .*/issues/42" "76. the close was attempted"
+assert_not_match "$(cat "$LOG")" "AWS delete-object key=ops/alerts/SWEEP_CONFIG_ERROR/_.json" "76. the sentinel is KEPT on a failed close"
+assert_contains "$OUT" "could NOT close issue #42" "76. the failed close is reported, not swallowed"
+
+# ── 77. #5028: the ride-along skip names the ACTUAL status (lock case) ─────
+# The pre-fix else-branch logged "sweep reported already_running (lock held)"
+# for ALL THREE skip statuses; driver_timeout and empty_response are not a
+# held lock, and that false line sent an investigation after a lock that was
+# then falsified (0 of 14 sampled runs reported already_running).
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null true 1 "$TS_RECENT")"
+export STUB_SWEEP_BODY='{"status":"already_running"}'
+run_driver
+assert_eq "$RC" 0 "77. a fresh held lock is healthy"
+assert_contains "$OUT" "sweep skipped (status=already_running)" "77. a held lock names already_running"
+assert_not_contains "$OUT" "already_running (lock held)" "77. the false lock-held claim is gone"
+assert_not_contains "$OUT" "ride-along OK" "77. already_running still skips the purge/reconcile ride-along"
+
+# ── 78. #5028: a sweep timeout names the status AND the elapsed time ───────
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null true 1 "$TS_RECENT")"
+export STUB_SWEEP_RC=28
+run_driver
+assert_eq "$RC" 1 "78. a sweep timeout stays RED (1)"
+assert_contains "$OUT" "sweep skipped (status=driver_timeout)" "78. a timeout names driver_timeout"
+assert_not_contains "$OUT" "lock held" "78. a timeout is NOT reported as a held lock"
+assert_match "$OUT" "curl rc=28, took [0-9]+s" "78. the timeout reports rc 28 and the elapsed seconds"
+# #5028: the elapsed is carried in the FILED body too, not only the log line —
+# the incident is what a human reads weeks later, when the run's stdout is gone.
+assert_match "$(cat "$LOG")" 'after [0-9]+s \(curl exit 28' "78. the filed incident body carries the elapsed seconds"
+assert_not_contains "$OUT" "ride-along OK" "78. a timeout still skips the purge/reconcile ride-along"
+
+# ── 79. #5028: an empty sweep body names empty_response, not a lock ────────
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null true 1 "$TS_RECENT")"
+export STUB_SWEEP_RC=0
+run_driver
+assert_eq "$RC" 1 "79. an empty response stays RED (1)"
+assert_contains "$OUT" "sweep skipped (status=empty_response)" "79. an empty response names empty_response"
+assert_not_contains "$OUT" "lock held" "79. an empty response is NOT reported as a held lock"
+
+# ── 80. #5028: the sweep OUTCOME is never truncated away ───────────────────
+# `per_team` (the org census) is serialized BEFORE `last_sweep`, so the old
+# 600-char `raw status` blob always cut the outcome off the end. The outcome
+# must be on its own untruncated line.
+reset_case
+BIG_PER_TEAM="$(python3 -c 'import json;print(json.dumps({("org%03d" % i):"ok" for i in range(78)}))')"
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(printf '{"enabled":true,"config_error":null,"storage_error":null,"per_team":%s,"last_sweep":{"last_sweep_at":"%s","last_team_count":78},"watcher":{"running":true,"age_minutes":1}}' "$BIG_PER_TEAM" "$TS_RECENT")"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+run_driver
+assert_eq "$RC" 0 "80. a healthy run with a 78-org census exits 0"
+assert_contains "$OUT" "sweep outcome: last_sweep=" "80. the sweep outcome is on its own line"
+assert_contains "$OUT" "\"last_sweep_at\":\"$TS_RECENT\"" "80. the outcome line carries last_sweep_at"
+assert_contains "$OUT" "orgs=78" "80. the outcome line carries the org census count"
+RAW_PREVIEW="$(printf '%s' "$STUB_STATUS_BODY" | head -c 600)"
+assert_not_contains "$RAW_PREVIEW" "last_sweep" "80. (control) the 600-char raw blob genuinely cuts last_sweep off"
+
+# ── 81. #5028: the outcome names the org census — `unknown`, never blank ───
+# The outcome line must report the real count when `per_team` is an object and
+# say `unknown` when it is absent or a non-object. A blank `orgs=` reads as
+# "0 orgs" at a glance — the same silent-degradation shape the untruncated
+# outcome line exists to prevent. BOTH the jq `else "unknown"` and the
+# `[ -n … ] ||` guard are pinned (the else catches a non-object; the guard
+# catches the empty output of a jq failure).
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+# (a) `per_team` absent entirely.
+export STUB_STATUS_BODY="$(printf '{"enabled":true,"config_error":null,"storage_error":null,"last_sweep":{"last_sweep_at":"%s","last_team_count":0},"watcher":{"running":true,"age_minutes":1}}' "$TS_RECENT")"
+run_driver
+assert_eq "$RC" 0 "81. a run whose /status omits per_team stays healthy"
+assert_contains "$OUT" "sweep outcome: last_sweep=" "81. the outcome line is still emitted"
+assert_contains "$OUT" "orgs=unknown" "81. an absent per_team reports orgs=unknown"
+assert_not_match "$OUT" "orgs=[0-9]" "81. an absent per_team never reports a numeric count"
+# (b) `per_team` present but a non-object (schema drift).
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_STATUS_BODY="$(printf '{"enabled":true,"config_error":null,"storage_error":null,"per_team":"drifted","last_sweep":{"last_sweep_at":"%s","last_team_count":0},"watcher":{"running":true,"age_minutes":1}}' "$TS_RECENT")"
+run_driver
+assert_eq "$RC" 0 "81. a run with a non-object per_team stays healthy"
+assert_contains "$OUT" "orgs=unknown" "81. a non-object per_team reports orgs=unknown"
+# (c) an object `per_team` still reports the real count.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_STATUS_BODY="$(printf '{"enabled":true,"config_error":null,"storage_error":null,"per_team":{"orgA":"ok","orgB":"ok"},"last_sweep":{"last_sweep_at":"%s","last_team_count":0},"watcher":{"running":true,"age_minutes":1}}' "$TS_RECENT")"
+run_driver
+assert_eq "$RC" 0 "81. a run with an object per_team stays healthy"
+assert_contains "$OUT" "orgs=2" "81. an object per_team reports the real org count"
+
+# ── 82. #4612: a purge timeout is named truthfully, never `HTTP 000000` ─────
+# Pre-#4612 the leg ran `-w '%{http_code}' … || echo '000'`: on a `-m` timeout
+# curl writes its OWN `000` (no newline) and exits 28, so the second `000`
+# concatenated into `000000` — a server-error claim for a client-side give-up —
+# and the empty body left `.status` blank because `jq -r '.status // "error"'`
+# prints nothing and exits 0 on empty input.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_PURGE_RC=28
+run_driver
+assert_eq "$RC" 1 "82. a purge timeout stays RED (1)"
+assert_filed "$(cat "$LOG")" PURGE_FAILED "82. a purge timeout files PURGE_FAILED"
+assert_contains "$OUT" "HTTP 000 curl_rc=28 shape=driver_timeout" "82. the timeout names 000 + curl rc 28 + the shape"
+assert_contains "$OUT" "status=driver_timeout" "82. the blank-status defect is closed (the shape is named)"
+assert_not_contains "$OUT" "000000" "82. the concatenated code is gone from the log"
+assert_not_contains "$(cat "$LOG")" "000000" "82. and from the filed body (the durable surface)"
+assert_match "$OUT" "purge ride-along FAILED .*took [0-9]+s" "82. the elapsed seconds are reported on the PURGE leg (not the sweep's)"
+
+# ── 83. #4612: a reconcile timeout is named truthfully too ──────────────────
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_RECONCILE_RC=28
+run_driver
+assert_eq "$RC" 1 "83. a reconcile timeout stays RED (1)"
+assert_filed "$(cat "$LOG")" RECONCILE_FAILED "83. a reconcile timeout files RECONCILE_FAILED"
+assert_contains "$OUT" "HTTP 000 curl_rc=28 shape=driver_timeout" "83. the reconcile timeout is named truthfully"
+assert_not_contains "$OUT" "000000" "83. no concatenated code"
+assert_not_contains "$(cat "$LOG")" "000000" "83. and none in the filed body"
+
+# ── 84. #4612: BOTH legs failing files BOTH incidents ───────────────────────
+# The terminal arms are sequential `if`s, so purge's `exit 1` would pre-empt a
+# reconcile failure if filing happened there. Filing is inline at detection.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_PURGE_CODE=500
+export STUB_RECONCILE_CODE=500
+run_driver
+assert_eq "$RC" 1 "84. both legs failing stays RED (1)"
+assert_filed "$(cat "$LOG")" PURGE_FAILED "84. purge files"
+assert_filed "$(cat "$LOG")" RECONCILE_FAILED "84. reconcile ALSO files (not pre-empted by the first exit arm)"
+assert_match "$(cat "$LOG")" "AWS put-object key=ops/alerts/PURGE_FAILED/_.json" "84. the purge dedup object exists"
+assert_match "$(cat "$LOG")" "AWS put-object key=ops/alerts/RECONCILE_FAILED/_.json" "84. the reconcile dedup object exists"
+
+# ── 85. #4612: a completed purge RESOLVES its open incident ─────────────────
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_PURGE_BODY='{"status":"ok","teams_purged":0}'
+export GH_ISSUE_PURGE_FAILED=77
+run_driver
+assert_eq "$RC" 0 "85. a healthy ride-along stays green"
+assert_match "$(cat "$LOG")" "GH PATCH .*/issues/77" "85. the open PURGE_FAILED incident is closed"
+assert_match "$(cat "$LOG")" "AWS delete-object key=ops/alerts/PURGE_FAILED/_.json" "85. and its dedup object is deleted (delete-to-resolve)"
+
+# ── 86. #4612: `already_running` is not erasure evidence ────────────────────
+# A purge that queued behind a held lock proves NOTHING about erasure, so it
+# neither files nor resolves — the strongest-evidence gate (#3127).
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_PURGE_BODY='{"status":"already_running","purged":[]}'
+export GH_ISSUE_PURGE_FAILED=77
+run_driver
+assert_eq "$RC" 0 "86. already_running is not a failure"
+assert_not_match "$(cat "$LOG")" "GH PATCH .*/issues/77" "86. already_running does NOT resolve PURGE_FAILED"
+assert_contains "$OUT" "leaving PURGE_FAILED unchanged" "86. and the reason is logged (not silent)"
+
+# ── 87. #4612: a 2xx reconcile resolves its open incident ───────────────────
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export GH_ISSUE_RECONCILE_FAILED=88
+run_driver
+assert_eq "$RC" 0 "87. a healthy reconcile stays green"
+assert_match "$(cat "$LOG")" "GH PATCH .*/issues/88" "87. the open RECONCILE_FAILED incident is closed"
+assert_match "$(cat "$LOG")" "AWS delete-object key=ops/alerts/RECONCILE_FAILED/_.json" "87. and its dedup object is deleted"
+
+# ── 88. #4612: a SKIPPED ride-along files and resolves nothing ──────────────
+# A skip gathers no leg evidence, so nothing may be filed OR closed.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null true 1 "$TS_RECENT")"
+export STUB_SWEEP_BODY='{"status":"already_running"}'
+export GH_ISSUE_PURGE_FAILED=77
+export GH_ISSUE_RECONCILE_FAILED=88
+run_driver
+assert_eq "$RC" 0 "88. a fresh held lock is healthy"
+assert_not_match "$(cat "$LOG")" "GH POST .*/issues \{" "88. a skip creates no issue at all"
+assert_not_match "$(cat "$LOG")" "AWS put-object key=ops/alerts/PURGE_FAILED" "88. a skip writes no PURGE_FAILED dedup object"
+assert_not_match "$(cat "$LOG")" "AWS put-object key=ops/alerts/RECONCILE_FAILED" "88. a skip writes no RECONCILE_FAILED dedup object"
+assert_not_match "$(cat "$LOG")" "GH PATCH .*/issues/77" "88. a skip does not resolve PURGE_FAILED"
+assert_not_match "$(cat "$LOG")" "GH PATCH .*/issues/88" "88. a skip does not resolve RECONCILE_FAILED"
+assert_contains "$OUT" "leaving PURGE_FAILED/RECONCILE_FAILED unchanged" "88. the skip states that it gathered no evidence"
+
+# ── 89. #4612: the ride-along curl-outcome vocabulary is declared ONCE ──────
+# leg_shape is the single declaration for the TWO RIDE-ALONG legs, so purge and
+# reconcile cannot drift into private tokens. Asserted by BEHAVIOUR — the
+# function is EXTRACTED from the shipping script and CALLED — because the source
+# contains these tokens in prose too, so a whole-file grep cannot discriminate an
+# inverted implementation.
+LEG_EXT="$(mktemp)"
+sed -n '/^leg_shape()/,/^}/p' "$DRIVER" > "$LEG_EXT"
+run_leg_shape() { # <curl_rc> <body> — the real leg_shape from the shipping driver
+  (
+    # shellcheck disable=SC1090
+    . "$LEG_EXT"
+    leg_shape "$1" "$2"
+  )
+}
+assert_eq "$(run_leg_shape 28 'x')" "driver_timeout" "89. rc 28 (the caller's own -m ceiling) is driver_timeout"
+assert_eq "$(run_leg_shape 7 '')" "transport_error" "89. any other non-zero rc is transport_error"
+assert_eq "$(run_leg_shape 0 '')" "empty_response" "89. rc 0 with no body is empty_response"
+assert_eq "$(run_leg_shape 0 '{}')" "http" "89. rc 0 with a body is http (the code is then meaningful)"
+rm -f "$LEG_EXT"
+assert_file_match "$SCRIPT_DIR/registry-cron.sh" 'RIDE_SHAPE="\$\(leg_shape' "89. the ride-along request derives its shape from the shared vocabulary"
+
+# ── 90. #4612: the observed 504 is named, not read as an outage ─────────────
+# The production failure the reporter logged is a 504 answered WITH a body —
+# curl rc 0, shape=http — so neither the shape `case` nor a transport check can
+# name it. The filed body must say it is an over-budget answer from a control
+# plane that is answering, NOT a general outage, and that erasure is UNVERIFIED.
+# (The app's own wait-bound refusal (#4412) is this shape; #4939 exempted
+# `/v1/internal/` from it, so the driver names the shape rather than assuming
+# which layer emitted it.) Pinned on the create POST (the durable surface).
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_PURGE_CODE=504
+export STUB_PURGE_BODY='{"detail":"The server'"'"'s wait budget for this request was exceeded before a response was ready. The work may still complete on the server."}'
+run_driver
+assert_eq "$RC" 1 "90. a wait-bound purge 504 stays RED (1)"
+assert_filed "$(cat "$LOG")" PURGE_FAILED "90. the 504 files PURGE_FAILED (it has an owner)"
+assert_contains "$OUT" "HTTP 504" "90. the log names the 504"
+assert_match "$(cat "$LOG")" "not a general control-plane outage" "90. the filed body separates it from a general outage"
+assert_match "$(cat "$LOG")" "gateway timeout" "90. and names it a gateway timeout, not a transport failure"
+assert_match "$(cat "$LOG")" "erasure is UNVERIFIED" "90. and states erasure is UNVERIFIED, not disproven"
+assert_match "$(cat "$LOG")" "wait-bound refusal" "90. and cites the server-side shape (#4412) without over-attributing it"
+
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_RECONCILE_CODE=504
+run_driver
+assert_eq "$RC" 1 "90. a wait-bound reconcile 504 stays RED (1)"
+assert_filed "$(cat "$LOG")" RECONCILE_FAILED "90. the reconcile 504 files RECONCILE_FAILED"
+assert_match "$(cat "$LOG")" "not a general control-plane outage" "90. the reconcile body carries the same distinction"
+
+# ── 91. #4612 review P1: a 2xx received before a transport failure is NOT success
+# curl writes its OWN `%{http_code}` even when `-m` then kills the transfer, so a
+# leg can report rc 28 WITH code 200 (headers arrived, body stalled). Resolving on
+# the code alone would close a live incident on a TRANSPORT failure; the gate must
+# also require the exchange to have COMPLETED.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_RECONCILE_CODE=200
+export STUB_RECONCILE_RC=28
+run_driver
+assert_eq "$RC" 1 "91. a reconcile that timed out after 200 headers stays RED (1)"
+assert_filed "$(cat "$LOG")" RECONCILE_FAILED "91. it files RECONCILE_FAILED"
+
+# Same shape with an open incident: it must be filed against, never resolved.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_RECONCILE_CODE=200
+export STUB_RECONCILE_RC=28
+export GH_ISSUE_RECONCILE_FAILED=88
+run_driver
+assert_eq "$RC" 1 "91. the seeded-incident reconcile is still RED (1)"
+assert_not_match "$(cat "$LOG")" "GH PATCH .*/issues/88" "91. it does NOT resolve the open RECONCILE_FAILED incident"
+
+# The purge leg's gate already requires a body-derived status, so the same
+# transport shape cannot read as success there either — pinned for symmetry.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_PURGE_CODE=200
+export STUB_PURGE_RC=28
+export GH_ISSUE_PURGE_FAILED=77
+run_driver
+assert_eq "$RC" 1 "91. a purge that timed out after 200 headers stays RED (1)"
+assert_not_match "$(cat "$LOG")" "GH PATCH .*/issues/77" "91. it does NOT resolve the open PURGE_FAILED incident"
+
+# ── 92. #4612 review P2: empty_response ≠ transport_error in the filed body ──
+# `leg_shape` separates them because they are DIFFERENT facts: empty_response is
+# rc 0 (the exchange COMPLETED, a status code came back, only the body is
+# missing), transport_error is a non-zero rc (no response at all). The filed body
+# must not tell the reader "never reached a response" for the former.
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_PURGE_RC=0
+export STUB_PURGE_CODE=200
+run_driver
+assert_eq "$RC" 1 "92. an empty purge body is RED (1)"
+assert_match "$(cat "$LOG")" "answered HTTP 200 without a response body" "92. empty_response is named as a completed exchange with no body"
+assert_not_match "$(cat "$LOG")" "never reached a response" "92. and is NOT described as a request that never reached a response"
+
+reset_case
+export R2_TEAMS=$'backups/teamA/'
+export R2_DEFAULT_LIST="$TS_RECENT"
+export STUB_STATUS_BODY="$(status_body true null null)"
+export STUB_SWEEP_BODY='{"status":"backed_up","teams_backed_up":1}'
+export STUB_PURGE_RC=7
+run_driver
+assert_eq "$RC" 1 "92. a transport_error purge is RED (1)"
+assert_contains "$(cat "$LOG")" "never reached a response (curl exit 7)" "92. transport_error names the curl exit"
 
 echo ""
 echo "registry-cron.test.sh: $PASS passed, $FAIL failed"
