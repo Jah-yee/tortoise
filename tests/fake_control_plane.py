@@ -82,6 +82,8 @@ def _assert_uuid_fidelity(table: str, filters: list[tuple[str, str, object]] | N
 # set against the migrations so a forgotten column fails the suite.
 TIMESTAMPTZ_COLUMNS: set[tuple[str, str]] = {
     ("abuse_events", "created_at"),
+    ("account_deletions", "created_at"),
+    ("account_deletions", "deleted_at"),
     ("agent_signup_tokens", "created_at"),
     ("agent_signup_tokens", "last_used_at"),
     ("agent_signup_tokens", "revoked_at"),
