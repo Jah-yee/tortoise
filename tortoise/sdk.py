@@ -6264,6 +6264,18 @@ class TortoiseSDK:
     def update(self, id: str, **props) -> dict:
         """One update for a Point OR an entity (epic #888 W2).
 
+        A graph operator IS a Point (``is_operator=true``), so it takes the
+        Point arm below: ``update(<operator_id>, label=...)`` edits an existing
+        operator edge in place. So ``update`` belongs to the operator-mutation
+        vocabulary even though ``operator_action`` exposes only mitigate/annotate
+        (#6131).
+
+        Note what this path does NOT do: unlike ``create_operator``, which returns
+        a structured ``undeclared_relation`` warning when no installed pack
+        declares the predicate, ``update(<operator_id>, label=...)`` performs no
+        declaredness check and installs the label silently. Take valid predicates
+        from ``list_relations()``.
+
         Detects the node type by label:
           - Point → point-lifecycle semantics (delegates to update_point):
             draft→live promote via status (only transition allowed), version
@@ -6283,6 +6295,12 @@ class TortoiseSDK:
 
     def delete(self, id: str) -> bool:
         """One delete for a Point OR an entity (epic #888 W2).
+
+        An operator IS a Point (``is_operator=true``), so
+        ``delete(<operator_id>)`` removes an operator edge — operators are not
+        delete-less, and a mislabelled or superseded edge is not permanent
+        (#6131). The verb is deliberately generic, so its name says Point/entity
+        rather than naming operators.
 
         Destructive. Detects the node type by label:
           - Point → delete_point (tag GC + `PointRetracted` :GraphEvent)
@@ -8303,6 +8321,13 @@ class TortoiseSDK:
         action='annotate' → annotate_operator(id=..., bias=..., precision=...,
             consistency=..., directness=...) — structured epistemic dims.
 
+        This is NOT the whole operator-mutation vocabulary. Operators are also
+        edited and removed by the GENERIC verbs — ``update(<operator_id>, ...)``
+        and ``delete(<operator_id>)`` — because an operator IS a Point and so
+        takes their Point arm (#6131). This action set exists for the two
+        operations that need a reason or epistemic dimensions; their absence
+        here is not evidence that operators cannot be changed.
+
         Unknown action raises ValueError.
         """
         if action == "mitigate":
@@ -8315,7 +8340,9 @@ class TortoiseSDK:
                 kwargs["consistency"], kwargs["directness"])
         raise ValueError(
             f"operator_action: unknown action {action!r} — must be "
-            f"'mitigate' or 'annotate'")
+            f"'mitigate' or 'annotate'. This is not the whole operator "
+            f"vocabulary: operators are also edited and removed by the generic "
+            f"verbs update(id, ...) and delete(id) (#6131).")
 
     def annotate_operator(self, id: str, bias: float, precision: float,
                           consistency: float, directness: float) -> dict:
