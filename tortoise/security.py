@@ -430,12 +430,26 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("huggingface_token",
      re.compile(r"(?<![A-Za-z0-9])(?:hf_|api_org_)[A-Za-z0-9]{34,}(?![A-Za-z0-9])"),
      _REDACTION_VALUE.format(kind="huggingface_token")),
-    # Tortoise's OWN API key (#5109) — minted as ``f"{prefix}{uuid.uuid4().hex}"``,
-    # i.e. EXACTLY ``<prefix>`` + 32 lowercase hex, for the DEFAULT ``tt_`` and for the
-    # ``tk_`` per-graph keys the provisioning service mints (``prefix`` kwarg, C2
-    # #2111). The body is anchored to HEX rather than loose alnum because the mint is
-    # ``uuid4().hex``: the exact shape is available, so it is used, and it is
-    # maximally specific.
+    # Tortoise's OWN API key (#5109) — ``<prefix>`` + a body of lowercase hex, for the
+    # DEFAULT ``tt_`` and for the ``tk_`` per-graph keys (``prefix`` kwarg, C2 #2111).
+    # The body is anchored to HEX rather than loose alnum because every mint produces
+    # hex: the exact shape is available, so it is used, and it is maximally specific.
+    #
+    # ⛔ TWO BODY LENGTHS, AND DROPPING EITHER LEAVES A LIVE KEY IN THE CLEAR. The
+    # Python mint (``f"{prefix}{uuid.uuid4().hex}"``) produces 32 hex; the
+    # tenant-provision edge function produces 64 (``32`` random BYTES, each padded to
+    # two hex digits) and is the key the dashboard BFF provisions. Both are genuine
+    # API keys accepted by ``mcp_auth`` and hashed identically, so a ``{32}``-only
+    # body matches the first and CANNOT match the second — the 33rd hex character
+    # trips the lookahead and the engine finds no match at all, storing the 64-hex key
+    # verbatim with ``counts == {}``. That is the very hole this rule closes, so the
+    # body is an ALTERNATION over both lengths.
+    #
+    # ⛔ THE LOOKAHEAD IS WHAT MAKES THE ALTERNATION SAFE. ``{32}`` is tried first and
+    # its lookahead FAILS on a 64-hex body (character 33 is hex), so the engine
+    # backtracks to ``{64}`` and replaces the WHOLE body — never a 32-of-64 prefix
+    # that would leave a cleartext suffix behind. A 33-hex value still survives
+    # untouched, which is what keeps the rule narrow.
     #
     # ⛔ STATE THE SHAPE; NEVER A COUNT AND NEVER A SITE LIST. The mint is not a
     # fixed set of call sites and it spans more than one module, so ANY enumeration
@@ -455,7 +469,9 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # ⛔ BOTH PREFIXES, because they differ only in the prefix: covering ``tt_``
     # alone leaves a ``tk_`` key — the same secret, same mint, same leak —
     # stored verbatim. The mint is ONE expression over a prefix variable, so the
-    # rule must be one alternative over the prefix — not a rule per prefix.
+    # rule must be one alternative over the prefix — not a rule per prefix. (The
+    # BODY, by contrast, is not one expression: see the two-length note above — the
+    # prefix is shared, the body length is not.)
     #
     # Measured BEFORE this rule existed: ``redact_secrets`` returned the key
     # VERBATIM with ``counts == {}``, so the capture path stored it with
@@ -470,7 +486,7 @@ _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # measured. Neither prefix is claimed by another rule, so the ordering rule
     # above is not engaged.
     ("tortoise_api_key",
-     re.compile(r"(?<![A-Za-z0-9])(?:tt|tk)_[0-9a-f]{32}(?![A-Za-z0-9])"),
+     re.compile(r"(?<![A-Za-z0-9])(?:tt|tk)_(?:[0-9a-f]{32}|[0-9a-f]{64})(?![A-Za-z0-9])"),
      _REDACTION_VALUE.format(kind="tortoise_api_key")),
     # Jev / TypeSafe AI (`jv_live_…`, `jv_test_…`).
     ("jev_api_key",

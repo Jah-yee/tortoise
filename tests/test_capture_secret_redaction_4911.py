@@ -115,15 +115,20 @@ CASES: tuple[tuple[str, str, str], ...] = (
     ("npm", "npm_token", "npm_" + _fill(36)),
     ("huggingface", "huggingface_token", "hf_" + _fill(34)),
     ("huggingface_org", "huggingface_token", "api_org_" + _fill(34)),
-    # #5109: the repo's OWN key — ``<prefix>`` + ``uuid4().hex``. Synthetic, and
-    # assembled at runtime (see ``_synth``) like every other row. A site is
-    # deliberately NOT named (see the rule comment in ``tortoise/security.py``):
-    # the mint is not a fixed set of call sites, and a partial list reads as a
-    # complete one. The body is HEX specifically because the mint's body is
-    # ``uuid4().hex`` — that is what the rule anchors on, so a mixed-case
-    # ``_fill`` body would not represent the real shape.
+    # #5109: the repo's OWN key — ``<prefix>`` + hex. Synthetic, and assembled at
+    # runtime (see ``_synth``) like every other row. A site is deliberately NOT
+    # named (see the rule comment in ``tortoise/security.py``): the mint is not a
+    # fixed set of call sites, and a partial list reads as a complete one. The body
+    # is HEX specifically because every mint's body is hex — that is what the rule
+    # anchors on, so a mixed-case ``_fill`` body would not represent the real shape.
     ("tortoise", "tortoise_api_key",
      _synth("tt_", "0123456789abcdef0123456789abcdef")),
+    # #5109: the SAME credential's SECOND live shape. The tenant-provision edge
+    # function mints ``tt_`` + 64 hex (32 random BYTES, each padded to two hex
+    # digits) and is what the dashboard BFF provisions with, so a ``{32}``-only
+    # body matches the Python mint above and CANNOT match this one at all.
+    ("tortoise_edge_64", "tortoise_api_key",
+     _synth("tt_", "0123456789abcdef" * 4)),
     ("supabase_pat", "supabase_secret_key", "sbp_" + _fill(40)),
     ("slack_workflow_webhook", "slack_webhook_url",
      _synth("https://", _webhook(
@@ -848,10 +853,12 @@ def test_every_rule_scans_linearly_on_adversarial_input():
 def test_the_repos_own_api_key_is_redacted():
     """#5109: the #4911 mitigation did not cover Tortoise's OWN credential.
 
-    The key is minted as ``f"{prefix}{uuid.uuid4().hex}"``, so its shape is
-    exactly ``<prefix>`` + 32 lowercase hex. ⛔ The mint is NOT a fixed set of call
-    sites and spans more than one module, so this docstring states the SHAPE and
-    names no site and no count: any enumeration or figure here is a claim about
+    Every mint is ``<prefix>`` + lowercase hex, and there are TWO body lengths in
+    the tree: the Python mint (``f"{prefix}{uuid.uuid4().hex}"``) gives 32, and the
+    tenant-provision edge function gives 64 (32 random BYTES, two hex digits each)
+    — the key the dashboard BFF provisions with. ⛔ The mint is NOT a fixed set of
+    call sites and spans more than one module, so this docstring states the SHAPES
+    and names no site and no count: any enumeration or figure here is a claim about
     the source rather than about the rule, it re-stales on the next mint, and a
     partial list reads as a complete one whether or not it is one. The rule
     anchors on the SHAPE, which is why it covers a site neither this docstring nor
@@ -872,29 +879,42 @@ def test_the_repos_own_api_key_is_redacted():
     a rule covering ``tt_`` alone would leave the same secret with the same
     leak shape stored verbatim.
 
+    ⛔ EVERY PREFIX/BODY-LENGTH PAIR is exercised — the mint is a cross product,
+    not a single expression: ``tt_``/``tk_`` are the two prefixes and 32/64 are the
+    two body lengths. Covering only the Python pair leaves the edge function's live
+    key stored verbatim, which is the hole #5109 exists to close.
+
     REDs on: removing the ``tortoise_api_key`` rule (back to verbatim + empty
-    counts), or narrowing it to ``tt_``.
+    counts), narrowing it to ``tt_``, or dropping either body length from the
+    alternation (the 64-hex pair goes back to verbatim).
     """
     for prefix in ("tt_", "tk_"):
-        key = _synth(prefix, "0123456789abcdef0123456789abcdef")
-        out, counts = redact_secrets(f"my key is {key}, keep it safe")
-        assert key not in out, out
-        assert "[REDACTED:tortoise_api_key]" in out, out
-        assert counts == {"tortoise_api_key": 1}, counts
-        # and the recorded count survives the capture double-pass (see the
-        # idempotency test below)
-        again, extra = redact_secrets(out)
-        assert again == out and extra == {}, extra
+        for body in ("0123456789abcdef0123456789abcdef", "0123456789abcdef" * 4):
+            key = _synth(prefix, body)
+            out, counts = redact_secrets(f"my key is {key}, keep it safe")
+            assert key not in out, out
+            assert "[REDACTED:tortoise_api_key]" in out, out
+            assert counts == {"tortoise_api_key": 1}, counts
+            # and the recorded count survives the capture double-pass (see the
+            # idempotency test below)
+            again, extra = redact_secrets(out)
+            assert again == out and extra == {}, extra
 
 
 def test_the_tortoise_key_rule_is_narrow_enough():
     """``tt_``/``tk_`` are only TWO-character prefixes, so the body does the work.
 
-    That precision is real rather than cosmetic: the minting site is
-    ``uuid4().hex``, so a genuine key body is pure lowercase hex. A body of the
-    wrong length, a body containing a non-hex character, a prefix sitting
-    inside a word, and the repo's own OTHER two-letter-prefixed ids (``ev_``,
-    ``pt_``) must all survive untouched.
+    That precision is real rather than cosmetic: every minting site produces
+    lowercase hex, so a genuine key body is pure lowercase hex of one of the two
+    minted lengths. A body of any OTHER length, a body containing a non-hex
+    character, a prefix sitting inside a word, and the repo's own OTHER
+    two-letter-prefixed ids (``ev_``, ``pt_``) must all survive untouched.
+
+    ⛔ THE ``{32,}`` REFUSAL IS THE LOAD-BEARING ONE and it must survive the second
+    body length: a greedy ``{32,}`` would swallow any long hex run after the prefix
+    (including the 33- and 63-hex rows below), whereas the two-length alternation
+    is exact. A 63-hex body is NOT a key of either shape, so it must survive — and
+    it stays a survivor only because the anchors are kept.
 
     REDs on: widening the body to loose alnum or to ``{32,}``, or dropping the
     lookbehind/lookahead anchors.
@@ -902,7 +922,8 @@ def test_the_tortoise_key_rule_is_narrow_enough():
     survivors = [
         _synth("tt_", "0123456789abcdef0123456789abcde"),      # 31, too short
         _synth("tt_", "0123456789abcdef0123456789abcdeg"),     # non-hex body
-        _synth("tt_", "0123456789abcdef0123456789abcdef0"),    # 33, too long
+        _synth("tt_", "0123456789abcdef0123456789abcdef0"),    # 33, not a length
+        _synth("tt_", "0123456789abcdef" * 4)[:-1],            # 63, not a length
         _synth("outt_", "0123456789abcdef0123456789abcdef"),   # inside a word
         _synth("ev_", "0123456789abcdef0123456789abcdef"),
         _synth("pt_", "0123456789abcdef0123456789abcdef"),
