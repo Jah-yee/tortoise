@@ -3912,13 +3912,31 @@ def test_docs_job_pr_path_never_interpolates_filenames():
     Both arms are pinned: the list is produced NUL-delimited into a FILE, and
     each consumer reads that file (``xargs -0`` / ``--files-from``) instead of
     receiving interpolated text.
+
+    SCOPE — what this pins: the shell/argv SHAPE of the pipeline (the diff's
+    NUL mode, filter and pathspec, the tolerance, each intermediate file ACROSS
+    the chain, the published output key and its redirect, and both consumers'
+    input source) and the ABSENCE of any ``steps.changed`` interpolation or new
+    shell-text channel in the consumers. It does NOT pin the diff BASE ref, the
+    ``--no-renames`` flag, an added-but-unrelated stage, or an interpolation of
+    some OTHER PR-controlled expression. Those are outside this invariant: a
+    finite pin cannot enumerate every FUTURE addition, and new workflow code is
+    the control that covers them (review + the repo's own CI guards). The
+    invariant this test DOES own — a changed filename is never shell text — is
+    pinned in both directions.
     """
     steps = _load_workflow("ci.yml")["jobs"]["docs"]["steps"]
 
     changed = next(s for s in steps if s.get("id") == "changed")
     run = changed["run"]
+    # The step ITSELF must be PR-path-only, and the polarity is part of the pin:
+    # `inputs.main_health` (no `!`) INVERTS it and kills the PR path entirely.
+    # A sibling test only substring-matches "main_health", which the inverted
+    # expression satisfies.
+    assert "!inputs.main_health" in str(changed.get("if", "")), changed.get("if")
+    assert changed.get("if") == "${{ !inputs.main_health }}", changed.get("if")
 
-    def _logical(startswith: str) -> str:
+    def _logical(block: str, startswith: str) -> str:
         """The shell logical line beginning with ``startswith``, comments stripped.
 
         Assertions must target a SPECIFIC command: matching the whole ``run``
@@ -3927,32 +3945,66 @@ def test_docs_job_pr_path_never_interpolates_filenames():
         was satisfied by the ``sed -z`` two lines later, and a bare
         ``"|| true" in run`` by the ``grep -c . ... || true`` in the count
         line, so deleting ``-z`` or the tolerance from the ``git diff`` left
-        the whole suite green. Command continuations (``\``) are joined.
+        the whole suite green. Command continuations (a trailing backslash)
+        are joined.
         """
-        code = [ln for ln in run.splitlines() if not ln.lstrip().startswith("#")]
+        code = [ln for ln in block.splitlines() if not ln.lstrip().startswith("#")]
         for i, ln in enumerate(code):
             if ln.strip().startswith(startswith):
                 parts, j = [], i
                 while j < len(code):
-                    parts.append(code[j].strip())
+                    # The line-continuation backslash is SYNTAX, not command text:
+                    # strip it so the joined result is the real logical command.
+                    parts.append(code[j].strip().rstrip("\\").strip())
                     if not code[j].rstrip().endswith("\\"):
                         break
                     j += 1
                 return " ".join(parts)
-        raise AssertionError(f"no shell command beginning {startswith!r} in run block")
+        raise AssertionError(
+            f"no shell command beginning {startswith!r} in block {block!r}"
+        )
 
-    diff_cmd = _logical("git diff")
-    # NUL-delimited output on the DIFF ITSELF (not the `sed -z` below it).
-    assert "-z" in diff_cmd, diff_cmd
-    assert "--name-only" in diff_cmd, diff_cmd
-    # Only paths that exist on disk: lychee hard-errors on a nonexistent input,
-    # and under `--no-renames` a rename contributes its deleted source path.
-    assert "--diff-filter ACMR" in diff_cmd, diff_cmd
-    # The tolerance, asserted ON THIS COMMAND. `docs` is a REQUIRED status
-    # check and a shallow PR checkout has no base sha, so without it git exits
-    # 128, the step aborts under `bash -e`, and every PR reds.
-    assert "|| :" in diff_cmd or diff_cmd.rstrip().endswith("|| true"), diff_cmd
-    assert "$RUNNER_TEMP/pr-md.raw.nul" in diff_cmd, diff_cmd
+    # EXACT-EQUALITY PINS, not presence checks.
+    #
+    # Eight review rounds established that a PRESENCE assertion over a shell
+    # string cannot be made sound by adding more substrings: every one is
+    # defeated by an OVERRIDE, because the shell takes the LAST of a repeated
+    # option. Measured examples, each of which passed a presence pin:
+    #   xargs -a A -a B      (xargs uses B)
+    #   --files-from A --files-from B   (lychee uses B)
+    #   cmd > A > B          (bash leaves A empty, writes B)
+    #   /usr/bin/sed ...     (evades `startswith("sed ")`)
+    # These commands are OURS and short, so the sound pin is the whole command:
+    # a deliberate change must update the pin, which is exactly what a control
+    # over PR-author-controlled data should require.
+    diff_cmd = _logical(run, "git diff")
+    assert diff_cmd == (
+        "git diff --no-renames --diff-filter ACMR -z --name-only \"${{ "
+        "github.event.pull_request.base.sha }}\"...HEAD -- '*.md' "
+        '> "$RUNNER_TEMP/pr-md.raw.nul" || :'
+    ), diff_cmd
+
+    # The two derived views, each pinned as the WHOLE command. `-z` on the sed
+    # is the argument-injection control (without it only the FIRST entry is
+    # `./`-prefixed), and the `tr` is what gives lychee one path per line.
+    prefix_cmd = _logical(run, "sed")
+    assert prefix_cmd == (
+        'sed -z \'s|^|./|\' "$RUNNER_TEMP/pr-md.raw.nul" '
+        '> "$RUNNER_TEMP/pr-md.nul"'
+    ), prefix_cmd
+    newline_cmd = _logical(run, "tr")
+    assert newline_cmd == (
+        'tr \'\\0\' \'\\n\' < "$RUNNER_TEMP/pr-md.nul" '
+        '> "$RUNNER_TEMP/pr-md.txt"'
+    ), newline_cmd
+    # Exactly ONE `sed` INVOCATION — counted by a regex that also matches an
+    # absolute path (`/usr/bin/sed`), which a `startswith("sed ")` check misses.
+    # A second pass (`sed -z 's|^\./||'`) would re-strip the `./` prefix and
+    # re-admit the injection the line above prevents.
+    sed_invocations = [
+        ln for ln in run.splitlines() if re.match(r"^(?:\S*/)?sed\s", ln.strip())
+    ]
+    assert len(sed_invocations) == 1, sed_invocations
 
     # The list is never published as step-output TEXT (a later `${{ ... }}`
     # would re-parse the filenames as shell).
@@ -3960,14 +4012,29 @@ def test_docs_job_pr_path_never_interpolates_filenames():
         "the PR path must not publish the filenames as step OUTPUT text: a "
         "later `${{ steps.changed.outputs.files }}` re-parses them as shell"
     )
-    count_cmd = _logical("count=")
-    assert "pr-md.txt" in count_cmd, count_cmd
+    count_cmd = _logical(run, "count=")
+    # The tolerance and the `grep -c .` pattern are both inside the equality:
+    # without the tolerance `grep -c` exits 1 on a zero-match file and `bash -e`
+    # aborts the step (reding REQUIRED `docs`); with a narrower pattern the
+    # count is wrong and can pin at 0, skipping both consumers forever.
+    assert count_cmd == (
+        'count="$(grep -c . "$RUNNER_TEMP/pr-md.txt" || true)"'
+    ), count_cmd
+    # `${count:-0}` is load-bearing (`grep -c` exits 1 with no match), and the
+    # REDIRECT and the KEY are the other halves of that invariant: if either
+    # goes, `steps.changed.outputs.count` is empty, `'' != '0'` is TRUE, and
+    # both consumers run unconditionally.
+    echo_cmd = _logical(run, "echo")
+    assert echo_cmd == 'echo "count=${count:-0}" >> "$GITHUB_OUTPUT"', echo_cmd
 
     lint = next(
         s for s in steps if str(s.get("name", "")) == "Markdownlint (changed files)"
     )
-    assert "xargs -0" in lint["run"], (
-        "markdownlint must consume the NUL list as ARGV, not as expanded text"
+    lint_cmd = _logical(lint["run"], "xargs")
+    # The WHOLE argv chain, so a second `-a`, an `eval`, a `sh -c`, or any other
+    # new shell-text channel cannot be added while the pin still passes.
+    assert lint_cmd == 'xargs -0 -a "$RUNNER_TEMP/pr-md.nul" npx markdownlint-cli', (
+        lint_cmd
     )
     assert "steps.changed.outputs.files" not in lint["run"]
     assert "${{ steps.changed" not in lint["run"]
@@ -3975,25 +4042,23 @@ def test_docs_job_pr_path_never_interpolates_filenames():
     link = next(
         s for s in steps if str(s.get("name", "")) == "Link check (changed files)"
     )
-    assert "--files-from" in link["with"]["args"], (
-        "lychee must read the list from a FILE"
-    )
-    assert "steps.changed.outputs.files" not in link["with"]["args"]
-    assert "${{ steps.changed" not in link["with"]["args"]
+    args = link["with"]["args"]
+    # The WHOLE args string: a second `--files-from` would otherwise override
+    # this one (lychee uses the last), which an `endswith` check cannot catch.
+    assert args == "--no-progress --files-from ${{ runner.temp }}/pr-md.txt", args
+    assert "steps.changed.outputs.files" not in args
+    assert "${{ steps.changed" not in args
     # A link-free markdown file is legitimate.
     assert link["with"].get("failIfEmpty") is False
 
-    # Both consumers must ALSO be guarded on the PR path: the main-health path
-    # sets no `changed` output, so an unguarded `count != '0'` would be TRUE on
-    # an empty count and run the step on the nightly with no list.
+    # Both consumers must ALSO be guarded on the PR path, with the EXACT guard:
+    # the main-health path sets no `changed` output, and `count != ''` is
+    # vacuously true (count is always a non-empty string), which would disable
+    # the gate and run the step on the nightly with no list.
     for step in (lint, link):
-        cond = str(step.get("if", ""))
-        assert "!inputs.main_health" in cond, (
-            f"{step.get('name')!r} must stay on the PR path only"
-        )
-        assert "count" in cond, (
-            f"{step.get('name')!r} must gate on the produced list, not on `files`"
-        )
+        assert step.get("if") == (
+            "${{ !inputs.main_health && steps.changed.outputs.count != '0' }}"
+        ), f"{step.get('name')!r} guard is {step.get('if')!r}"
 
 
 def test_main_health_nightly_calls_ci_yml_and_never_gates_main():
