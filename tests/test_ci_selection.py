@@ -28,6 +28,7 @@ from tools.ci_selection import (  # noqa: I001
     duration_issues, TESTS_DIR, WATCHDOG_HEADROOM, WATCHDOG_CEILING_MIN,
 )
 from tools import mergify_config_guard as mcg
+from tools import ci_selection as cs
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -411,6 +412,187 @@ def test_unknown_path_goes_full():
     # under-select (new top-level dir/subsystem → full matrix)
     r = _sel(["mystery-dir/x.py"])
     assert r["full"] is True
+
+
+def test_root_level_non_python_files_skip_the_matrix():
+    """#6784: an EXPLICIT root-level allowlist skips the matrix.
+
+    Before this, a ROOT path matched no NON_PYTHON_PREFIXES entry, fell to the
+    unknown-path branch, and reserved the FULL matrix (every shard slot) for a
+    prose edit. The names are hard-coded here, NOT read from the module
+    constant: emptying the allowlist must RED this test, which it cannot do if
+    the assertion derives its expectation from the same set it is checking.
+
+    ⛔ This set is the ZERO-READER census only, and it is much smaller than the
+    change's first two revisions: every root file that a test reads KEEPS the
+    fail-closed full matrix (see `test_root_file_read_by_a_test_is_never_allowlisted`).
+    """
+    allowlisted = (".scope-1894.md", ".scope-comment-2578.md", "pr-body.md")
+    for name in allowlisted:
+        r = _sel([name])
+        assert r["full"] is False, f"{name} must skip the matrix, got {r}"
+        assert r["surfaces"] == [], name
+        assert set(r["test_files"]) == _tier1(), name
+
+
+def test_every_allowlisted_root_file_actually_exists():
+    """#6784 review cycle 2, P3: a liveness ratchet on the allowlist.
+
+    `SOURCE_PATTERNS` has an equivalent ratchet (`test_source_patterns_all_name_
+    something_real`). Without one, a name that does not exist in the tree is a
+    dead entry that skips the matrix for nothing — which is exactly how the
+    previous revision passed its own tests while changing NO existing file's
+    behaviour (its four names were all absent on disk, so #6784's headline case
+    was still unfixed and the review had to catch it by hand).
+    """
+    for name in sorted(cs.ROOT_NON_PYTHON_FILES):
+        assert (REPO / name).exists(), (
+            f"{name} is allowlisted but does not exist in the tree — a dead "
+            "entry that skips the matrix for nothing")
+
+
+# Files that only NAME the census/members rather than reading them: the census
+# module quotes it, and this test file hard-codes the members.
+_SELF_NAMERS = frozenset({"tools/ci_selection.py", "tests/test_ci_selection.py"})
+
+
+def _readers_of(name: str) -> list[str]:
+    """Non-self files under tests/tools/scripts/.github/tortoise naming `name`.
+
+    ⛔ `scripts/` carries a TRAILING SLASH deliberately: `scripts` is a tracked
+    SYMLINK, and BSD grep does not descend a symlinked directory named without
+    one — so `grep -rlF <n> tests tools scripts .github tortoise` silently
+    searches NOTHING under scripts/ on macOS (0 hits vs 72 for the same dir with
+    the slash). The census numbers are only reproducible with the slash.
+
+    SCOPE: a LITERAL-NAME grep. It does not see a reader that finds `name` by
+    GLOB or directory walk, nor one outside these five roots.
+    """
+    out = subprocess.run(
+        ["grep", "-rlF", name, "tests", "tools", "scripts/", ".github",
+         "tortoise"],
+        cwd=REPO, capture_output=True, text=True).stdout.split("\n")
+    return sorted(h for h in (x.strip() for x in out)
+                  if h and h not in _SELF_NAMERS and not h.endswith(".pyc"))
+
+
+def test_no_allowlisted_root_file_has_a_reader():
+    """#6784 review cycle 3 P2: derive the readers, do not list the names.
+
+    The earlier guard was a hard-coded 11-name list, so it only defended names
+    someone had thought of. Measured counterexamples: adding `.env.example` or
+    `fly.toml` left the whole suite GREEN while silently skipping guards — the
+    exact class this allowlist exists to prevent.
+
+    ⛔ SCOPE — do not read this as "any future member whose file something reads
+    will fail here" (review cycle 4, P2 falsified exactly that phrasing). This
+    catches a LITERAL-NAME reader under `tests tools scripts/ .github tortoise`.
+    A reader that GLOBS for the file (`REPO.glob("*.md")`), or that lives
+    outside those roots (e.g. `docs/`), is NOT caught — both were demonstrated
+    GREEN against this test. Before adding a member, grep the WHOLE tree.
+    """
+    offenders = {name: _readers_of(name) for name in sorted(cs.ROOT_NON_PYTHON_FILES)
+                 if _readers_of(name)}
+    assert not offenders, (
+        "allowlisted root file(s) are READ by the listed files — allowlisting them "
+        f"makes those guards skip on exactly the PR that edits the file: {offenders}")
+
+
+def test_allowlist_members_are_real_root_level_files():
+    """Companion to the invariant above: every member must be a ROOT-LEVEL
+    tracked file, so the census is about real paths, not invented ones."""
+    roots = subprocess.run(["git", "ls-files"], cwd=REPO,
+                           capture_output=True, text=True).stdout.split("\n")
+    root_set = {f for f in roots if f and "/" not in f}
+    for name in sorted(cs.ROOT_NON_PYTHON_FILES):
+        assert name in root_set, (
+            f"{name} is allowlisted but is not a root-level tracked file in this tree")
+
+
+def test_root_file_read_by_a_test_is_never_allowlisted():
+    """#6784 review cycle 1 P1 + cycle 2 P1: a file a test READS is not "not
+    python-relevant".
+
+    `tests/test_embedded_durability_claim.py` reads `ROOT/README.md` and asserts
+    its durability claim, and it is `core`+carve-out (NOT tier1) — so allowlisting
+    README.md made that guard skip on exactly the PR that edits it. The census is
+    published on issue #6784 (method: `grep -rlF "<name>" tests tools scripts/
+    .github tortoise`, excluding both ci_selection files, which only name or quote
+    the census) rather than duplicated here, because a duplicated number is a
+    claim that re-stales: an earlier revision of this docstring cited
+    `.env.example` as 16 readers when the method yields 15.
+
+    This is the explicit spot-check for the files that matter most; the rule
+    itself is pinned by `test_no_allowlisted_root_file_has_a_reader`. It REDs if
+    the removed blanket `*.md`-at-root clause is reintroduced (it admitted
+    README.md).
+    """
+    for name in ("README.md", "AGENTS.md", "CHANGELOG.md", "CONTRIBUTING.md",
+                 "LICENSE", "MEMORY.md", "CLAUDE.md", "index.md",
+                 ".gitignore", ".env.example", "fly.toml", "pyproject.toml",
+                 ".python-version"):
+        r = _sel([name])
+        assert r["full"] is True, (
+            f"{name} is read by a test — it must keep the fail-closed FULL "
+            f"matrix, got {r}")
+        assert r["test_files"] == "ALL", name
+    # `*.md` at the root is NOT blanket-safe: only explicitly named files are.
+    r_md = _sel(["NOTES.md"])
+    assert r_md["full"] is True, "root *.md must fail closed, not blanket-skip"
+    assert r_md["test_files"] == "ALL"
+
+
+def test_a_claimed_root_file_beats_the_allowlist(monkeypatch):
+    """#6784 review P2: the allowlist is a FALLBACK, never a short-circuit.
+
+    An earlier revision tested `_is_safe_root_file` FIRST, so listing a file in
+    SOURCE_PATTERNS or CORE_ALSO — the repo's own documented remedy for "the
+    guard for file X never runs when X changes" (#6138 review P1) — could no
+    longer rescue it. Here a root-allowlisted name is CLAIMED via CORE_ALSO and
+    must therefore stay selected.
+    """
+    claimed = ".scope-1894.md"
+    assert _sel([claimed])["full"] is False, "precondition: unclaimed → skip"
+    monkeypatch.setattr(cs, "CORE_ALSO", (*cs.CORE_ALSO, claimed))
+    r = _sel([claimed])
+    assert r["full"] is False, f"a claimed path must not become full: {r}"
+    assert r["surfaces"] == ["core"], (
+        f"a claimed root file must be KEPT and select its surface, got {r}")
+
+
+def test_root_build_files_still_select_the_full_matrix():
+    """Fail-closed must be PRESERVED: the root allowlist is NOT "root-level
+    and no extension ⇒ safe" (that would admit Makefile/Dockerfile/build.sh)
+    and NOT "any non-python extension ⇒ safe". Each of these remains
+    code-relevant and must keep the FULL matrix."""
+    for name in ("Makefile", "Dockerfile", "pyproject.toml", "uv.lock",
+                 ".python-version", "requirements.txt", "conftest.py",
+                 "setup.py"):
+        r = _sel([name])
+        assert r["full"] is True, f"{name} must fail closed to full, got {r}"
+        assert r["test_files"] == "ALL", name
+
+
+def test_unknown_root_file_still_selects_the_full_matrix():
+    """An unknown ROOT-level path must still hit the fail-closed default:
+    the allowlist is additive, it does not soften the unknown-path branch.
+    (Reds if that fall-through defaults to skip instead of full.)"""
+    for name in ("build.sh", "some_new_thing.xyz", "mystery.conf"):
+        r = _sel([name])
+        assert r["full"] is True, f"{name} must fail closed to full, got {r}"
+        assert r["test_files"] == "ALL", name
+
+
+def test_subdirectory_markdown_is_unaffected():
+    """The root rule must not become "any *.md anywhere": `docs/x.md` keeps
+    its NON_PYTHON_PREFIXES skip, and `tortoise/NOTES.md` keeps the `tortoise/`
+    core fallback — it must NOT become a matrix skip by accident."""
+    r_docs = _sel(["docs/x.md"])
+    assert r_docs["full"] is False
+    assert r_docs["surfaces"] == []
+    r_tortoise = _sel(["tortoise/NOTES.md"])
+    assert r_tortoise["full"] is False
+    assert r_tortoise["surfaces"] == ["core"]
 
 
 def test_new_engine_module_maps_to_core():
