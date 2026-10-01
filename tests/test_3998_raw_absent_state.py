@@ -874,8 +874,14 @@ def test_a_multi_source_point_prefers_the_source_that_has_an_entity(sdk):
     ``entity=None`` and HID the entity-bearing source the pre-change required-hop
     query returned.
 
-    (1) FAILS if the query keeps ``OPTIONAL MATCH`` + ``LIMIT 1`` with no
-        ordering: the entity-less source wins and ``entity`` comes back ``None``.
+    (1) FAILS if the entity-bearing source is HIDDEN. Under the branch's
+        pre-#5199 query (`OPTIONAL MATCH` + `LIMIT 1` with no ordering) the
+        entity-less source won and the chain reported it alone. `origin/main`
+        (#5199) now returns ONE ROW PER LINK, so the shape is two rows and the
+        falsifier is that the entity-bearing source's row must be PRESENT and
+        must LEAD (`ref IS NULL` sorts a resolved reference ahead of the
+        self-terminal fallback), and the fallback row's `entity` is the source
+        itself (the `coalesce`), never `None`.
     (2) REACHABLE: the fixture builds that exact shape — an entity-less source
         linked first, then an entity-bearing one — so both rows exist to choose
         between.
@@ -891,11 +897,21 @@ def test_a_multi_source_point_prefers_the_source_that_has_an_entity(sdk):
         params={"p": pid, "u": second},
     )
     chain = s.get_provenance_chain(pid)
-    assert len(chain) == 1, chain
+    # #5199 (now on main): ONE ROW PER LINK — a Point with two sources yields
+    # two rows, not one. The regression this test pins is unchanged in
+    # substance: the entity-bearing source must not be HIDDEN behind the
+    # entity-less one, so its row must be present AND lead (`ref IS NULL` sorts
+    # a resolved reference ahead of the self-terminal fallback).
+    assert len(chain) == 2, chain
     assert chain[0]["entity"] is not None, (
         "the entity-bearing source was hidden behind an entity-less one"
     )
     assert chain[0]["labels"], "labels must accompany the entity"
+    assert "Object" in chain[0]["labels"], chain[0]["labels"]
+    assert "Source" in chain[1]["labels"], chain[1]["labels"]
+    assert chain[1]["entity"] is not None, (
+        "the self-terminal fallback row returns the source itself, never None"
+    )
 
 
 def test_index_entry_shape_carries_no_payload_field():

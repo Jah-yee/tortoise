@@ -1278,7 +1278,13 @@ _SERVER_MANAGED_PROPS = frozenset({  # #3947: envelope capture directive (not a 
     # tenant could `rawState=None` to CLEAR a recorded absence — silently
     # resurrecting a raw the record says is gone — or persist an unvalidated
     # `rawState='banana'`.
-    "rawState", "rawStateAt", "raw_state"})
+    "rawState", "rawStateAt", "raw_state",
+    # #5256: the `extractedFrom` READ-VERSION anchor and its Point node carrier
+    # are server-derived (read from the :Source on the live path and carried in
+    # the Point's journaled snapshot). A tenant setting either would forge
+    # provenance and break live/replay parity. Rejected on ALL spellings, at
+    # this boundary AND in `sdk._sanitize_props` (the fail-closed backstop).
+    "sourceVersion", "sourceVersions", "sourceVersionTransit"})
 
 
 # #2600: client-supplied actor claims are STRIP-AND-IGNORE (never a 4xx —
