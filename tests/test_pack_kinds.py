@@ -1255,6 +1255,16 @@ def _ontology_object_kinds() -> set[str]:
     text = (REPO_ROOT / "docs" / "ONTOLOGY.md").read_text(encoding="utf-8")
     section = text.split(_OBJECT_KIND_SECTION, 1)[1]
     block = section.split("```", 2)[1]
+    # The opening fence's first line is its INFO STRING (a language tag such as
+    # `text`), not vocabulary — Markdown metadata. `split("```", 2)[1]` returns it
+    # as part of the block, so a tagged fence contributed a phantom kind named
+    # after its tag and the three-way diff fired. #6927's MD040 lint fix added
+    # `text` to that fence and exposed this. Drop the line for ANY tag rather
+    # than special-casing `text`: a bare fence yields an EMPTY first line here, so
+    # this is correct for both forms (and for whatever tag the linter asks for
+    # next). Never strip content — only the fence line itself.
+    if "\n" in block:
+        block = block.split("\n", 1)[1]
     kinds: set[str] = set()
     for line in block.splitlines():
         line = line.split("#", 1)[0]
