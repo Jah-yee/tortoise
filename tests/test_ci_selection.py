@@ -803,6 +803,27 @@ def test_tmpdir_sweep_tool_change_selects_core_not_tier1():
     assert set(r["test_files"]) != _tier1()
 
 
+def test_queue_resweep_tool_change_selects_core_not_tier1():
+    # tools/queue_resweep.py owns tests/test_queue_resweep.py (82 hermetic cases
+    # pinning dry-run-by-default, the never-touch-a-queued-PR rule, and the
+    # artifact-not-the-send verification).
+    #
+    # Before its CORE_ALSO entry this was the #3261 silent-drop class: `tools/`
+    # is a flat NON_PYTHON_PREFIXES entry, so a tools-only change came back with
+    # `changed == []` and took the docs-only early return — `select()` returned
+    # NO surface, and the guard never ran on the file it guards. Measured before
+    # the fix: `_sel(["tools/queue_resweep.py"])` -> surfaces=[], full=False,
+    # test_queue_resweep.py absent.
+    #
+    # CORE_ALSO (not TOOL_CARVEOUTS) is the deliberate choice: the guard is
+    # hermetic and sub-second, so selecting `core` runs it at the lowest CI cost.
+    # Mutation check: removing the CORE_ALSO entry fails assert 2 below.
+    r = _sel(["tools/queue_resweep.py"])
+    assert "core" in r["surfaces"], r
+    assert "test_queue_resweep.py" in r["test_files"], r
+    assert r["full"] is False, r
+
+
 def test_queue_conflict_census_tool_change_selects_core_not_tier1():
     # #6138 review P1: tools/queue_conflict_census.py owns
     # tests/test_queue_conflict_census.py (`core`). Without the CORE_ALSO entry
@@ -814,6 +835,22 @@ def test_queue_conflict_census_tool_change_selects_core_not_tier1():
     assert r["full"] is False, r
     assert "core" in r["surfaces"], r
     assert "test_queue_conflict_census.py" in r["test_files"], r
+    assert set(r["test_files"]) != _tier1()
+
+
+def test_drift_guard_tool_change_selects_core_not_tier1():
+    # #4174 review P1: tools/drift-guard.py owns tests/test_drift_guard.py. The
+    # flat "tools/" NON_PYTHON_PREFIXES entry swallowed the path, so a
+    # guard-only change selected NO surface and fell back to tier-1 smoke — the
+    # suite pinning the guard never ran on the PR that changed the guard. Same
+    # silent-drop class as #4069 above, and the same defect #4174 describes a
+    # gate having. Mutation check: removing the CORE_ALSO entry filters the path
+    # out (docs-only early return → empty surfaces, tier-1 smoke) and fails
+    # every assert below.
+    r = _sel(["tools/drift-guard.py"])
+    assert r["full"] is False, r
+    assert "core" in r["surfaces"], r
+    assert "test_drift_guard.py" in r["test_files"], r
     assert set(r["test_files"]) != _tier1()
 
 
@@ -1268,8 +1305,9 @@ def test_register_already_present_in_surface_is_reported_noop(capsys):
 
 def test_duplicate_entries_reports_same_surface_repeats():
     """#2913: a same-surface duplicate is invisible to select() (it unions
-    surfaces) and to integrity() (it only asks "classified?") — the new
-    duplicate_entries() check surfaces it for the --integrity note."""
+    surfaces) and to integrity() (it only asks "classified?") — duplicate_entries()
+    surfaces it, and since #5373 it FAILS `--integrity` (a union-merged registry
+    would otherwise absorb it silently)."""
     from tools.ci_selection import duplicate_entries
     m = {"surfaces": {"core": ["test_a.py", "test_a.py", "test_b.py"],
                       "api": ["test_a.py"]}}
@@ -1283,6 +1321,37 @@ def test_duplicate_entries_reports_same_surface_repeats():
     ) == ["core: test_a.py"]
     # a value that is None (empty surface block) must not raise
     assert duplicate_entries({"surfaces": {"core": None}}) == []
+
+
+def test_integrity_reddens_on_a_duplicate_entry(monkeypatch, capsys):
+    """#5373: a duplicate entry must FAIL `--integrity`, not print a note.
+
+    `config/ci-surfaces.yml` carries `merge=union`, which keeps BOTH sides' lines for
+    a conflicting hunk — so a same-surface duplicate is the exact shape union emits
+    when two lanes register the same test. It used to be a ⚠️ note; a note on a
+    union-merged registry lets the duplicate in silently.
+    """
+    import tools.ci_selection as cs
+
+    manifest = {"surfaces": {"core": ["test_a.py", "test_a.py"]}}
+    monkeypatch.setattr(cs, "load_manifest", lambda: manifest)
+    # All the OTHER integrity legs are neutralised so the duplicate is the only
+    # possible cause of the non-zero exit; each is a pure function of the manifest.
+    for leg in ("integrity", "slow_file_issues", "duration_issues",
+                "leg_coverage_issues", "duration_coverage_issues",
+                "workflow_matrix_issues"):
+        monkeypatch.setattr(cs, leg, lambda *a, **k: [])
+    # #6135: `push_legs` now returns `{"shards": [...]}` (N shards), not the old
+    # `half_a`/`half_b` pair — the stub below matches the CURRENT contract so the
+    # duplicate remains the only possible cause of the non-zero exit.
+    monkeypatch.setattr(cs, "push_legs", lambda *a, **k: {"shards": []})
+    monkeypatch.setattr(cs, "workflow_halves_issues", lambda *a, **k: [])
+    monkeypatch.setattr(cs, "fast_files_absent_from_halves", lambda *a, **k: [])
+    monkeypatch.setattr(sys, "argv", ["ci_selection.py", "--integrity"])
+
+    rc = cs.main()
+    assert rc == 1, "a duplicate same-surface entry must redden --integrity"
+    assert "core: test_a.py" in capsys.readouterr().out
 
 
 # ── #1266: matrix halves ↔ manifest consistency ──────────────────────────
@@ -1366,6 +1435,32 @@ def test_halves_imbalance_within_tolerance_clean():
     halves = {"a": ["test_api", "test_auth"], "b": ["test_crypto", "test_api"]}
     issues = workflow_halves_issues(_halves_manifest(), halves)
     assert not any("imbalanced" in i for i in issues), issues
+
+
+def test_halves_ratio_decides_at_the_published_precision():
+    """#6145, same root as the watchdog gate: this check compared the EXACT
+    ratio and then rendered both operands at 2 dp, so a fire inside
+    (1.25, 1.255) printed "ratio 1.25x, tolerance 1.25x" — a diagnosis that
+    reads as compliant while the check refuses, the very contradiction the
+    #6145 change removes next door. The ratio is now decided at the precision it
+    publishes, so no message can print a value that reads as within tolerance.
+    """
+    from tools.ci_selection import HALF_DURATION_IMBALANCE_RATIO, workflow_halves_issues
+    halves = {"a": ["test_api"], "b": ["test_auth", "test_crypto"]}
+    # 1250.4 / 1000 = 1.2504 -> prints 1.25 -> INSIDE tolerance, so it must pass
+    # (under the old exact comparison this fired with a 1.25x-vs-1.25x message).
+    inside = _halves_manifest()
+    inside["durations"] = {"test_api.py": 1000.0, "test_auth.py": 1000.0,
+                           "test_crypto.py": 250.4}
+    assert not any("imbalanced" in i
+                   for i in workflow_halves_issues(inside, halves))
+    # 1256.0 / 1000 = 1.256 -> prints 1.26 -> still refused.
+    beyond = _halves_manifest()
+    beyond["durations"] = {"test_api.py": 1000.0, "test_auth.py": 1000.0,
+                           "test_crypto.py": 256.0}
+    assert any("imbalanced" in i
+               for i in workflow_halves_issues(beyond, halves))
+    assert HALF_DURATION_IMBALANCE_RATIO == 1.25
 
 
 def test_fast_files_absent_from_halves_reports_coverage_hole():
@@ -1580,6 +1675,18 @@ def test_every_file_rides_exactly_one_shard_at_s_greater_than_two():
     assert len({e["half"] for e in inc}) == 5
     assert [e["half"] for e in inc] == ["a", "b", "c", "d", "e"]
     assert sum(len(e["files"].split()) for e in inc) == len(flat)
+    # #6145: the emitted headroom is this change's only new OUTPUT — the whole
+    # feature is "the margin a leg actually got is visible" — and it had NO
+    # assertion: deleting the key from `fast_matrix_include` left all 221 tests
+    # green (measured) while silently removing the feature. Pin it per entry
+    # against the shard value it reports, so the emitter and the shard dict
+    # cannot drift, and require it to be a real margin.
+    from tools.ci_selection import WATCHDOG_HEADROOM
+    for s, e in zip(legs["shards"], inc, strict=True):
+        assert "watchdog_headroom" in e, \
+            f"the emitted matrix must carry the headroom (#6145): {e['half']}"
+        assert e["watchdog_headroom"] == s["watchdog_headroom"], (e, s)
+        assert e["watchdog_headroom"] >= WATCHDOG_HEADROOM, (e, s)
 
 
 def test_shard_labels_are_a_superset_when_s_changes():
@@ -1633,6 +1740,158 @@ def test_watchdog_is_per_shard_and_scales_with_the_shard():
     # inside math.ceil
     for bad in (None, "nonsense", float("inf"), float("nan"), float("-inf"), -5):
         assert shard_watchdog_minutes(bad) == WATCHDOG_FLOOR_MIN, bad
+
+
+def test_a_shard_merely_slow_under_load_still_fits_its_budget():
+    """#6145 direction (a): a shard that runs SLOW under load must still fit.
+
+    The budget is built from `WATCHDOG_HEADROOM`, so the question this test asks
+    is whether that factor is still above the slowest width a healthy shard has
+    actually been observed to occupy. If it were not, the watchdog would kill a
+    shard that observed no defect — the whole defect #6145 names.
+
+    MEASURED — pytest-STEP duration of all nine fast shards, 76 SUCCESSFUL leg
+    samples drawn from main runs 2026-10-02T01:19Z-03:22Z, each over that shard's
+    declared 7.22-min estimate: min 0.47x, median 0.86x, MAX 1.33x.
+
+    ⛔ THE SAMPLE IS SUCCESS-ONLY, DELIBERATELY, AND ITS LIMIT IS NAMED. A killed
+    leg is excluded because a kill is not a "merely slow" observation — it is the
+    event this budget exists to bound, and it is not what this assertion is
+    about. For the record, the kills in that window and the day after were at
+    ~2.11x (legs SIGKILLed at the 15m floor with 0 failures), and the SAME shards
+    ran 0.9x-1.2x on another attempt of that run — a nondeterministic wedge
+    beyond this distribution, not a tail of it. So this bounds the SUCCESSFUL
+    distribution; it does NOT claim the budget survives every loaded leg, and
+    #6145 carries that half. The value
+    that must survive is the MAX (the median is what a healthy shard costs).
+    A job's WALL time is deliberately NOT the measurement: it carries ~6 min of
+    setup plus the off-watchdog collect-only pre-phase, so it overstates the
+    shard by roughly the setup constant — the pytest step is the only surface
+    the watchdog actually bounds, hence the only comparable one.
+    """
+    from tools.ci_selection import (
+        WATCHDOG_HEADROOM,
+        load_manifest,
+        push_legs,
+        watchdog_headroom_issues,
+    )
+    # The slowest healthy shard measured. A frozen literal is right HERE, unlike
+    # the derived floor below: this is an observation about runs that have
+    # already happened, not a property of the committed manifest, so there is
+    # nothing in-tree to re-derive it from. It is re-measured by hand when the
+    # pool changes materially (the durations map's own sweep is the trigger).
+    measured_max_healthy_shard_ratio = 1.33
+    assert measured_max_healthy_shard_ratio < WATCHDOG_HEADROOM, (
+        "the worst HEALTHY shard measured is already outside the factor the "
+        "budget is built from — the margin no longer covers even the "
+        "successful distribution, and the constant must be raised "
+        "DELIBERATELY (#6145)")
+    # The shipped gate's OWN verdict on the committed manifest is the primary
+    # assertion, so this test cannot disagree with the gate at either end of the
+    # reporting quantum (#6145). The loop below is a readable restatement for a
+    # non-empty leg, not a second, differently-precise gate.
+    committed = load_manifest()
+    assert watchdog_headroom_issues(committed) == [], watchdog_headroom_issues(committed)
+    for s in push_legs(committed)["shards"]:
+        headroom = s["watchdog_minutes"] * 60.0 / s["est_seconds"]
+        assert headroom >= measured_max_healthy_shard_ratio, (
+            f"shard {s['name']}: {headroom:.2f}x is below the slowest healthy "
+            f"shard measured ({measured_max_healthy_shard_ratio}x) — a merely "
+            f"slow shard would be killed")
+        # The shipped gate's own invariant, asserted on the value the matrix
+        # PUBLISHES (2 dp) rather than on a second, differently-precise
+        # recomputation: otherwise this test and the gate could disagree in the
+        # band where rounding decides — a manifest could pass `--integrity` and
+        # then red here (#6145).
+        assert s["watchdog_headroom"] >= WATCHDOG_HEADROOM, (
+            f"shard {s['name']}: emitted budget retains "
+            f"{s['watchdog_headroom']:.2f}x, below the {WATCHDOG_HEADROOM}x it "
+            f"is built from (#6145)")
+
+
+def test_a_shard_that_cannot_fit_its_budget_is_named_not_silently_killed():
+    """#6145 direction (b): the sizing contract — "a shard unable to fit is
+    flagged rather than silently killed". #4819 option 2 recorded this as the
+    thing nothing checked: "the watchdog value and the shard count — nothing
+    checks that [they are consistent]".
+
+    The CEILING is what makes a shard unable to fit: it clamps the built factor
+    (2.0x) DOWNWARD. Before this check the clamp was silent, so raising an
+    estimate produced a TIGHTER margin with no signal anywhere — the state in
+    which a shard that fits its own declared estimate is killed.
+    """
+    from tools.ci_selection import (
+        WATCHDOG_CEILING_MIN,
+        WATCHDOG_HEADROOM,
+        load_manifest,
+        push_legs,
+        shard_watchdog_minutes,
+        watchdog_headroom_issues,
+    )
+    # (a) the committed manifest is consistent: nothing named, and every leg's
+    #     emitted budget retains the factor it was built from.
+    committed = load_manifest()
+    assert watchdog_headroom_issues(committed) == []
+    for s in push_legs(committed)["shards"]:
+        assert s["watchdog_headroom"] >= WATCHDOG_HEADROOM, s
+    # (b) an estimate past the ceiling's reach is NAMED (fail-closed). 30.62 min
+    #     is the ceiling's OWN provenance exemplar ("55m for a ~30m shard",
+    #     factor 1.8 — the constants block): ceil(30.62*2)=62 -> clamped to 55 =
+    #     1.80x, BELOW the factor the budget was built from. (The real S=2 shape
+    #     is heavier still — the probe that lowered fast_shards to 2 measured
+    #     est=1951.0s = 32.52 min at 1.69x — so this exemplar is the gentler of
+    #     the two, not a best case.)
+    assert shard_watchdog_minutes(30.62 * 60) == WATCHDOG_CEILING_MIN == 55
+    m = _shard_manifest(2, heavy={"test_huge_a.py": 1837.2,
+                                  "test_huge_b.py": 1837.2})
+    issues = watchdog_headroom_issues(m)
+    assert issues, "a shard the ceiling clamps below the build factor must be NAMED"
+    assert any("its emitted budget retains" in i for i in issues), issues
+    assert any("ceiling clamped it" in i for i in issues), issues
+    # (d) the decision is taken at the PUBLISHED precision (2 dp — the same
+    #     rounding the emitters apply), so a manifest is never refused while the
+    #     row it would emit reads a compliant `2.0`, and the message never says
+    #     "2.00x, below the 2.0x". 1651.0s = 27.5167 min -> 55/27.5167 = 1.9988,
+    #     which ROUNDS to 2.0 and must therefore pass; 1660.0s = 27.6667 min ->
+    #     1.9880 -> 1.99 and must still be refused. `tiny=0` keeps the shard's
+    #     estimate exactly the heavy file's duration.
+    edge = _shard_manifest(1, heavy={"test_edge.py": 1651.0}, tiny=0)
+    assert watchdog_headroom_issues(edge) == [], watchdog_headroom_issues(edge)
+    past = _shard_manifest(1, heavy={"test_past.py": 1660.0}, tiny=0)
+    assert watchdog_headroom_issues(past), "1.99x must still be refused"
+    # (e) the OTHER end of the same quantum. A ratio below 0.005 rounds to 0.00,
+    #     which is also `watchdog_headroom`'s "no usable estimate" sentinel — so
+    #     a guard testing the ROUNDED value for truthiness FAILS OPEN here: it
+    #     skips the leg and publishes `0.00` on a row it passed. The sentinel is
+    #     therefore read from the UNROUNDED ratio, and a leg this far past the
+    #     ceiling is still NAMED. 844400.0s = 14073.3 min -> 55/14073.3 = 0.0039
+    #     -> rounds to 0.0.
+    collapsed = _shard_manifest(1, heavy={"test_collapsed.py": 844400.0},
+                               tiny=0)
+    assert watchdog_headroom_issues(collapsed), (
+        "a ratio that rounds to 0.00 is a mis-sized leg, not an absent estimate")
+    # and the sentinel itself is NOT a finding: a leg with no estimate has no
+    # ratio to judge (an empty leg is not over-tight).
+    empty = _shard_manifest(1, tiny=0)
+    assert watchdog_headroom_issues(empty) == [], watchdog_headroom_issues(empty)
+    # (c) a genuinely wedged leg is STILL KILLED. The check makes an over-tight
+    #     budget visible; it does not widen it and it does not disarm the kill —
+    #     the emitted budget is unchanged, and the workflow still applies it with
+    #     a SIGINT-then-SIGKILL escalation, so a leg that hangs past its budget
+    #     is still terminated (and the outer job cap still bounds the total).
+    #     Read the PARSED run step, never the file text: the identical string
+    #     also sits in heading COMMENTs (and with literal durations in other
+    #     steps), so a whole-file scan stays green if the real execution line is
+    #     deleted — an assertion that can pass on a comment does not guard what
+    #     its message claims.
+    for s in push_legs(m)["shards"]:
+        assert s["watchdog_minutes"] == WATCHDOG_CEILING_MIN, s
+    wf = _load_python_ci()
+    run = next(s for s in wf["jobs"]["test"]["steps"]
+               if s.get("name", "").startswith("Run fast test suite"))["run"]
+    assert "timeout -s INT -k 10 ${{ matrix.watchdog_minutes }}m" in run, (
+        "the per-shard kill must stay wired: without it a wedged leg runs to the "
+        "job's outer cap and the budget is advisory")
 
 
 def test_fast_shard_config_is_validated_not_silently_defaulted():
@@ -2287,8 +2546,8 @@ def test_carve_out_job_uri_unset_with_carve_out_flag():
 #     MISSING cap (test-track-b before #3239) leaves GitHub's 360m default:
 #     six hours of held slot instead of the 90m the issue reports.
 #   * PROPORTION: the cap clears the measured work with `WATCHDOG_HEADROOM`
-#     (#6135's validated 2.0x factor, reused rather than invented) and is not
-#     an order of magnitude above it.
+#     (#6135's 2.0x factor, reused rather than invented — the constants block
+#     owns its provenance) and is not an order of magnitude above it.
 #
 # The work is MEASURED, not asserted: Actions API on the 60 newest completed
 # python-ci.yml runs, `started_at`→`completed_at` on the pytest step
@@ -2570,15 +2829,114 @@ def test_a_matrix_job_never_uploads_a_fixed_name_artifact():
         + "; ".join(offenders))
 
 
+def test_workflow_lint_pins_the_actionlint_image_and_its_scope():
+    """Pin the `workflow-lint` step's body.
+
+    The plumbing guards (needs/LEGS) prove the leg is wired in; they cannot
+    see its body. Without this pin the step can be replaced with `echo ok`,
+    the image unpinned to `:latest`, the `*.yaml` glob dropped, or the
+    empty-match refusal deleted, and every test stays green while the leg
+    stops being a check — the same fail-open shape #6253 is about.
+    """
+    job = _load_python_ci()["jobs"]["workflow-lint"]
+    raw = "\n".join(
+        str(step.get("run") or "") for step in job.get("steps") or []
+    )
+    # Every assertion below targets EXECUTABLE-looking text: `#`-comment lines
+    # are stripped, shell line-continuations are joined, and the invocation is
+    # pinned STRUCTURALLY, which closes the specific no-op the earlier revision
+    # let through (a commented-out body carrying `actionlint:1.7.12
+    # -shellcheck= *.yaml` plus the copied empty-match block).
+    #
+    # WHAT THIS DOES NOT GUARANTEE, stated because the limit is real: a static
+    # regex over a `run:` scalar can prove the command is WRITTEN, never that it
+    # EXECUTES. A body that prints the script from a quoted heredoc, or that
+    # exits 0 before reaching it, still satisfies every assertion below. This is
+    # therefore a TRIPWIRE against the realistic no-op replacements (deleting
+    # the step's work, commenting it out, unpinning the image, dropping the
+    # `*.yaml` glob or the empty-match refusal) — not proof of execution. Real
+    # proof needs a runtime positive control in the step itself (lint a
+    # deliberately malformed temp workflow and assert actionlint exits
+    # non-zero), which is a change to the leg, not to this test.
+    runs = "\n".join(
+        line for line in raw.splitlines() if not line.lstrip().startswith("#")
+    )
+    # Join shell line-continuations so a command split across lines (the
+    # `docker run … \` + `  rhysd/actionlint:…` form) is matched as ONE command.
+    joined = re.sub(r"\\\n\s*", " ", runs)
+    assert re.search(
+        r"(?m)^\s*docker\s+run\b[^\n]*\brhysd/actionlint"
+        r"(?::\d+\.\d+\.\d+(?:@sha256:[0-9a-f]{64})?|@sha256:[0-9a-f]{64})\b"
+        r"[^\n]*-shellcheck=",
+        joined,
+    ), (
+        "workflow-lint no longer executes `docker run … rhysd/actionlint:<pinned> "
+        "-shellcheck=` on a non-comment line: a body that only MENTIONS those "
+        "tokens would satisfy a presence check while linting nothing (#6253)"
+    )
+    assert "actionlint" in runs, (
+        "workflow-lint no longer invokes actionlint — the leg would certify "
+        "nothing while still reporting green (#6253)"
+    )
+    tags = re.findall(r"actionlint:(\S+)", runs)
+    digest_only = re.search(r"actionlint@sha256:[0-9a-f]{64}\b", runs)
+    assert tags or digest_only, (
+        "workflow-lint does not pin the actionlint image by tag or digest"
+    )
+    for tag in tags:
+        # A digest pin (`tag@sha256:…`) is STRONGER than a tag pin and is the
+        # supply-chain-correct form, so it must pass this check too. A
+        # digest-ONLY reference carries no `tag:` at all and is matched above.
+        assert re.fullmatch(r"\d+\.\d+\.\d+(?:@sha256:[0-9a-f]{64})?", tag), (
+            f"actionlint image must be pinned to major.minor.patch, got {tag!r} "
+            "— a floating tag re-opens the unpinned-dependency class (#5440)"
+        )
+    assert "-shellcheck=" in runs, (
+        "the actionlint invocation must set -shellcheck= explicitly: the pinned "
+        "image bundles shellcheck, so defaulting it on would add this tree's "
+        "shellcheck findings to the required gate"
+    )
+    assert "*.yaml" in runs, (
+        "workflow-lint globs only *.yml; GitHub loads workflows with either "
+        "extension, so a .yaml workflow would be silently unlinted"
+    )
+    # The empty-match refusal is asserted STRUCTURALLY, not by looking for two
+    # loose substrings: a substring pin is satisfied by commenting the body out.
+    assert re.search(
+        r"if\s+\[\s*\$\{#files\[@\]\}\s*-eq\s+0\s*\]\s*;\s*then\s*\n"
+        r"\s*echo\s+\S.*\n"
+        r"\s*exit\s+1\s*\n"
+        r"\s*fi\b",
+        runs,
+    ), (
+        "workflow-lint no longer refuses an EMPTY match: an unmatched glob "
+        "would lint nothing and report success over an empty surface"
+    )
+    # `$files` unquoted was a real SC2086 this leg introduced into a tree whose
+    # other shellcheck findings are pre-existing. The array form keeps it fixed.
+    assert '"${files[@]}"' in runs, (
+        "workflow-lint must expand the glob array quoted (\"${files[@]}\"); a "
+        "bare `$files` is a new SC2086 in a tree pinned to -shellcheck="
+    )
+
+
 def _extract_pytest_marker(run_script: str) -> str:
-    """Pull the `-m <marker>` filter from a job's pytest run script. The
+    """Pull the `-m <marker>` filter from a job's GATING pytest run. The
     docker lanes quote it (`-m 'not track_b and not live'`); the track-b
     job's is bare (`-m track_b`). The launcher's own `python -m pytest`
-    module form is never a marker — the unquoted fallback skips 'pytest'."""
-    quoted = _re.search(r"-m '([^']+)'", run_script)
+    module form is never a marker — the unquoted fallback skips 'pytest'.
+
+    #6142: the `test` job now has a SECOND pytest invocation — the last-failed
+    pre-phase, whose junit is /tmp/junit-lf.xml. Scanning the whole script
+    silently retargets this pin to the pre-phase (the same class of bug fixed
+    in tests/test_skip_guard.py), so the pre-phase line is dropped and the
+    search stays on the canonical gating invocation."""
+    searchable = "\n".join(
+        ln for ln in run_script.splitlines() if "junit-lf.xml" not in ln)
+    quoted = _re.search(r"-m '([^']+)'", searchable)
     if quoted:
         return quoted.group(1)
-    for m in _re.finditer(r"-m\s+([^\s]+)", run_script):
+    for m in _re.finditer(r"-m\s+([^\s]+)", searchable):
         if m.group(1) != "pytest":
             return m.group(1)
     raise AssertionError(f"no -m marker found in run script:\n{run_script}")
@@ -2878,28 +3236,44 @@ def test_drift_gate_cannot_skip_the_test_matrix():
     assert not _defaults_shell(workflow) and not _defaults_shell(drift), (
         "a `defaults.run.shell` can swallow the integrity exit code (#2656)")
 
-    integrity_steps = [s for s in drift.get("steps", [])
-                       if "integrity" in _code(s)]
-    assert integrity_steps, "the drift job must run the integrity check"
-    for step in integrity_steps:
+    # BOTH checks in this job are fail-closed gates and BOTH feed the required
+    # aggregate, so BOTH are held to the same unsilenceability rule. The
+    # `merge=union` registry validator (#5373) is a SEPARATE step from the drift
+    # gate, but a `|| true` / `continue-on-error` / `shell:` override on it is the
+    # SAME defect class this test exists to catch: the validator would report
+    # success while a duplicate-key union merge passed — the fail-open shape the
+    # validator exists to remove, wearing the fix. Matching on "integrity" alone
+    # swept both steps into one token check and false-redded; parameterising by
+    # each step's OWN exact invocation keeps every contract exact.
+    drift_gate_steps = [s for s in drift.get("steps", [])
+                        if "ci_selection" in _code(s)]
+    assert drift_gate_steps, "the drift job must run the integrity check"
+    registry_validator_steps = [s for s in drift.get("steps", [])
+                                if "tools/registry_integrity.py" in _code(s)]
+    assert registry_validator_steps, (
+        "the drift job must also run the union registry validator (#5373): the "
+        "unioned registries are only safe while a validator fails closed on them")
+    # Each step is paired with the EXACT non-comment invocation it must make.
+    checked_gate_steps = [
+        *((s, "python3 tools/ci_selection.py --integrity") for s in drift_gate_steps),
+        *((s, "python3 tools/registry_integrity.py") for s in registry_validator_steps),
+    ]
+    for step, expected in checked_gate_steps:
         run = step["run"].replace("\\\n", " ")
-        tokens = shlex.split(run)
-        assert tokens[:2] == ["python3", "tools/ci_selection.py"] \
-            and "--integrity" in tokens, (
-            "the integrity step must invoke tools/ci_selection.py --integrity "
-            f"directly (#2656); got {step.get('run')!r}")
-        assert not any(op in run for op in ("||", "&&", ";", "`", "$(")), (
-            "no shell operator may follow the integrity check — `|| true` / "
-            "`; exit 0` (this workflow's most-used silencing idiom) makes a "
-            f"real drift report green (#2656); got {step.get('run')!r}")
+        # The exact string, not a `tokens[:2]` prefix and not a membership test:
+        # a trailing `|| true`, a `; exit 0`, or any other shell tail is the
+        # silencing idiom this pins, and it would satisfy a looser check.
+        assert run.strip() == expected, (
+            f"a gate step must invoke EXACTLY `{expected}` — no shell operator "
+            "and no trailing anything, or a real failure reports green "
+            f"(#2656/#5373); got {step.get('run')!r}")
         assert not step.get("continue-on-error") and not step.get("shell"), (
-            "the integrity STEP must neither be continue-on-error nor override "
+            "a gate STEP must neither be continue-on-error nor override "
             "`shell`: either one lets the job report success while the check "
-            "failed (#2656)")
+            "failed (#2656/#5373)")
         assert step.get("if", "always()") in _always, (
-            "the integrity step must be unconditional: `if: always()` is fine, "
-            "any other condition drops drift enforcement on the events it "
-            "excludes")
+            "a gate step must be unconditional: `if: always()` is fine, any "
+            "other condition drops enforcement on the events it excludes")
     _timeout = drift.get("timeout-minutes")
     assert isinstance(_timeout, int) and 0 < _timeout <= 15, (
         f"the drift job needs a tight timeout (got {_timeout!r}) — it installs "
@@ -4827,12 +5201,21 @@ def test_every_changed_set_diff_disables_rename_detection():
       `npx markdownlint-cli <nonexistent.md>` exits 0, and plain `.md` deletions
       already put nonexistent paths into this list.
     * Do NOT generalise this rule to `.github/scripts/check-migration-append-only`.
-      That script deliberately runs
-      `git diff --find-renames=20% ... --name-status` because its #1235
-      pure-prefix-rename repair exception is keyed on the `R*` status (recorded
-      at `docs/plans/2026-08-13-1095-migration-drift-gate.md:148`); `--no-renames`
-      there would emit `D`+`A` and break the gate. The rule in this pin is scoped
-      to changed-set *selection* diffs; that file is a deliberate exception.
+      That script deliberately runs `git diff --find-renames=20% ... --name-status`
+      (recorded at `docs/plans/2026-08-13-1095-migration-drift-gate.md:148`).
+      Its exempt arm IS keyed on the `R*` status: #2240 scoped the exemption to a
+      git-detected forward prefix rename whose destination version sorts strictly
+      AFTER the newest applied version, with BOTH endpoints absent from
+      `supabase_migrations.schema_migrations`. A bare `M`/`D` path carries no
+      destination version, so it has no content-independent ordering bound and is
+      NEVER admitted — it falls through to KEEP and is reported as a violation.
+      The old justification ("`--no-renames` would break the gate") therefore
+      holds again: `--find-renames=20%` is what lets a HIGH-SIMILARITY forward
+      renumber report as one `R<sim>` line and reach the exempt arm at all; a
+      re-land carrying a real content delta still degrades to `D`+`A` even with
+      the flag set, and that form is now reported rather than exempted.
+      The rule in this pin is scoped to changed-set
+      *selection* diffs; that file is a deliberate exception.
     """
     root = Path(__file__).resolve().parents[1]
     wf_dir = root / ".github" / "workflows"
