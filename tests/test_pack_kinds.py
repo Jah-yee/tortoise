@@ -7,6 +7,7 @@ the core-entity expansion fix (§6.2a).
 from __future__ import annotations  # noqa: I001
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1246,6 +1247,28 @@ def test_dangling_cross_pack_ref_after_drop(tmp_path):
 _OBJECT_KIND_SECTION = "### Object Kind Vocabulary (core)"
 
 
+def _parse_object_kind_block(section: str) -> set[str]:
+    """Return the kind names in the first fenced block of ``section``.
+
+    The fence's optional **language tag** is discarded (#6951). markdownlint
+    MD040 requires a tag on every fenced block, so `````text`` is the normal
+    case; splitting on the bare delimiter leaves the tag as the block's first
+    line, and tokenising blindly injected the literal word ``text`` into the
+    parsed kind set — a permanently red ``test_three_way_diff_empty`` no PR
+    could clear. Matching the whole fence skips the tag by construction.
+
+    Kept as a pure function on the section text so the tag-independence is
+    testable without editing ``docs/ONTOLOGY.md``.
+    """
+    fenced = re.search(r"```[A-Za-z0-9_+-]*[ \t]*\n(.*?)```", section, re.S)
+    block = fenced.group(1) if fenced else ""
+    kinds: set[str] = set()
+    for line in block.splitlines():
+        line = line.split("#", 1)[0]
+        kinds.update(tok for tok in line.replace(",", " ").split() if tok)
+    return kinds
+
+
 def _ontology_object_kinds() -> set[str]:
     """Parse ONTOLOGY §5's Object Kind Vocabulary fenced block.
 
@@ -1254,12 +1277,33 @@ def _ontology_object_kinds() -> set[str]:
     """
     text = (REPO_ROOT / "docs" / "ONTOLOGY.md").read_text(encoding="utf-8")
     section = text.split(_OBJECT_KIND_SECTION, 1)[1]
-    block = section.split("```", 2)[1]
-    kinds: set[str] = set()
-    for line in block.splitlines():
-        line = line.split("#", 1)[0]
-        kinds.update(tok for tok in line.replace(",", " ").split() if tok)
-    return kinds
+    return _parse_object_kind_block(section)
+
+
+class TestObjectKindBlockParser:
+    """#6951: the fence's language tag is not a kind."""
+
+    _TAGGED = "### Object Kind Vocabulary (core)\n\n```text\nProject, WorkItem, tag\n```\n"
+    _BARE = "### Object Kind Vocabulary (core)\n\n```\nProject, WorkItem, tag\n```\n"
+
+    def test_a_language_tagged_fence_parses_the_same_as_a_bare_one(self):
+        # The regression: the tag `text` was returned as a kind.
+        assert _parse_object_kind_block(self._TAGGED) == {"Project", "WorkItem", "tag"}
+        assert _parse_object_kind_block(self._TAGGED) == _parse_object_kind_block(self._BARE)
+
+    def test_the_tag_itself_is_never_a_kind(self):
+        assert "text" not in _parse_object_kind_block(self._TAGGED)
+
+    def test_comments_and_comma_separators_are_still_stripped(self):
+        section = "```text\nProject, WorkItem,  # a comment\ntag\n```\n"
+        assert _parse_object_kind_block(section) == {"Project", "WorkItem", "tag"}
+
+    def test_a_missing_fence_yields_the_empty_set(self):
+        assert _parse_object_kind_block("no fence here") == set()
+
+    def test_the_live_document_parses_without_the_tag(self):
+        # The end-to-end pin: whatever the fence tag, `text` is not a kind.
+        assert "text" not in _ontology_object_kinds()
 
 
 class TestCanonicalObjectKindAlignment:
