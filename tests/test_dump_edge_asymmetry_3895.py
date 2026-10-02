@@ -103,7 +103,19 @@ def test_dump_edges_are_a_subset_of_the_dumped_node_set():
         assert dump["edge_count"] == len(dump["edges"])
         # The markers are excluded, and the edges incident to them are
         # REPORTED, never silently dropped.
-        assert dump["excluded_node_count"] == 3
+        #
+        # FOUR, not the three this fixture seeds: constructing the projection
+        # now mints the Event FTS marker (`Meta{key:'event_fts_v2'}`) as well as
+        # the Point one, so production contributes one further bookkeeping node.
+        # Assert the marker EXISTS rather than just bumping the number — the
+        # count is then pinned to a named cause, not to an incidental total.
+        assert proj.g.query(
+            "MATCH (m:Meta {key:'event_fts_v2'}) RETURN 1").result_set, (
+            "the Event FTS marker is the fourth excluded node; without it the "
+            "count below would be 3 and this fixture would not describe a "
+            "real dump (#5440)"
+        )
+        assert dump["excluded_node_count"] == 4
         assert dump["skipped_edge_count"] == 3
         assert dump["unresolved_edge_count"] == 0
         proj.close()
@@ -333,7 +345,10 @@ def test_manifest_counts_are_over_the_same_node_set(monkeypatch):
 
         assert manifest["node_count"] == 2
         assert manifest["edge_count"] == 1
-        assert manifest["excluded_node_count"] == 3
+        # Four: the three seeded markers plus the Event FTS marker the
+        # projection now mints on construction (#5440). See the sibling test
+        # for why the marker's existence is asserted rather than assumed.
+        assert manifest["excluded_node_count"] == 4
         assert manifest["skipped_edge_count"] == 3
         assert manifest["unresolved_edge_count"] == 0
         assert manifest["dump_revision"] == 2
