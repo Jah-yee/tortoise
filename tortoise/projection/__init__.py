@@ -7541,6 +7541,7 @@ class FalkorProjection(
                             # properties (verified on v4.16.7) — flatten to a
                             # flat space-joined string (the sdk write path
                             # already stores flat; this fixes existing nodes).
+                            dropped = False
                             try:
                                 done = self.g.query(
                                     "MATCH (m:Meta {key:'point_fts_v2'}) RETURN 1"
@@ -7567,6 +7568,7 @@ class FalkorProjection(
                                             self.g.query(
                                                 f"CALL {drop_proc}('Point')"
                                             )
+                                            dropped = True
                                             break
                                         except Exception:
                                             continue
@@ -7579,22 +7581,40 @@ class FalkorProjection(
                             except Exception as e:
                                 # #H05 review: the helper's docstring promises the
                                 # caller surfaces failures, but THIS migration
-                                # path swallowed them (bare `pass`) while the
-                                # drop above has already run -- so an error here
-                                # can leave Point with NO full-text index and no
-                                # signal at all, which is the exact silent
-                                # degradation this PR exists to end. Reported,
-                                # never fatal: an engine that cannot hold FTS
-                                # must still open.
+                                # path swallowed them (bare `pass`), so an error
+                                # here could leave Point with no full-text index
+                                # and no signal. Reported, never fatal: an engine
+                                # that cannot hold FTS must still open.
+                                #
+                                # Signal quality (2nd review): the two outcomes
+                                # are NOT equivalent, so they are not the same
+                                # message. If the legacy index was DROPPED and the
+                                # recreate failed, Point has NO full-text index --
+                                # an ERROR. If the drop procedure is simply absent
+                                # (embedded FalkorDBLite, the case the drop loop's
+                                # own comment calls covered), the legacy
+                                # content-only index still stands and nothing is
+                                # degraded -- logging that as ERROR every boot
+                                # would dilute the very #H05 signal this PR exists
+                                # to sharpen, so it is a WARNING.
                                 import logging
-                                logging.getLogger(__name__).error(
-                                    "fulltext index MIGRATION failed on Point: %s -- if the "
-                                    "drop above succeeded, Point may now have NO full-text "
-                                    "index (searches degrade to `index_missing`). The "
-                                    "point_fts_v2 marker was NOT set, so this retries on "
-                                    "the next boot",
-                                    e,
-                                )
+                                if dropped:
+                                    logging.getLogger(__name__).error(
+                                        "fulltext index MIGRATION failed on Point AFTER the "
+                                        "legacy index was DROPPED: %s -- Point now has NO "
+                                        "full-text index (searches degrade to "
+                                        "`index_missing`). The point_fts_v2 marker was NOT "
+                                        "set, so this retries on the next boot",
+                                        e,
+                                    )
+                                else:
+                                    logging.getLogger(__name__).warning(
+                                        "fulltext index MIGRATION skipped on Point (no drop "
+                                        "procedure on this engine, so the legacy "
+                                        "content-only index REMAINS; its sparse path covers "
+                                        "retrieval): %s",
+                                        e,
+                                    )
                         elif label == "Event":
                             # #244: legacy subject-only Event FTS index —
                             # migrate to include name ONCE (persisted DB
@@ -7605,6 +7625,7 @@ class FalkorProjection(
                             # FalkorDBLite embedded lacks dropIndex — leave
                             # subject-only there (name search still covered by
                             # the keyword fallback + vector strategies).
+                            dropped = False
                             try:
                                 done = self.g.query(
                                     "MATCH (m:Meta {key:'event_fts_v2'}) RETURN 1"
@@ -7624,6 +7645,7 @@ class FalkorProjection(
                                             self.g.query(
                                                 f"CALL {drop_proc}('Event')"
                                             )
+                                            dropped = True
                                             break
                                         except Exception:
                                             continue
@@ -7635,17 +7657,29 @@ class FalkorProjection(
                                     )
                             except Exception as e:
                                 # #H05 review: same silent-swallow defect as the
-                                # Point branch above, and the drop has already
-                                # run -- report it rather than `pass`.
+                                # Point branch above. Same signal split too:
+                                # ERROR only if the legacy index was actually
+                                # dropped (Event then has NO full-text index),
+                                # otherwise a WARNING -- the drop procedure's
+                                # absence is a covered case, not degradation.
                                 import logging
-                                logging.getLogger(__name__).error(
-                                    "fulltext index MIGRATION failed on Event: %s -- if the "
-                                    "drop above succeeded, Event may now have NO full-text "
-                                    "index (searches degrade to `index_missing`). The "
-                                    "event_fts_v2 marker was NOT set, so this retries on "
-                                    "the next boot",
-                                    e,
-                                )
+                                if dropped:
+                                    logging.getLogger(__name__).error(
+                                        "fulltext index MIGRATION failed on Event AFTER the "
+                                        "legacy index was DROPPED: %s -- Event now has NO "
+                                        "full-text index (searches degrade to "
+                                        "`index_missing`). The event_fts_v2 marker was NOT "
+                                        "set, so this retries on the next boot",
+                                        e,
+                                    )
+                                else:
+                                    logging.getLogger(__name__).warning(
+                                        "fulltext index MIGRATION skipped on Event (no drop "
+                                        "procedure on this engine, so the legacy "
+                                        "subject-only index REMAINS; name search stays "
+                                        "covered by the keyword fallback): %s",
+                                        e,
+                                    )
                     else:
                         self._report_fulltext_index_failure(label, fields, e)
 

@@ -2184,8 +2184,13 @@ class TestFulltextIndexCreationForm:
         """
         from tortoise.projection import FalkorProjection
         graph = StrategyControlledGraph({
-            # first matching substring wins, so the DDL is tried first and the
-            # procedure is the fallback -- exactly the production order.
+            # The DDL is tried first and the procedure second because
+            # _create_fulltext_index iterates its OWN `forms` tuple in that
+            # order -- NOT because of this dict's ordering: each query below
+            # contains exactly one key, so map order is irrelevant here.
+            # (2nd review: the earlier comment credited first-match-wins,
+            # which would mislead a maintainer into thinking reordering this
+            # dict changes the production order.)
             "CREATE FULLTEXT INDEX": (
                 [], RuntimeError("Invalid input 'CREATE FULLTEXT'")),
             "db.idx.fulltext.createNodeIndex": (
@@ -2200,3 +2205,42 @@ class TestFulltextIndexCreationForm:
         messages = [r.getMessage() for r in caplog.records
                     if r.levelno == logging.ERROR]
         assert any("Source" in m and "DEGRADED" in m for m in messages), messages
+
+    def test_migration_without_a_drop_procedure_warns_not_errors(self, caplog):
+        """#H05 2nd review: the migration branch has TWO outcomes and they are
+        not equivalent, so they must not share a level.
+
+        When the drop procedure is absent (embedded FalkorDBLite -- the case
+        the drop loop's own comment calls covered), the legacy content-only
+        index REMAINS and nothing is degraded; logging that as ERROR on every
+        boot would dilute the very #H05 signal this PR exists to sharpen. It
+        must be a WARNING, and the ERROR arm must NOT fire.
+        """
+        from tortoise.projection import FalkorProjection
+        already = RuntimeError("Attribute 'content' is already indexed")
+        graph = StrategyControlledGraph({
+            # both drop forms fail -> `dropped` stays False
+            "CALL db.idx.fulltext.drop": ([], RuntimeError("unknown procedure")),
+            # the DDL re-raises 'already' verbatim (no fallback attempted),
+            # which is what routes into the migration branch at all
+            "CREATE FULLTEXT INDEX": ([], already),
+        })
+        proj = object.__new__(FalkorProjection)
+        proj.g = graph
+        proj._falkordb_version = (6, 0, 0)
+        proj._is_embedded = True
+        with caplog.at_level(logging.WARNING, logger="tortoise.projection"):
+            proj._ensure_indexes()
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("MIGRATION skipped on Point" in m for m in msgs), msgs
+        assert not any("MIGRATION failed on Point" in m for m in msgs), msgs
+        # ...and the LEVEL is what this test is actually about: the benign
+        # path must not be ERROR. Asserting the message text alone is not
+        # enough -- caplog captures ERROR records under the same text, so the
+        # text assertion survives a warning->error mutation (proved).
+        skipped = [r for r in caplog.records
+                   if "MIGRATION skipped on Point" in r.getMessage()]
+        assert skipped, msgs
+        assert all(r.levelno == logging.WARNING for r in skipped), [
+            (r.levelno, r.getMessage()) for r in skipped
+        ]
