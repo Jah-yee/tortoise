@@ -346,6 +346,16 @@ surfaces:
   # is exactly the PR that could silently drop the receipt. Same #2938
   # dual-membership convention as the two entries above.
   - test_capture_secret_redaction_4911.py
+  # #3551: the shared `_write_session_and_turns` primitive (Session MERGE +
+  # turn store). DUAL-REGISTERED (`api` + `core`): the `api` entry is the one
+  # that carries a PR-shape requirement — the primitive is called from
+  # `tortoise/hosted_api.py::_capture_session_impl`, which SELECTS `api`, and a
+  # named-surface match REPLACES the `core` fallback, so a core-only
+  # registration would never run this guard on a hosted_api.py-only PR. The
+  # `core` entry covers the engine path: the primitive also serves
+  # `tortoise/sdk.py::TortoiseSDK.capture_session`, and `tortoise/sdk.py` is a
+  # SHARED_MODULE (so an sdk.py change selects the full matrix regardless).
+  - test_write_session_and_turns_3551.py
   # #3665: pre-spend cohort cost cap. DUAL-REGISTERED (also under `core`): the
   # admission gate, the ledger write, the reader and the RPC wrappers all live
   # in tortoise/hosted_api.py, metering.py and supabase_control.py, which
@@ -921,6 +931,7 @@ surfaces:
   # Registered beside its sibling capture tests; `tortoise/sdk.py` is a
   # SHARED_MODULE, so an sdk.py-only change already runs the full matrix.
   - test_capture_validfrom_3945.py
+  - test_write_session_and_turns_3551.py  # #3551: the shared _write_session_and_turns primitive (Session MERGE + turn store); dual: api
   # #2006 (W11): onboarding funnel telemetry (seed/decide events gated on the
   # COMPLETED_STEP edge's new creation). Registered under `core` for the
   # `tortoise/analytics.py` seam, which matches no SOURCE_PATTERNS entry — and
@@ -2238,6 +2249,7 @@ durations:
   test_write_verb.py: 34.6
   test_index_restore.py: 2.7
   test_capture_session.py: 53.9
+  test_write_session_and_turns_3551.py: 70.8  # #3551: locally measured (10 tests, embedded carve-out lane; the hosted half drives POST /v1/sessions) — refresh from CI junit
   test_battery_setup.py: 67.9
   test_graph_write_loop_responsiveness.py: 19.6
   test_read_routes_loop_responsiveness.py: 6.5
