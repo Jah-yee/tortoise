@@ -805,6 +805,34 @@ def test_emit_manifest_still_refuses_a_collection_ERROR(tmp_path):
     assert not out.exists(), "a collection error must never write a manifest"
 
 
+def test_consumer_accepts_a_PROVEN_empty_manifest_but_refuses_a_bare_one(tmp_path):
+    # #6898: an empty expected-set has two meanings and only one is a bug.
+    # Without the completion marker the generator emitted nothing and the set is
+    # UNKNOWABLE, so the guard must stay red (the whole point of the check).
+    # With it, collection provably ran to the end and matched nothing — every
+    # selected module skipped at collection (a URI-gated docker-lane module on a
+    # PR leg that runs embedded by design) — and expected=0 with 0 observed is
+    # consistent, not a vacuous green. Both halves are asserted here, because a
+    # guard that accepts every empty manifest is worse than one that refuses.
+    log = tmp_path / "pytest.log"
+    log.write_text("1 skipped in 0.20s\n", encoding="utf-8")
+
+    bare = tmp_path / "bare.txt"
+    bare.write_text(
+        "# expected nodeids — epic #1647 Task 6 coverage manifest\n\n",
+        encoding="utf-8")
+    assert run_guard_with_manifest(str(log), manifest=str(bare)) == 1, (
+        "an empty manifest with NO completion marker must stay fail-closed")
+
+    proven = tmp_path / "proven.txt"
+    proven.write_text(
+        "# expected nodeids — epic #1647 Task 6 coverage manifest\n"
+        "# collection: completed 0\n\n",
+        encoding="utf-8")
+    assert run_guard_with_manifest(str(log), manifest=str(proven)) == 0, (
+        "a PROVEN-empty manifest is a legitimate pass, not a vacuous green")
+
+
 def test_emit_manifest_hook_sees_the_marker_deselected_set(tmp_path):
     # The hook is trylast because pytest's `-m`/`-k` filter is a default-priority
     # pytest_collection_modifyitems and pluggy runs same-priority hooks in

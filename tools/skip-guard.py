@@ -228,6 +228,11 @@ def pytest_collection_modifyitems(config, items):
 '''
 _COLLECT_ERROR_RC = 2
 
+# Written into the manifest header by _write_manifest and required by the
+# consumer before it will accept an EMPTY expected-set: the marker is only
+# ever written when collection provably completed (#6898).
+_MANIFEST_COMPLETION_MARK = "# collection: completed"
+
 
 # A skip line: "SKIPPED" + a reason (both formats above).
 _SKIPPED_MARK = "SKIPPED"
@@ -839,9 +844,23 @@ def emit_manifest(files: list[str], marker: str, output: Path,
                     print(f"  {_ln[:300]}", file=sys.stderr)
         return rc or _COLLECT_ERROR_RC
     nodeids = [n for n in nodeids if n.strip()]
+    return _write_manifest(nodeids, output, marker)
+
+
+def _write_manifest(nodeids: list[str], output: Path, marker: str) -> int:
+    """Write the expected-nodeid manifest, carrying its completion proof.
+
+    The `# collection: completed <n>` line is what makes an EMPTY manifest
+    trustworthy, and it is written on the only path that can reach here — the
+    one where collection provably completed (#6898). Without it a consumer
+    seeing no nodeids cannot tell "collection completed and found nothing"
+    from "the generator emitted nothing", so it must fail closed on both; with
+    it, `expected=0` is evidence rather than absence.
+    """
     lines = [
         f"# expected nodeids — epic #1647 Task 6 coverage manifest "
         f"(from the run step's verbatim $FILES x `-m {marker}` collect-only)",
+        f"{_MANIFEST_COMPLETION_MARK} {len(nodeids)}",
         *nodeids,
         "",
     ]
@@ -1027,12 +1046,32 @@ def main(argv: list[str]) -> int:
                 print(f"   - {line!r}", file=sys.stderr)
             return 1
         if not expected:
-            print("❌ manifest contains no expected nodeids (empty or "
-                  "comment-only) — an empty expected-set must not "
-                  "vacuous-green (it would report zero missing nodeids by "
-                  "construction); the manifest generator emitted nothing.",
-                  file=sys.stderr)
-            return 1
+            # #6898: an empty expected-set has TWO meanings and only one is a
+            # bug. If the generator emitted nothing at all the expected-set is
+            # unknowable and this must stay red (which is what the check was
+            # written for). But when the manifest CARRIES the completion
+            # marker, collection provably ran to the end and genuinely matched
+            # nothing — every selected module skipped at collection, e.g. a
+            # URI-gated docker-lane module on a PR leg that runs embedded by
+            # design. Then expected=0 with 0 observed is consistent, not a
+            # vacuous green, and the run's own rc already decided whether the
+            # skips were legitimate. Same distinction the scope branch below
+            # makes: an empty required set is a legitimate pass when it is
+            # KNOWN to be empty, never when the set is merely unknowable.
+            _text = open(manifest_path, encoding="utf-8", errors="replace").read()  # noqa: SIM115
+            if _MANIFEST_COMPLETION_MARK not in _text:
+                print("❌ manifest contains no expected nodeids (empty or "
+                      "comment-only) and carries NO completion marker — an "
+                      "empty expected-set must not vacuous-green (it would "
+                      "report zero missing nodeids by construction); the "
+                      "manifest generator emitted nothing.",
+                      file=sys.stderr)
+                return 1
+            print("✅ manifest declares a COMPLETED collection with zero "
+                  "expected nodeids — every selected module skipped at "
+                  "collection, so nothing was expected and nothing is "
+                  "missing (see the run's own rc for whether those skips "
+                  "were legitimate).")
         if scope is not None:
             # The frozen set is intact (checked non-empty above); this only
             # narrows what THIS run must observe. A scope naming no frozen
