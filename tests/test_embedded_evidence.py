@@ -1017,11 +1017,11 @@ class TestTheDeclaredCeilingMustBeUsable:
         # the `--ref` worktree but before the `try/finally` that removes it leaks that
         # worktree into `git worktree list`, which `tools/collision_preflight.py`
         # scans untruncated — so a typo'd ceiling would poison a dispatch surface.
-        # `_worktree_at` is replaced with a sentinel that fails the test if the
-        # validation has not already run. The ref is a real commit that is NOT HEAD,
-        # so `_worktree_at` in the unmutated code would create a genuine detached
-        # worktree — with `ref="HEAD"` it returns the invoking checkout and creates
-        # nothing, and the leak this test is about could not occur at all.
+        # A ref that is NOT HEAD, so the scenario is real — and `_git` patched, because
+        # CI checks out a SHALLOW clone where `HEAD~1` does not resolve: a test that
+        # shells out to real history passes locally and fails in CI. Returns a
+        # plausible 40-hex so the code path is exercised, not short-circuited.
+        monkeypatch.setattr(ee, "_git", lambda *a, cwd=None: "0" * 40)
         args = TestRecordConstructionReadsTheCanonicalConstants._args(
             load_ceiling=0.0, ref="HEAD~1"
         )
@@ -1044,6 +1044,11 @@ class TestTheDeclaredCeilingMustBeUsable:
         # between `_worktree_at` and the `try`, so a raise there skipped the `finally`
         # and leaked the detached worktree into `git worktree list` — the surface
         # `tools/collision_preflight.py` scans untruncated.
+        # `_git` is patched because CI checks out a SHALLOW clone: a real
+        # `rev-parse HEAD~1` does not resolve there, so a test that reaches for actual
+        # history passes locally and fails in CI. The ref is still a non-HEAD name, so
+        # the scenario below is the real one if these patches were removed.
+        monkeypatch.setattr(ee, "_git", lambda *a, cwd=None: "0" * 40)
         args = TestRecordConstructionReadsTheCanonicalConstants._args(
             load_ceiling=60.0, ref="HEAD~1", record_out="/tmp/unused/record.json"
         )
