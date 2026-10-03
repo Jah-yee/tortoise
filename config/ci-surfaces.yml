@@ -2448,40 +2448,6 @@ durations:
   eval/retrieval/test_oracle.py: 5.7
   longmem_eval/test_context_assembly_leakage.py: 5.2
   test_ep_directional.py: 5.7
-  eval/write_path/test_write_path_benchmark.py: 112.3
-  test_tortoise_client.py: 110.7
-  eval/retrieval/test_run.py: 109.3
-  # #4314: the inert-hooks guard. Measured locally in the carve-out lane
-  # (`uv run pytest tests/test_4314_inert_hooks.py -q`, 169.8s — the round-2
-  # fix adds real-hook guards for the install-inert marker and the CWE-427
-  # pre-path vector); refresh from a CI junit run once it has one.
-  test_4314_inert_hooks.py: 170.0
-  test_platform_seams.py: 73.3
-  test_2952_degraded_read.py: 70.0   # #2952 (B)+(C): docker-lane warm-up/degraded-read suite
-  test_quota.py: 65.3
-  # #3501: the migration-backlog gate. A pure static scan of website/ (no
-  # wrangler, no server), so it runs in the python-ci matrix like any other
-  # static guard. Measured 53s-90s standalone across runs — a SINGLE SAMPLE of a
-  # high-variance quantity dominated by the repo's heavy conftest import path,
-  # not a precise cost. Re-measure rather than trusting it if the import graph
-  # changes.
-  test_no_legacy_token_path.py: 60.0
-  # #3895: 21 docker-lane dump/restore + graph-rebuild tests (~40 graph
-  # round-trips). HIGH-VARIANCE: measured 68-106s warm across runs (the
-  # session-hygiene sweep and the shared container's load dominate the tail),
-  # 126-183s on the embedded lane. Loose middle so the LPT packer does not
-  # under-weight it against default_weight=2.0 — the file is NOT slow-listed,
-  # it stays in the derived fast halves.
-  test_dump_edge_asymmetry_3895.py: 90.0
-  test_divergence_conformance.py: 57.8
-  # #3039: new file. No CI junit measurement exists yet, so the value below is
-  # a LOCAL measurement (54 tests, 55.6s docker-lane). Entry — rather than the
-  # flat 2.0s default — is required because leaving it out drops durations
-  # coverage from 90.02% (541/601) on main to 89.87% (541/602), one file below
-  # the 90% floor exactly as #4348 (--register cannot emit a `durations` row)
-  # describes; and a 27x under-weight would skew the LPT pack for a ~55s file.
-  # Refresh from the first post-merge junit artifact.
-  test_from_uri_userinfo.py: 55.6
   # #2944: new file. The row is required. Pair at this commit: 544/605 = 89.92%
   # without it (below the 90% floor, so the gated `--integrity` step reds) vs
   # 545/605 = 90.08% with it (545 is the lowest passing count for a 605-file
