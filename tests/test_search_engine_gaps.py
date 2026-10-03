@@ -2269,10 +2269,10 @@ class TestFulltextIndexCreationForm:
         from tortoise.projection import FalkorProjection
         already = RuntimeError("Attribute 'subject' is already indexed")
         graph = StrategyControlledGraph({
-            # List the unregistered form BEFORE the registered one:
-            # "db.idx.fulltext.drop" is a prefix of
-            # "db.idx.fulltext.dropIndex", so first-match-wins would let the
-            # registered entry swallow the dropIndex query.
+            # Keys are FULL query strings, including the ('Event') suffix, so
+            # neither is a prefix of the other and the dict order is NOT
+            # load-bearing. The unregistered form is listed first only to
+            # mirror the production loop's order.
             "CALL db.idx.fulltext.dropIndex('Event')": (
                 [], RuntimeError(
                     "Procedure `db.idx.fulltext.dropIndex` is not registered")),
