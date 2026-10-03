@@ -1319,11 +1319,11 @@ def _disable_embedder_autowarmup(monkeypatch):
 # Two product paths build a default httpx client and therefore leave the
 # process the moment SUPABASE_URL names a real host:
 #   * the analytics sink — POST {SUPABASE_URL}/rest/v1/analytics_events
-#     (tortoise/hosted_api.py:20636);
+#     (tortoise/hosted_api.py::_track_analytics_event);
 #   * the JWKS cold pre-warm — GET {SUPABASE_URL}/auth/v1/.well-known/
-#     jwks.json (tortoise/session_auth.py:421, driven from
-#     tortoise/hosted_api.py:858 at TestClient boot).
-# Neither was stubbed suite-wide, so the ~45 files that set SUPABASE_URL +
+#     jwks.json (tortoise/session_auth.py::_fetch_jwks, driven from
+#     tortoise/hosted_api.py::_first_contact_prewarm at app startup).
+# Neither was stubbed suite-wide, so the test files that set SUPABASE_URL +
 # SUPABASE_SERVICE_ROLE_KEY were hermetic only because test.supabase.co /
 # x.supabase.co / testref.supabase.co happen to be NXDOMAIN. A wildcard A
 # record, a resolver that answers with a parking page, or one typo in a
