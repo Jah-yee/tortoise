@@ -2070,6 +2070,13 @@ def get_relationships(graph, point_ids: list[str]) -> dict[str, list[dict]]:
     related_content, direction, operator_id}.
 
     Points with no operator edges get an empty list.
+
+    ⚠️ An ALL-EMPTY map can also mean the read did not happen: a query timeout
+    returns early after logging, and the same value comes back when the id
+    predicate is dropped by the engine and every returned row belongs to some
+    other point (the `foreign rows` warning, #6976). A caller therefore cannot
+    distinguish "this point has no relationships" from "the read failed" — if
+    that distinction matters at a call site, do not infer it from this value.
     """
     if not point_ids:
         return {}
@@ -2182,6 +2189,10 @@ def get_relationships_bounded(
     related_id, related_kind, direction) and add role, peer, family_size,
     op_created_at. related_content is intentionally ABSENT in the list view
     (D5 — full content via expand_relationships, D14).
+
+    ⚠️ Same caveat as get_relationships: an all-empty result can mean the read
+    FAILED rather than that the points have no relationships (#6976) — the
+    foreign-row guard logs, then returns this documented empty map.
 
     Contested coverage: contested peers are computed EXACTLY in Q2-crit — the
     in-Cypher variance on the coalesced persisted α/β (same formula as

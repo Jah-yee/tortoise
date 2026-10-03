@@ -688,12 +688,12 @@ def test_no_query_loses_its_id_predicate():
         not a barrier for the outer predicate — it must not count as protection
         (measured: without this, removing the outer `WITH` at one site left the
         guard reporting 0 offenders while the site was unprotected).
-      * the predicate regex covers `WHERE|AND|OR <v>.id IN|= $<p>`; it does NOT
-        see dynamically-assembled fragments (e.g. a variable holding
-        "AND t.id IN $ids ") — those were checked by hand and are all either
-        already barred or have no following clause, but the coverage is bounded,
-        not total.
+      * a query ASSEMBLED at runtime (joined from separate string expressions
+        with `+`, or held in a variable and passed to `graph.query`) is not
+        scanned — the parser sees the pieces, not the query. Those were checked
+        by hand; the coverage is bounded, not total.
     """
+    import ast
     import pathlib
     import re
 
@@ -701,27 +701,77 @@ def test_no_query_loses_its_id_predicate():
     pred = re.compile(r"(?:WHERE|AND|OR)\s+([a-z_]+)\.id\s+(?:IN|=)\s+\$")
     clause = re.compile(r"\b(OPTIONAL\s+MATCH|MATCH|CALL)\b")
     with_any = re.compile(r"\bWITH\b")
-    strline = re.compile(r'^\s*[frbu]{0,2}["\']')
+
+    def _strings(node):
+        """The query text a node contributes, or None if it contributes none.
+
+        Using the PARSER is what makes this correct: implicit concatenation
+        across lines is already folded into ONE Constant, a comment is not a
+        string at all, an assignment line is irrelevant, and an inline barrier
+        (`… WHERE n.id IN $ids WITH n `) is part of the same string. A
+        line-based scan got every one of those wrong (#7050 review P2).
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            parts: list[str] = []
+            for piece in node.values:
+                if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                    parts.append(piece.value)
+                else:
+                    parts.append(" \x00 ")  # expression placeholder
+            return "".join(parts)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = _strings(node.left), _strings(node.right)
+            if left is not None or right is not None:
+                return (left or " \x00 ") + (right or " \x00 ")
+        if isinstance(node, (ast.Name, ast.Call, ast.Attribute, ast.Subscript)):
+            return " \x00 "  # a fragment only known at runtime
+        return None
+
+    def unbarred(source: str) -> list[str]:
+        """#6976 offenders in one module's source text."""
+        found: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            text = _strings(node)
+            if text is None:
+                continue
+            for m in pred.finditer(text):
+                after = text[m.end():]
+                nxt = clause.search(after)
+                if not nxt:
+                    continue
+                # A WITH inside a `CALL { … }` body is that subquery's ARGUMENT
+                # IMPORT, not a barrier for the outer predicate.
+                if with_any.search(after[: nxt.start()].split("CALL {", 1)[0]):
+                    continue
+                found.add(f"{node.lineno} ({m.group(1)})")
+        return sorted(found)
+
+    # The five shapes a line-based scan got wrong (review P2). Pinned here so
+    # the holes cannot quietly reopen.
+    assignment = 'Q = ("MATCH (n:Point) WHERE n.id IN $ids " "MATCH (n)-[r:IMPL]-(o) RETURN n")'
+    assert unbarred(assignment) == ["1 (n)"], assignment
+    inline = 'Q = ("MATCH (n:Point) WHERE n.id IN $ids WITH n " "MATCH (n)-[r]-(o) RETURN n")'
+    assert unbarred(inline) == [], inline
+    long_block = (
+        'Q = (\n    "MATCH (n:Point) WHERE n.id IN $ids "\n    "WITH n "\n'
+        '    "MATCH (n)-[r]-(o) "\n    "MATCH (o)-[r2]-(p) "\n'
+        '    "WHERE p.id <> n.id "\n    "RETURN n"\n)'
+    )
+    assert unbarred(long_block) == [], long_block
+    mixed = 'Q = ("MATCH (n:Point) WHERE n.id IN $ids " + extra + " MATCH (n)-[r]-(o) RETURN n")'
+    assert unbarred(mixed) == ["1 (n)"], mixed
+    call_body = 'Q = ("MATCH (n:Point) WHERE n.id IN $ids " "CALL { WITH n MATCH (n)-[r]-(o) } RETURN n")'
+    assert unbarred(call_body) == ["1 (n)"], call_body
 
     offenders: list[str] = []
     for path in sorted(root.rglob("*.py")):
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        for i, line in enumerate(lines):
-            if not strline.match(line):
-                continue
-            m = pred.search(line)
-            if not m:
-                continue
-            for j in range(i + 1, min(i + 5, len(lines))):
-                if not strline.match(lines[j]):
-                    break  # query text ended (comment, code, or new statement)
-                # A WITH inside a CALL body is the subquery's import — not a
-                # barrier. Only a WITH before `CALL {` protects the predicate.
-                if with_any.search(lines[j].split("CALL {", 1)[0]):
-                    break  # a WITH materialises the filtered rows
-                if clause.search(lines[j]):
-                    offenders.append(f"{path.name}:{i + 1} ({m.group(1)})")
-                    break
+        try:
+            for hit in unbarred(path.read_text(encoding="utf-8", errors="replace")):
+                offenders.append(f"{path.name}:{hit}")
+        except SyntaxError:
+            continue  # a syntax error is py_compile's to report, not this rail's
     assert not offenders, (
         "these queries lose their id predicate when a following clause expands "
         "the match (#6976) — add a load-bearing `WITH <var>` between the "
