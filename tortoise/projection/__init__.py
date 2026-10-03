@@ -1728,8 +1728,9 @@ def _union_prewipe_snapshot(leftover: dict | None, fresh: dict) -> dict:
 # KNOWN GAPS (pre-existing, NOT fixed by #2944):
 #   * ``proj.db`` is the RAW FalkorDB client. Two destructive forms reach a
 #     graph without passing either layer: ``select_graph(name).query("MATCH (n)
-#     DETACH DELETE n")`` (e.g. battery/testing/seeds.py:120;
-#     graph-scripts/smoke_test.py:130 server-or-embedded, :111 embedded
+#     DETACH DELETE n")`` (e.g. tortoise/graph_delete_guard.py:252, reached
+#     from battery/testing/seeds.py via ``safe_graph_delete``;
+#     graph-scripts/smoke_test.py:140 in both modes, :121 on the embedded
 #     branch) and ``select_graph(name).delete()`` (GRAPH.DELETE — used by
 #     ``sdk.team_delete``, ``hosted_api``, ``backup_sweep``). This surface
 #     cannot be closed inside the guard: a caller holding ``proj.db`` can

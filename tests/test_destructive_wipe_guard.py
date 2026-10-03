@@ -189,13 +189,12 @@ def test_replacement_is_a_call_site_parameter_not_ambient_state():
         )
 
 
-def _rebuild_call_sites(path: Path) -> list:
-    """Every ``*.rebuild(...)`` / ``*.rebuild_all(...)`` call AST node in a file.
+def _rebuild_call_nodes(tree) -> list:
+    """Every ``*.rebuild(...)`` / ``*.rebuild_all(...)`` call node in a PARSED tree.
 
-    An AST walk, not a substring scan: the token must be present on the CALL,
-    so a comment or docstring mentioning ``confirm_destructive=True`` cannot
-    make this pin pass vacuously while the call itself omits it."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    Takes the tree rather than the path on purpose: a caller that builds a
+    parent map from one parse and node identity-tests against another silently
+    finds nothing (and would report every site as unenclosable)."""
     sites = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -206,6 +205,16 @@ def _rebuild_call_sites(path: Path) -> list:
         if name in ("rebuild", "rebuild_all"):
             sites.append(node)
     return sites
+
+
+def _rebuild_call_sites(path: Path) -> list:
+    """Every ``*.rebuild(...)`` / ``*.rebuild_all(...)`` call AST node in a file.
+
+    An AST walk, not a substring scan: the token must be present on the CALL,
+    so a comment or docstring mentioning ``confirm_destructive=True`` cannot
+    make this pin pass vacuously while the call itself omits it."""
+    return _rebuild_call_nodes(
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
 
 
 def test_production_entry_points_thread_the_token():
@@ -238,6 +247,73 @@ def test_production_entry_points_thread_the_token():
                 f"{label}: {path.name}:{call.lineno}: confirm_destructive must be "
                 f"the literal True (a variable could be flipped at runtime)"
             )
+
+
+# Token-less call sites in tests/ that are correct BY DESIGN, keyed by
+# (relative path, enclosing function) so the list survives edits above it — and
+# carrying the EXPECTED count, so a second token-less call added to an
+# already-listed function still reds. An entry with no matching call reds too, so
+# the list cannot rot into silent coverage.
+_TOKEN_LESS_BY_DESIGN = {
+    ("tests/test_destructive_wipe_guard.py",
+     "test_setting_skip_guard_attribute_does_not_authorize_wipe"): (
+        1, "asserts the refusal: an instance attribute must not authorize a wipe"),
+    ("tests/test_destructive_wipe_guard.py",
+     "test_test_looking_name_alone_is_not_enough"): (
+        1, "asserts the refusal: a test-looking graph name is not the gate"),
+    ("tests/test_destructive_wipe_guard.py",
+     "test_embedded_without_token_is_refused"): (
+        1, "asserts the refusal on the embedded lane"),
+    ("tests/test_ops_safety.py",
+     "test_inmemory_rebuild_refuses_a_torn_removal_tail"): (
+        2, "InMemoryProjection — no graph to wipe"),
+    ("tests/test_projection.py",
+     "test_inmemory_rebuild"): (
+        1, "InMemoryProjection — no graph to wipe"),
+}
+
+
+def test_test_call_sites_are_token_threaded_or_allowlisted():
+    """(f) The pin above stops at the production boundary.
+
+    Main added a test that drives the wipe lane without the token (#4503) after
+    this branch's call-site sweep ran, so the production-only pin walked past it
+    and CI would have gone red on a file nobody had looked at. Same AST rule,
+    applied across tests/: every call site passes the token, or is listed above
+    with the reason it must not."""
+    counts, unexplained = {}, []
+    for path in sorted((REPO_ROOT / "tests").rglob("*.py")):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {child: node for node in ast.walk(tree)
+                   for child in ast.iter_child_nodes(node)}
+        for call in _rebuild_call_nodes(tree):
+            if any(kw.arg == "confirm_destructive" for kw in call.keywords):
+                continue
+            name, node = "<module>", call
+            while node is not None:
+                node = parents.get(node)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = node.name
+                    break
+            key = (rel, name)
+            if key in _TOKEN_LESS_BY_DESIGN:
+                counts[key] = counts.get(key, 0) + 1
+            else:
+                unexplained.append(f"{rel}:{call.lineno}")
+    assert not unexplained, (
+        "these test call sites reach the wipe without confirm_destructive and "
+        "are not allowlisted: " + ", ".join(unexplained) + " — either thread "
+        "the token or add them to _TOKEN_LESS_BY_DESIGN with the reason")
+    wrong = [
+        f"{rel}:{fn} expected {want} token-less call(s), found "
+        f"{counts.get((rel, fn), 0)}"
+        for (rel, fn), (want, _why) in sorted(_TOKEN_LESS_BY_DESIGN.items())
+        if counts.get((rel, fn), 0) != want
+    ]
+    assert not wrong, (
+        "these allowlist entries no longer describe what they claim (the call "
+        "moved, gained the token, or a new one appeared): " + "; ".join(wrong))
 
 
 # ── (a) non-disposable graphs are refused ─────────────────────────────────

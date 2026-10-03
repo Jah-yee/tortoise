@@ -2457,8 +2457,8 @@ durations:
   # registration is the file that lands unweighed.
   #
   # The value is a LOCAL measurement (30 tests, 66.7s at fleet load), not a CI
-  # junit artifact — chosen over the flat 2.0s default for the reason the #3039
-  # block gives: a 33x under-weight would skew the LPT pack for a ~67s file
+  # junit artifact — chosen over the flat 2.0s default because a 33x
+  # under-weight would skew the LPT pack for a ~67s file
   # (this tree's durations map has 548 entries, median 0.85s, so ~78x; the fast
   # pool's own median is 0.8s). Refresh from the first
   # post-merge main junit run that includes it.
