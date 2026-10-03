@@ -883,6 +883,36 @@ class TestTheLoadCeilingIsPerRun:
         # The admitted run reports the very load it was gated on.
         assert rec["load"]["before"] == 59.0
 
+    def test_an_idle_host_at_zero_load_is_admitted_by_the_producer(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The producer's lower bound is `before < 0.0`, so `0.0` is ADMITTED.
+
+        An idle host reports exactly 0.0, and the CONSUMER pin asserts `>= 0.0`
+        for the same reason. Without this test the producer half of that pair is
+        unheld: mutating the producer to `before <= 0.0` — which refuses a
+        legitimate idle-host sample as "load is unmeasurable (0.0)" — left the
+        whole suite green, so the two bounds could drift apart one-directionally
+        with nothing failing.
+        """
+        monkeypatch.setattr(ee, "_child_env", lambda rr: {})
+        monkeypatch.setattr(ee, "_snapshot_redis_logs", lambda rr: [])
+        monkeypatch.setattr(ee, "load1", lambda: 0.0)
+
+        class Proc:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return ("", None)
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(ee.subprocess, "Popen", lambda *a, **k: Proc())
+        rec = ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 60, 60.0,
+                           "measured")
+        assert rec["load"]["before"] == 0.0
+
     def test_the_gate_is_the_recorded_value_not_a_second_sample(
         self, tmp_path: Path, monkeypatch
     ):
@@ -1474,6 +1504,44 @@ class TestRecordConstructionReadsTheCanonicalConstants:
         _, reasons = ee.closes_issue(rec)
         assert "load-sample-unusable" not in reasons
         assert "load-above-ceiling" not in reasons
+
+    def test_every_call_site_receives_the_validated_ceiling(self, monkeypatch):
+        """The WIRING half of #7054's Indicator (2).
+
+        The gate cannot be OMITTED (a missing arg is a `TypeError`), but the VALUE
+        each call site passes was unpinned: substituting `float("inf")` at either
+        the measurement loop or the pairing baseline disables the entire per-run
+        gate while the record still declares `"ceiling": 60.0` — a record claiming
+        a gate that never ran. That substitution passed all 121 tests before this.
+        """
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        seen: list[float] = []
+
+        def _capture(_files, _measured_root, _run_root, run_id, _marker, _timeout,
+                     ceiling, _label):
+            seen.append(ceiling)
+            return runs[run_id - 1]
+
+        monkeypatch.setattr(ee, "_run_once", _capture)
+        monkeypatch.setattr(
+            ee, "_manifest_receipt",
+            lambda files, marker, out_dir: {
+                "path": "stub", "digest": "sha256:0", "count": len(files),
+                "unique_count": len(files), "marker": marker,
+            },
+        )
+        monkeypatch.setattr(ee, "load1", lambda: 1.0)
+        monkeypatch.setattr(ee, "_git", lambda *a, cwd=None: "0" * 40)
+        monkeypatch.setattr(ee, "_porcelain_digest", lambda *a, **k: ("sha256:0", False))
+        monkeypatch.setattr(ee, "_tool_version", lambda: "blob0")
+        rec = ee._build_record(self._args(load_ceiling=60.0))
+        assert seen, "the producer never called _run_once"
+        assert set(seen) == {60.0}, f"a call site passed something else: {seen}"
+        assert rec["load"]["ceiling"] == 60.0
 
     def test_record_rejects_a_red_that_observed_a_different_file_list(self, monkeypatch):
         files = list(ee.FAMILY_REPRODUCERS)
