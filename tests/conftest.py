@@ -6,6 +6,7 @@ directly (no user-facing tier path in v1). Used by E2E-1/3/4/5/10/11/12/13.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import shutil
@@ -1372,8 +1373,8 @@ _hermetic_logger = logging.getLogger("tortoise.tests.egress")
 class _HttpxEgressCall:
     """One request observed at the #4387 transport guard."""
 
-    __slots__ = ("kind", "method", "url", "host", "path", "transport",
-                 "request")
+    __slots__ = ("host", "kind", "method", "path", "request", "transport",
+                 "url")
 
     def __init__(self, kind, request, transport):
         self.kind = kind
@@ -1430,10 +1431,18 @@ _ORIGINAL_ASYNC_HANDLE_ASYNC_REQUEST = httpx.AsyncHTTPTransport.handle_async_req
 
 
 def _hermetic_is_loopback(host):
-    return bool(host) and (
-        host in _HERMETIC_LOOPBACK_HOSTS
-        or host.startswith("127.")
-        or host.endswith(".localhost"))
+    if not host:
+        return False
+    if host in _HERMETIC_LOOPBACK_HOSTS or host.endswith(".localhost"):
+        return True
+    # Parse, do not prefix-match (#4387 review). `host.startswith("127.")` is a
+    # STRING test, so `127.evil.example` (a real, resolvable name) was classified
+    # loopback and delegated to the real transport — a hermeticity guard failing
+    # OPEN on exactly the shape it exists to catch. ip_address() is the range test.
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _hermetic_canned_response(request):

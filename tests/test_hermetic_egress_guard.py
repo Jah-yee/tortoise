@@ -88,7 +88,7 @@ def test_non_test_egress_is_blocked(hermetic_egress):
 def test_loopback_egress_is_not_blocked():
     """The guard must not blanket-block loopback (local test servers)."""
     class _Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             body = b"ok"
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
@@ -109,6 +109,24 @@ def test_loopback_egress_is_not_blocked():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_lookalike_loopback_hostname_is_blocked_not_delegated(hermetic_egress):
+    """#4387 review: a STRING prefix is not the 127.0.0.0/8 range.
+
+    `host.startswith("127.")` classified `127.evil.example` as loopback and
+    DELEGATED it to the real transport — real DNS, real egress — which is the
+    exact silent-egress class this guard exists to stop. The host sits under
+    the RFC 6761 reserved `.example` TLD, so it can never resolve: if the
+    guard fails open again this test fails on the assertion below, not on a
+    live request escaping the suite.
+    """
+    host = "127.evil.example"
+    with pytest.raises(httpx.ConnectError) as ei:
+        httpx.Client(timeout=2, trust_env=False).get(f"https://{host}/probe")
+    assert "#4387" in str(ei.value), str(ei.value)
+    assert [c.host for c in hermetic_egress.blocked] == [host]
+    assert hermetic_egress.loopback == []
 
 
 def test_testclient_transport_is_not_blocked():
