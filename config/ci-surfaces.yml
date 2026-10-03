@@ -181,6 +181,12 @@ surfaces:
   # surface, and `core` is only matched when nothing else matched — so `api`
   # is what makes these run on an api-only change to the file they guard.
   - test_onboarding_truth_surface.py
+  # #3553: the onboarding-state jsonb read-modify-write CAS (docker-lane).
+  # Dual-registered under `api` as well as `onboarding` for the same reason as
+  # the guards above: the write path it pins lives in tortoise/hosted_api.py,
+  # which selects the `api` surface — an `onboarding`-only entry would never run
+  # it on a hosted_api.py-only change (the file the CAS exists to fix).
+  - test_onboarding_state_cas.py
   # #3287/#2988/#3243: the selfhost health endpoints must not share fate with
   # work — the readiness probe rides its own daemon pool (a starved readiness
   # probe returned a false 503 for a healthy DB, measured 6020 ms with the probe
@@ -692,6 +698,19 @@ surfaces:
   # the re-key regression drives the real embedded capture commit, so this is
   # the `core` surface (same home as test_4716 above).
   - test_operator_idempotency_4971.py
+  # #5361: both halves of the inverted-validity-window guard. Registered under
+  # `core` ALONE, which is the surface that actually selects them: the audit half
+  # guards tortoise/audit.py (no SOURCE_PATTERNS entry → `core` fallback) and the
+  # read-path half tests TortoiseSDK.restore_point_at; both halves' measure is
+  # `_created_sort_key` in tortoise/search_engine.py, also `core`. The registration
+  # is load-bearing rather than cosmetic: without it the files are ABSENT from the
+  # run set selected by `--changed-files "tortoise/audit.py"` (surfaces ['core'],
+  # full=false) — the one diff that can break them.
+  # NOTE `--changed-files` takes a newline-separated string, not a path — a path
+  # argument is read as an unknown changed file and fail-closes to full=true,
+  # which masks exactly this gap.
+  - test_5361_inverted_window_audit.py
+  - test_5361_inverted_window_read_path.py
   - test_ask_eval_only.py
   - test_backfill_ghost_members_guard.py
   - test_backup_ledger_5062.py
@@ -867,6 +886,12 @@ surfaces:
   # no api/engine surface: `core` runs it on engine-wide changes. Its carve-out
   # below keeps a tools/run_reaper.py-only diff out of the tier-1 smoke fallback.
   - test_run_reaper.py
+  # #7017: distinguishes a wedged container engine from a graph outage. Hermetic
+  # (no network, no docker — every probe is injected), so it pins no api/engine
+  # surface: `core` runs it on engine-wide changes. It exists because a wedged
+  # engine presents as `redis.exceptions.TimeoutError`, which names the graph and
+  # sends the diagnosis where the problem is not (#4844, #7017).
+  - test_engine_probe.py
   - test_health_ready_nonblocking.py  # #2988: /health/ready off-loop + bounded probes
   - test_selfhost_health_probe_executor.py  # #3287/#2988/#3243: selfhost health probes (dual-registered)
   - test_server_hygiene_gate.py
@@ -1699,6 +1724,7 @@ surfaces:
   - test_onboarding_health_flip.py
   - test_onboarding_integration.py
   - test_onboarding_state.py        # #2001 (W5): canonical module unit tests (lane-agnostic)
+  - test_onboarding_state_cas.py    # #3553: jsonb RMW compare-and-set against the REAL registry path (docker-lane)
   - test_onboarding_state_split.py  # #2001 (W5): docker-lane graph-held FLOW-state tests
   - test_onboarding_seed.py         # #1999 (W3): shared seed-core unit tests (lane-agnostic)
   - test_onboarding_seed_endpoint.py  # #1999 (W3): docker-lane seed/decide/completion tests
@@ -2208,6 +2234,10 @@ durations:
   test_backup_watcher_health.py: 0.2
   eval/retrieval/test_integration.py: 1523.4
   test_onboarding_state_split.py: 310.7
+  # #3553: this file is NEW on this branch, so main's sweep has no junit measurement for it.
+  # It is NOT presented as a measurement — it carries the branch's local reading under the
+  # `# unmeasured` convention stated above. Refresh from the first post-merge main run that includes it.
+  test_onboarding_state_cas.py: 120.0  # unmeasured
   test_onboarding_truth_surface.py: 4.0
   eval/write_path/test_write_path_benchmark.py: 101.8
   test_tortoise_client.py: 11.9
@@ -2364,6 +2394,7 @@ durations:
   test_collision_preflight.py: 13.1
   test_branch_reaper.py: 2.0  # unmeasured — no measurement in the four source runs; flat default
   test_run_reaper.py: 2.0  # unmeasured — new file (#6868); no CI junit yet, flat default
+  test_engine_probe.py: 2.0  # unmeasured — new file (#7017); no CI junit yet, flat default
   test_control_plane_offload_3498.py: 1.4
   test_analytics_offloop_4015.py: 0.6
   test_free_team_entitlement.py: 4.8
