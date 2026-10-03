@@ -2232,15 +2232,67 @@ class TestFulltextIndexCreationForm:
         with caplog.at_level(logging.WARNING, logger="tortoise.projection"):
             proj._ensure_indexes()
         msgs = [r.getMessage() for r in caplog.records]
-        assert any("MIGRATION skipped on Point" in m for m in msgs), msgs
-        assert not any("MIGRATION failed on Point" in m for m in msgs), msgs
+        assert any("MIGRATION could not run for Point" in m for m in msgs), msgs
+        assert not any(
+            "MIGRATION for Point" in m and "DROPPED" in m for m in msgs
+        ), msgs
         # ...and the LEVEL is what this test is actually about: the benign
         # path must not be ERROR. Asserting the message text alone is not
         # enough -- caplog captures ERROR records under the same text, so the
         # text assertion survives a warning->error mutation (proved).
         skipped = [r for r in caplog.records
-                   if "MIGRATION skipped on Point" in r.getMessage()]
+                   if "MIGRATION could not run for Point" in r.getMessage()]
         assert skipped, msgs
         assert all(r.levelno == logging.WARNING for r in skipped), [
             (r.levelno, r.getMessage()) for r in skipped
         ]
+
+    @pytest.mark.parametrize(
+        "created,dropped,exc,level,fragment",
+        [
+            # The index IS in place; only the one-time marker failed to
+            # persist. Reporting this at ERROR would dilute the signal.
+            (
+                True, True, RuntimeError("marker write failed"),
+                logging.WARNING, "the index IS in place",
+            ),
+            # The drop reported success, yet the recreate still answers
+            # "already": an index EXISTS, just not the intended form. The
+            # engine's own words refute an absence claim here.
+            (
+                False, True,
+                RuntimeError("Attribute 'content' is already indexed"),
+                logging.WARNING, "an index IS present, but NOT the intended",
+            ),
+            # The ONLY case where the label is genuinely left with no index.
+            (
+                False, True, RuntimeError("boom"),
+                logging.ERROR, "now has NO full-text index",
+            ),
+            # The drop never ran at all -> the legacy index REMAINS. Note
+            # the cause here is a marker-read failure, NOT a missing drop
+            # procedure, so the message must not blame the drop procedure.
+            (
+                False, False, RuntimeError("marker read failed"),
+                logging.WARNING, "legacy content-only index REMAINS",
+            ),
+        ],
+    )
+    def test_classify_fts_migration_failure_levels(
+        self, created, dropped, exc, level, fragment
+    ):
+        """#H05 3rd review: the migration report must state what is TRUE.
+
+        The drop -> recreate -> marker sequence produces four distinct
+        outcomes; the round-2 code keyed the level on `dropped` alone and so
+        asserted "NO full-text index" even when the recreate had succeeded
+        and only the marker write failed (reproduced by that review), and
+        blamed a missing drop procedure even when the failure preceded the
+        drop loop. The decision is pure, so all four arms are asserted here.
+        """
+        from tortoise.projection import FalkorProjection
+        got_level, msg = FalkorProjection._classify_fts_migration_failure(
+            "Point", created, dropped, exc
+        )
+        assert got_level == level, (got_level, msg)
+        assert fragment in msg, msg

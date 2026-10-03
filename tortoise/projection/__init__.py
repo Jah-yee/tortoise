@@ -7257,6 +7257,54 @@ class FalkorProjection(
             label, fields, exc,
         )
 
+    @staticmethod
+    def _classify_fts_migration_failure(
+        label: str, created: bool, dropped: bool, exc: object
+    ) -> tuple[int, str]:
+        """#H05: decide how LOUDLY to report a failed one-time FTS migration.
+
+        The migration is drop -> recreate -> persist-marker, and WHICH of
+        those steps got through decides what is actually true. Deriving the
+        message from the two recorded facts (rather than from the bare fact
+        that something raised) is what keeps it from asserting an absence
+        that does not hold:
+
+        ``created`` -- the intended index was (re)created, so a later failure
+        is only the one-time marker failing to persist. The index IS in
+        place and the next boot retries; reporting that at ERROR would train
+        readers to ignore the real thing.
+        ``dropped`` -- the legacy index was actually removed. Only then can
+        the label be left with NO full-text index, which is the degradation
+        that earns an ERROR.
+
+        A drop that reports success while the recreate still answers
+        "already" is a third outcome: an index EXISTS, just not the intended
+        multi-field form -- so absence is NOT asserted there either.
+        """
+        if created:
+            return logging.WARNING, (
+                f"fulltext index MIGRATION for {label} recreated the index but "
+                f"could not persist its one-time marker: {exc} -- the index IS "
+                f"in place; the marker is retried on the next boot"
+            )
+        if dropped and "already" in str(exc).lower():
+            return logging.WARNING, (
+                f"fulltext index MIGRATION for {label} dropped the legacy index "
+                f"and the recreate then reported the index already exists: {exc} "
+                f"-- an index IS present, but NOT the intended multi-field form"
+            )
+        if dropped:
+            return logging.ERROR, (
+                f"fulltext index MIGRATION for {label} DROPPED the legacy index "
+                f"and the recreate failed: {exc} -- {label} now has NO full-text "
+                f"index (searches degrade to `index_missing`). The migration "
+                f"marker was NOT set, so this retries on the next boot"
+            )
+        return logging.WARNING, (
+            f"fulltext index MIGRATION could not run for {label}, so the legacy "
+            f"content-only index REMAINS (its sparse path covers retrieval): {exc}"
+        )
+
     def _ensure_indexes(self) -> None:
         """Create indexes on frequently-filtered Point properties.
 
@@ -7300,7 +7348,6 @@ class FalkorProjection(
                 if "already indexed" in msg or "already exists" in msg:
                     pass  # expected — index exists from prior startup
                 else:
-                    import logging
                     logging.getLogger(__name__).error(
                         "Failed to create index on n.%s: %s", prop, e)
 
@@ -7357,7 +7404,6 @@ class FalkorProjection(
             if "already indexed" in msg or "already exists" in msg:
                 pass  # expected — index exists from prior startup
             else:
-                import logging
                 logging.getLogger(__name__).error(
                     "Failed to create index on :Point(lastDreamedAt): %s", e)
 
@@ -7426,7 +7472,6 @@ class FalkorProjection(
                     if "already indexed" in msg or "already exists" in msg:
                         pass
                     else:
-                        import logging
                         logging.getLogger(__name__).error(
                             "Failed to create index on %s.%s: %s", label, prop, e)
 
@@ -7443,7 +7488,6 @@ class FalkorProjection(
             if "already indexed" in msg or "already exists" in msg:
                 pass
             else:
-                import logging
                 logging.getLogger(__name__).error(
                     "Failed to create index on Session.actor_user_id: %s", e)
 
@@ -7462,7 +7506,6 @@ class FalkorProjection(
             if "already indexed" in msg or "already exists" in msg:
                 pass
             else:
-                import logging
                 logging.getLogger(__name__).error(
                     "Failed to create index on Session.id: %s", e)
 
@@ -7541,6 +7584,7 @@ class FalkorProjection(
                             # properties (verified on v4.16.7) — flatten to a
                             # flat space-joined string (the sdk write path
                             # already stores flat; this fixes existing nodes).
+                            created = False
                             dropped = False
                             try:
                                 done = self.g.query(
@@ -7575,46 +7619,24 @@ class FalkorProjection(
                                     self._create_fulltext_index(
                                         "Point", ["content", "search_keys"]
                                     )
+                                    created = True
                                     self.g.query(
                                         "MERGE (m:Meta {key:'point_fts_v2'}) SET m.v = true"
                                     )
                             except Exception as e:
-                                # #H05 review: the helper's docstring promises the
-                                # caller surfaces failures, but THIS migration
-                                # path swallowed them (bare `pass`), so an error
+                                # #H05 review: this migration path used to
+                                # swallow failures (bare `pass`), so an error
                                 # here could leave Point with no full-text index
-                                # and no signal. Reported, never fatal: an engine
-                                # that cannot hold FTS must still open.
-                                #
-                                # Signal quality (2nd review): the two outcomes
-                                # are NOT equivalent, so they are not the same
-                                # message. If the legacy index was DROPPED and the
-                                # recreate failed, Point has NO full-text index --
-                                # an ERROR. If the drop procedure is simply absent
-                                # (embedded FalkorDBLite, the case the drop loop's
-                                # own comment calls covered), the legacy
-                                # content-only index still stands and nothing is
-                                # degraded -- logging that as ERROR every boot
-                                # would dilute the very #H05 signal this PR exists
-                                # to sharpen, so it is a WARNING.
-                                import logging
-                                if dropped:
-                                    logging.getLogger(__name__).error(
-                                        "fulltext index MIGRATION failed on Point AFTER the "
-                                        "legacy index was DROPPED: %s -- Point now has NO "
-                                        "full-text index (searches degrade to "
-                                        "`index_missing`). The point_fts_v2 marker was NOT "
-                                        "set, so this retries on the next boot",
-                                        e,
-                                    )
-                                else:
-                                    logging.getLogger(__name__).warning(
-                                        "fulltext index MIGRATION skipped on Point (no drop "
-                                        "procedure on this engine, so the legacy "
-                                        "content-only index REMAINS; its sparse path covers "
-                                        "retrieval): %s",
-                                        e,
-                                    )
+                                # and no signal at all. Reported, never fatal:
+                                # an engine that cannot hold FTS must still
+                                # open. HOW LOUDLY is a pure decision -- the
+                                # level depends on which migration step got
+                                # through, so it lives in the classifier where
+                                # all four outcomes are testable.
+                                _level, _msg = self._classify_fts_migration_failure(
+                                    "Point", created, dropped, e
+                                )
+                                logger.log(_level, _msg)
                         elif label == "Event":
                             # #244: legacy subject-only Event FTS index —
                             # migrate to include name ONCE (persisted DB
@@ -7625,6 +7647,7 @@ class FalkorProjection(
                             # FalkorDBLite embedded lacks dropIndex — leave
                             # subject-only there (name search still covered by
                             # the keyword fallback + vector strategies).
+                            created = False
                             dropped = False
                             try:
                                 done = self.g.query(
@@ -7652,34 +7675,18 @@ class FalkorProjection(
                                     self._create_fulltext_index(
                                         "Event", ["subject", "name"]
                                     )
+                                    created = True
                                     self.g.query(
                                         "MERGE (m:Meta {key:'event_fts_v2'}) SET m.v = true"
                                     )
                             except Exception as e:
-                                # #H05 review: same silent-swallow defect as the
-                                # Point branch above. Same signal split too:
-                                # ERROR only if the legacy index was actually
-                                # dropped (Event then has NO full-text index),
-                                # otherwise a WARNING -- the drop procedure's
-                                # absence is a covered case, not degradation.
-                                import logging
-                                if dropped:
-                                    logging.getLogger(__name__).error(
-                                        "fulltext index MIGRATION failed on Event AFTER the "
-                                        "legacy index was DROPPED: %s -- Event now has NO "
-                                        "full-text index (searches degrade to "
-                                        "`index_missing`). The event_fts_v2 marker was NOT "
-                                        "set, so this retries on the next boot",
-                                        e,
-                                    )
-                                else:
-                                    logging.getLogger(__name__).warning(
-                                        "fulltext index MIGRATION skipped on Event (no drop "
-                                        "procedure on this engine, so the legacy "
-                                        "subject-only index REMAINS; name search stays "
-                                        "covered by the keyword fallback): %s",
-                                        e,
-                                    )
+                                # #H05 review: same silent-swallow defect and
+                                # same pure level decision as the Point branch
+                                # above -- see _classify_fts_migration_failure.
+                                _level, _msg = self._classify_fts_migration_failure(
+                                    "Event", created, dropped, e
+                                )
+                                logger.log(_level, _msg)
                     else:
                         self._report_fulltext_index_failure(label, fields, e)
 
@@ -7732,11 +7739,9 @@ class FalkorProjection(
                             if "already" in msg2:
                                 self._vector_index_api = 'cypher'
                             else:
-                                import logging
                                 logging.getLogger(__name__).warning(
                                     "Failed to create vector index on Point.embedding: %s", e2)
         else:
-            import logging
             logging.getLogger(__name__).info(
                 "Skipping FTS and vector indexes: FalkorDB %s < 4.x",
                 '.'.join(map(str, _ver)))
