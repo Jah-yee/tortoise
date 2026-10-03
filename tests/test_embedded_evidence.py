@@ -1290,6 +1290,82 @@ class TestRecordConstructionReadsTheCanonicalConstants:
         _, reasons = ee.closes_issue(rec)
         assert "load-bands-do-not-overlap" not in reasons
 
+    def test_a_run_that_began_above_the_declared_ceiling_must_not_close(self, monkeypatch):
+        """The ceiling is a PRODUCER gate, but a PERSISTED record is re-evaluated
+        HERE — and `load.ceiling` is persisted for exactly this comparison.
+
+        Before this conjunct the field was WRITE-ONLY: no reader anywhere cast a
+        run's `load.before` against `rec["load"]["ceiling"]`, so a record carrying
+        a run that began above its own declared ceiling still closed. That is the
+        issue's own defect ("the contravention is recorded and never asserted")
+        surviving one layer down, on the surface designed to re-read a record.
+
+        The live instance is the #3882 record: run 2 BEGINS at 67.998 against a
+        declared `ceiling` of 60.0, and nothing reported it.
+        """
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        runs[0]["load"]["before"] = 30.0   # admissible
+        runs[1]["load"]["before"] = 68.0   # ABOVE the declared ceiling
+        rec = self._record(monkeypatch, runs)
+        rec["load"]["ceiling"] = 60.0      # the persisted record's declaration
+        ok, reasons = ee.closes_issue(rec)
+        assert ok is False
+        assert "load-above-ceiling" in reasons
+
+    def test_a_run_exactly_at_the_ceiling_is_admitted_by_the_consumer(self, monkeypatch):
+        # The boundary is `> ceiling`, not `>=`: a run AT the ceiling is
+        # admissible, matching `_run_once`'s producer gate. A consumer stricter
+        # than the producer would refuse records the tool itself produces.
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        for r in runs:
+            r["load"]["before"] = 60.0
+        rec = self._record(monkeypatch, runs)
+        rec["load"]["ceiling"] = 60.0
+        _, reasons = ee.closes_issue(rec)
+        assert "load-above-ceiling" not in reasons
+
+    def test_an_unusable_declared_ceiling_is_a_refusal_not_a_licence(self, monkeypatch):
+        # `_validated_ceiling` rejects 0/negative/non-finite at the producer, so a
+        # record carrying one was NOT produced by this version. An absent or
+        # unusable ceiling cannot establish admissibility, so it refuses: D14's
+        # posture is fail-closed, and `None > x` would otherwise raise.
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        for bad in (None, 0, -1.0, float("nan"), float("inf"), "60"):
+            rec = self._record(monkeypatch, runs)
+            rec["load"]["ceiling"] = bad
+            _, reasons = ee.closes_issue(rec)
+            assert "load-ceiling-unusable" in reasons, bad
+
+    def test_the_attested_baseline_is_in_the_ceiling_population(self, monkeypatch):
+        # Same reason as `pin-not-airtight`: the baseline is a RUN, so a baseline
+        # that began above the ceiling is a contravention even if every measured
+        # run was admissible.
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        rec = self._record(monkeypatch, runs)
+        rec["load"]["ceiling"] = 60.0
+        baseline = dict(runs[0])
+        baseline["load"] = dict(baseline["load"], before=68.0)
+        rec["red"]["baseline_run"] = baseline
+        assert all(r["load"]["before"] <= 60.0 for r in rec["runs"])
+        _, reasons = ee.closes_issue(rec)
+        assert "load-above-ceiling" in reasons
+
     def test_record_rejects_a_red_that_observed_a_different_file_list(self, monkeypatch):
         files = list(ee.FAMILY_REPRODUCERS)
         runs = [

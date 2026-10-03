@@ -1245,6 +1245,31 @@ def closes_issue(rec: dict) -> tuple[bool, list[str]]:
                rec["red"]["cause"] in rec["selection"]["expected_causes"])
     ok &= conj("red-file-list-differs", rec["red"]["same_file_list"])
     ok &= conj("load-bands-do-not-overlap", rec["load"]["overlap"])
+    # The ceiling is enforced as a PRODUCER gate in `_run_once`, but this function
+    # is also the RE-EVALUATION surface for a persisted record, and `load.ceiling`
+    # was persisted for exactly this comparison. Without the conjunct below the
+    # field is WRITE-ONLY: a record carrying a run that began above its own
+    # declared ceiling still closes. Measured on the live #3882 record — run 2
+    # begins at 67.998 against `ceiling` 60.0 and nothing here reported it. The
+    # issue's own defect was "the contravention is recorded and never asserted";
+    # asserting it only in the producer leaves the consumer doing exactly that.
+    #
+    # The attested baseline is a RUN too (same reason as `pin-not-airtight`), so
+    # it is in the population. An unusable ceiling is a refusal, not a licence:
+    # `_validated_ceiling` already rejects 0/negative/non-finite at the producer,
+    # so a record carrying one was not produced by this version.
+    _ceiling = rec["load"].get("ceiling")
+    _ceiling_usable = (
+        isinstance(_ceiling, (int, float)) and not isinstance(_ceiling, bool)
+        and math.isfinite(float(_ceiling)) and float(_ceiling) > 0
+    )
+    _load_runs = [*rec["runs"], *(
+        [rec["red"]["baseline_run"]] if rec["red"].get("baseline_run") else [])]
+    ok &= conj("load-ceiling-unusable", _ceiling_usable)
+    ok &= conj("load-above-ceiling",
+               _ceiling_usable and all(
+                   float(r["load"]["before"]) <= float(_ceiling)
+                   for r in _load_runs))
     # `attempted` is deliberately NOT an AND-term here: `main()` rejects `--n < 2`,
     # so the producer could only ever set it True and it supplied no protection. The
     # falsifiable claim is `rate_change` (a red was demonstrated and did not appear
