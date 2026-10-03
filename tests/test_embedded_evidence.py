@@ -1371,6 +1371,87 @@ class TestRecordConstructionReadsTheCanonicalConstants:
         _, reasons = ee.closes_issue(rec)
         assert "load-above-ceiling" in reasons
 
+    def test_the_unmeasured_sentinel_is_refused_by_the_consumer_too(self, monkeypatch):
+        """`LOAD_UNMEASURED` (`-1.0`) must be refused HERE as well as at the producer.
+
+        The producer refuses a `before` that is non-finite or negative, because
+        `-1.0 > ceiling` is `False` and the bare comparison fails OPEN. A consumer
+        that compared naively would re-create that exact fail-open one layer down
+        — on the surface whose whole job is to re-read a record.
+        """
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        runs[0]["load"]["before"] = ee.LOAD_UNMEASURED
+        rec = self._record(monkeypatch, runs)
+        rec["load"]["ceiling"] = 60.0
+        assert ee.LOAD_UNMEASURED < 0, "the sentinel must be negative to fail open"
+        _, reasons = ee.closes_issue(rec)
+        assert "load-sample-unusable" in reasons
+
+    def test_the_unmeasured_sentinel_on_the_baseline_is_refused(self, monkeypatch):
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        rec = self._record(monkeypatch, runs)
+        rec["load"]["ceiling"] = 60.0
+        baseline = dict(runs[0])
+        baseline["load"] = dict(baseline["load"], before=ee.LOAD_UNMEASURED)
+        rec["red"]["baseline_run"] = baseline
+        _, reasons = ee.closes_issue(rec)
+        assert "load-sample-unusable" in reasons
+
+    def test_an_unreadable_sample_is_a_reason_not_a_traceback(self, monkeypatch):
+        """`closes_issue` is a VERDICT over UNTRUSTED persisted JSON.
+
+        Before this guard the new reads raised: a missing key gave `KeyError`, a
+        null gave `TypeError`, a string gave `ValueError`, and a 401-digit int
+        literal gave `OverflowError`. A traceback is not a fail-closed refusal —
+        it is a crash where the function previously returned a verdict.
+        """
+        files = list(ee.FAMILY_REPRODUCERS)
+        cases = [
+            "MISSING",                   # no "before" key at all
+            {"before": None},           # null
+            {"before": "abc"},          # string
+            {"before": float("nan")},
+            {"before": float("inf")},
+            {"before": -1.0},
+            {"before": 10 ** 400},      # int literal too large for float()
+        ]
+        for shape in cases:
+            runs = [
+                self._run(files, 1, "unexpected-divergence"),
+                self._run(files, 2, "unexpected-divergence"),
+            ]
+            load = dict(runs[0]["load"])
+            if shape == "MISSING":
+                load.pop("before")
+            else:
+                load.update(shape)
+            runs[0]["load"] = load
+            rec = self._record(monkeypatch, runs)
+            rec["load"]["ceiling"] = 60.0
+            _, reasons = ee.closes_issue(rec)          # must NOT raise
+            assert "load-sample-unusable" in reasons, shape
+
+    def test_an_unreadable_ceiling_is_a_reason_not_a_traceback(self, monkeypatch):
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        # 10**400 is a legal JSON integer literal and too large for float().
+        for bad in (None, 0, -1.0, float("nan"), float("inf"), "60", True, 10 ** 400):
+            rec = self._record(monkeypatch, runs)
+            rec["load"]["ceiling"] = bad
+            _, reasons = ee.closes_issue(rec)          # must NOT raise
+            assert "load-ceiling-unusable" in reasons, bad
+
     def test_record_rejects_a_red_that_observed_a_different_file_list(self, monkeypatch):
         files = list(ee.FAMILY_REPRODUCERS)
         runs = [

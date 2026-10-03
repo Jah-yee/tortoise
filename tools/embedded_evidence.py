@@ -1255,21 +1255,47 @@ def closes_issue(rec: dict) -> tuple[bool, list[str]]:
     # asserting it only in the producer leaves the consumer doing exactly that.
     #
     # The attested baseline is a RUN too (same reason as `pin-not-airtight`), so
-    # it is in the population. An unusable ceiling is a refusal, not a licence:
-    # `_validated_ceiling` already rejects 0/negative/non-finite at the producer,
-    # so a record carrying one was not produced by this version.
-    _ceiling = rec["load"].get("ceiling")
-    _ceiling_usable = (
-        isinstance(_ceiling, (int, float)) and not isinstance(_ceiling, bool)
-        and math.isfinite(float(_ceiling)) and float(_ceiling) > 0
-    )
-    _load_runs = [*rec["runs"], *(
-        [rec["red"]["baseline_run"]] if rec["red"].get("baseline_run") else [])]
+    # it is in the population. An unusable sample is a refusal, not a licence:
+    # the PRODUCER refuses a `before` that is non-finite or negative (the
+    # `LOAD_UNMEASURED` sentinel is `-1.0`, and `-1.0 > ceiling` is `False`, so
+    # the bare comparison fails OPEN). A consumer that compared naively would
+    # re-create that exact fail-open one layer down, on the surface whose whole
+    # job is to re-read a record — so the same admissibility rule is applied
+    # here, at BOTH bounds.
+    #
+    # Every read goes through `_load_number`, because a persisted record is
+    # untrusted JSON: a missing key, a null, a string or a 401-digit int literal
+    # all reach this function. `closes_issue` is a VERDICT — it returns a reason,
+    # never raises — and a traceback is not a fail-closed refusal.
+    def _load_number(value: object) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            number = float(value)
+        except (OverflowError, ValueError):  # an int literal too large to convert
+            return None
+        return number if math.isfinite(number) else None
+
+    def _run_number(run: object) -> float | None:
+        load = run.get("load") if isinstance(run, dict) else None
+        return _load_number(load.get("before")) if isinstance(load, dict) else None
+
+    _load = rec.get("load") if isinstance(rec.get("load"), dict) else {}
+    _ceiling = _load_number(_load.get("ceiling"))
+    _ceiling_usable = _ceiling is not None and _ceiling > 0
+    _red = rec.get("red") if isinstance(rec.get("red"), dict) else {}
+    _baseline = _red.get("baseline_run")
+    _load_runs = [*rec["runs"], *([_baseline] if _baseline else [])]
+    _befores = [_run_number(r) for r in _load_runs]
     ok &= conj("load-ceiling-unusable", _ceiling_usable)
+    # A run whose load could not be read is inadmissible, exactly as at the
+    # producer: `LOAD_UNMEASURED` (`-1.0`) is the sentinel for "the host was
+    # unreadable", and a negative load is not a measurement.
+    ok &= conj("load-sample-unusable",
+               all(b is not None and b >= 0.0 for b in _befores))
     ok &= conj("load-above-ceiling",
                _ceiling_usable and all(
-                   float(r["load"]["before"]) <= float(_ceiling)
-                   for r in _load_runs))
+                   b is not None and b >= 0.0 and b <= _ceiling for b in _befores))
     # `attempted` is deliberately NOT an AND-term here: `main()` rejects `--n < 2`,
     # so the producer could only ever set it True and it supplied no protection. The
     # falsifiable claim is `rate_change` (a red was demonstrated and did not appear
