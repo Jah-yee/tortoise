@@ -765,6 +765,68 @@ def test_emit_manifest_collect_failure_writes_no_manifest(tmp_path):
     assert not out.exists()
 
 
+def test_emit_manifest_accepts_a_completed_empty_collection(tmp_path):
+    # #6898 / #6390: pytest exits 5 ("no tests collected") when collection
+    # SUCCEEDS and matches nothing under `-m` — the shape a diff that selects
+    # files whose tests all fall outside the marker produces. The tool already
+    # treats rc=5 as a normal outcome everywhere else (see the rc-in-(0, 5)
+    # assertion further down), but emit_manifest refused it, so every
+    # docs/website-only PR red its shards for a reason unrelated to its
+    # content. Completion is judged by the hook-written nodeid file, so this is
+    # now a clean, empty manifest rather than a fail-closed refusal.
+    (tmp_path / "test_only_marked.py").write_text(
+        "import pytest\n\n\n@pytest.mark.live\ndef test_live_one():\n"
+        "    assert True\n",
+        encoding="utf-8")
+    out = tmp_path / "expected-nodeids.txt"
+    rc = _skip_guard.emit_manifest(
+        [str(tmp_path / "test_only_marked.py")], "not live", out)
+    assert rc == 0, (
+        "a collection that completed and matched nothing must not fail closed")
+    assert out.exists(), "the manifest must exist so the consumer sees zero-vs-zero"
+    rows = [ln for ln in out.read_text().splitlines()
+            if ln.strip() and not ln.startswith("#")]
+    assert rows == [], rows
+
+
+def test_emit_manifest_still_refuses_a_collection_ERROR(tmp_path):
+    # The other half of the completion test, and the reason the nodeid file
+    # alone is NOT sufficient: pytest reaches pytest_collection_modifyitems
+    # even when a module cannot be imported (it drops the errored module and
+    # collects the rest), so a file-exists-only rule would fail OPEN on a
+    # genuine collection error. Measured: an unimportable module yields rc=2
+    # ("Interrupted: 1 error during collection").
+    (tmp_path / "test_unimportable.py").write_text(
+        "import definitely_not_a_real_module_xyz\n", encoding="utf-8")
+    out = tmp_path / "expected-nodeids.txt"
+    rc = _skip_guard.emit_manifest([str(tmp_path / "test_unimportable.py")],
+                                   "not live", out)
+    assert rc == 2, rc
+    assert not out.exists(), "a collection error must never write a manifest"
+
+
+def test_emit_manifest_hook_sees_the_marker_deselected_set(tmp_path):
+    # The hook is trylast because pytest's `-m`/`-k` filter is a default-priority
+    # pytest_collection_modifyitems and pluggy runs same-priority hooks in
+    # reverse registration order, so an untagged `-p` plugin would run first and
+    # snapshot the unfiltered items. Running last means the manifest holds the
+    # set the run step actually executes. If the order regressed, excluded
+    # nodeids would enter the manifest and the consumer would red every run on
+    # nodeids that were deliberately never collected.
+    (tmp_path / "test_mixed.py").write_text(
+        "import pytest\n\n\ndef test_included():\n    assert True\n\n\n"
+        "@pytest.mark.live\ndef test_excluded_one():\n    assert True\n\n\n"
+        "@pytest.mark.live\ndef test_excluded_two():\n    assert True\n",
+        encoding="utf-8")
+    out = tmp_path / "expected-nodeids.txt"
+    rc = _skip_guard.emit_manifest([str(tmp_path / "test_mixed.py")],
+                                   "not live", out)
+    assert rc == 0
+    rows = [ln for ln in out.read_text().splitlines()
+            if ln.strip() and not ln.startswith("#")]
+    assert rows == ["test_mixed.py::test_included"], rows
+
+
 # ── #3290: the live-URI gate has ONE reason string ────────────────────────
 
 def _live_uri_skip_reasons() -> list[tuple[str, int, str]]:

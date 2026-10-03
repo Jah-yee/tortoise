@@ -164,8 +164,10 @@ if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
         f"`uv run python tools/skip-guard.py`"
     )
 
+import os
 import re
 import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -180,6 +182,51 @@ _MANIFEST_MARKER_DEFAULT = "not track_b"
 # deselected) in 0.03s", "9/13 tests collected (4 deselected)") never
 # contain "::".
 _COLLECT_NODEID_RE = re.compile(r"^[^\s:]+::")
+
+# ── The collection-completion proof (#6898) ──────────────────────────────
+# pytest's exit code is NOT a reliable statement about collection. Concretely,
+# two shapes red a shard for a run that collected perfectly:
+#   * ``rc=5`` — EXIT_NOTESTSCOLLECTED: collection SUCCEEDED and matched
+#     nothing (e.g. a diff that selects files whose tests are all outside the
+#     ``-m`` marker). The tool already treats this as normal everywhere else
+#     (see the rc-in-(0, 5) assertion in tests/test_skip_guard.py).
+#   * ``rc=-6`` — the interpreter aborts AT EXIT, after the nodeid list has
+#     already been printed (issue #6898).
+# So the manifest must not be derived from the exit code at all. Instead a
+# `pytest_collection_modifyitems` hook writes it, because that hook is only
+# reached by a collection that ran to completion. It is NOT sufficient alone:
+# an unimportable module yields rc=2 ("Interrupted: 1 error during
+# collection") and STILL reaches the hook with the errored module dropped, so
+# the exit code is kept as the second half of the test. Completion is
+# therefore (file exists) AND (rc is 0, 5, or negative), and the manifest's
+# EXISTENCE is what rules out a signal that killed the interpreter
+# mid-collection. The write is atomic for the same reason: a manifest that
+# exists must be complete, never half-written.
+_MANIFEST_HOOK_SOURCE = '''\
+"""Written by tools/skip-guard.py for a single --emit-manifest run (#6898)."""
+import os
+from pathlib import Path
+
+import pytest
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):
+    # trylast: pytest's own `-m`/`-k` filtering is a DEFAULT-priority
+    # pytest_collection_modifyitems (it is not decorated tryfirst; the tryfirst
+    # on _pytest/mark is pytest_cmdline_main). pluggy runs same-priority hooks
+    # in reverse registration order, so an untagged `-p` plugin would run
+    # BEFORE the mark plugin and snapshot the UNFILTERED items. Running last
+    # means we see the DESELECTED set — the same set the run step executes.
+    # (Verified: dropping trylast leaks the deselected nodeids into the manifest.)
+    out = os.environ.get("_FTS_MANIFEST_NODEIDS")
+    if not out:
+        return
+    tmp = out + ".part"
+    Path(tmp).write_text("\\n".join(i.nodeid for i in items), encoding="utf-8")
+    os.replace(tmp, out)
+'''
+_COLLECT_ERROR_RC = 2
 
 
 # A skip line: "SKIPPED" + a reason (both formats above).
@@ -731,25 +778,56 @@ def emit_manifest(files: list[str], marker: str, output: Path,
     - empty files -> exit 0, NO output file (the CI guard skips manifest
       mode on empty $FILES — a "no selected files" run writes no junitxml,
       so a manifest would false-red every expected nodeid).
-    - collect-only failure -> propagate rc, NO output file (a vanished
+    - collection did NOT complete -> propagate rc, NO output file (a vanished
       manifest must never vacuous-green; the consumer reds on it).
+
+    Completion is judged by TWO conditions together, because neither alone is
+    sufficient:
+      1. the hook-written nodeid file EXISTS — this rules out a signal that
+         killed the interpreter mid-collection; and
+      2. ``rc`` is not a collection error — 0 (normal), 5 (collected nothing)
+         or negative (aborted at exit, #6898).
+    Measured: an unimportable module yields rc=2 and STILL reaches the hook
+    (the errored module is dropped and the remaining items are collected), so
+    the file alone would fail OPEN on a genuine collection error; and the
+    marker matching nothing yields rc=5 while collecting perfectly, so rc
+    alone would refuse a clean run.
     """
     if not files:
         print("emit-manifest: no files — no manifest written (guard skips)")
         return 0
+    nodeids_file = None
     cmd = [sys.executable, "-m", "pytest", *files, "--collect-only", "-q",
            "-m", marker, "-p", "no:cacheprovider",
            *[f"--ignore={ig}" for ig in ignores]]
     if runner is None:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        rc, collected = proc.returncode, proc.stdout
-        _err = proc.stderr
+        # The hook is delivered out-of-tree via -p + PYTHONPATH so the run's
+        # own conftest is untouched and nothing is written into the repo.
+        with tempfile.TemporaryDirectory() as _td:
+            (Path(_td) / "_fts_manifest_hook.py").write_text(
+                _MANIFEST_HOOK_SOURCE, encoding="utf-8")
+            nodeids_file = str(Path(_td) / "nodeids.txt")
+            env = dict(os.environ)
+            env["_FTS_MANIFEST_NODEIDS"] = nodeids_file
+            env["PYTHONPATH"] = _td + (
+                os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            proc = subprocess.run(
+                [*cmd, "-p", "_fts_manifest_hook"],
+                capture_output=True, text=True, env=env)
+            rc, collected = proc.returncode, proc.stdout
+            _err = proc.stderr
+            # Read INSIDE the TemporaryDirectory: the completion proof is the
+            # file the hook wrote, and it must be read before it is cleaned up.
+            nodeids = (list(Path(nodeids_file).read_text(
+                encoding="utf-8").splitlines())
+                if Path(nodeids_file).exists() else None)
     else:
         rc, collected = runner(cmd)
         _err = ""
-    if rc != 0:
-        print(f"emit-manifest: collect-only failed (rc={rc}) — no manifest "
-              f"written (fail-closed)", file=sys.stderr)
+        nodeids = collect_only_nodeids(collected)
+    if nodeids is None or (rc >= 0 and rc not in (0, 5)):
+        print(f"emit-manifest: collect-only did not COMPLETE (rc={rc}) — no "
+              f"manifest written (fail-closed)", file=sys.stderr)
         # Surface the swallowed reason — a fail-closed gate that hides WHICH
         # file failed collection turns every runner hiccup into archaeology.
         # Print the tail of pytest's captured stderr/stdout (best-effort).
@@ -759,8 +837,8 @@ def emit_manifest(files: list[str], marker: str, output: Path,
                 print(f"emit-manifest: -- {_label} tail --", file=sys.stderr)
                 for _ln in _lines[-20:]:
                     print(f"  {_ln[:300]}", file=sys.stderr)
-        return rc
-    nodeids = collect_only_nodeids(collected)
+        return rc or _COLLECT_ERROR_RC
+    nodeids = [n for n in nodeids if n.strip()]
     lines = [
         f"# expected nodeids — epic #1647 Task 6 coverage manifest "
         f"(from the run step's verbatim $FILES x `-m {marker}` collect-only)",
