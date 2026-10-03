@@ -7219,10 +7219,12 @@ def _cmd_doctor(args):
             # surfaces as a clean ❌ + rc 1, never a traceback (#720 P2 conf 75).
             probe_port = parsed.port or 16379
             from falkordb import FalkorDB
-            dbc = FalkorDB(host=probe_host, port=probe_port,
-                           username=probe_user, password=probe_pass,
-                           ssl=(parsed.scheme == "rediss"),
-                           socket_connect_timeout=5, socket_timeout=10)
+
+            from tortoise.cypher_guard import guarded_client  # #3595: guard seam
+            dbc = guarded_client(FalkorDB, host=probe_host, port=probe_port,
+                                 username=probe_user, password=probe_pass,
+                                 ssl=(parsed.scheme == "rediss"),
+                                 socket_connect_timeout=5, socket_timeout=10)
             dbc.select_graph(graph_name).query("RETURN 1")
             results.append(("Graph: FalkorDB", "✅", f"connected at {probe_host}:{probe_port} (graph {graph_name})"))
         except ImportError:
@@ -8772,7 +8774,7 @@ def main(argv: list[str] | None = None) -> int:
     cc = sp.add_parser("check-consistency", help="Verify event log matches graph state")
     cc.add_argument("--db", required=True, help="Docker URI or file path")
     cc.add_argument("--log", required=True, help="Path to events.jsonl")
-    au = sp.add_parser("audit", help="Audit graph wiring quality (8 checks: source tiering, superseded gaps, mitigation coverage)")
+    au = sp.add_parser("audit", help="Audit graph wiring quality (9 checks: source tiering, superseded gaps, mitigation coverage, inverted validity windows)")
     au.add_argument("--db", default=None, help=(
         f"DB target override — URI ({uri_schemes_hint}) or absolute path "
         "(default: TORTOISE_DB_URI / FALKORDB_* / embedded path)"))
