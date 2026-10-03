@@ -2029,6 +2029,31 @@ jobs:
           TMPD=$(python3 -c "import tempfile;print(tempfile.gettempdir())")
           find "$TMPD" -maxdepth 1 -type d -name "tmp*" -mmin +30 -exec rm -rf {} + 2>/dev/null || true
           echo "tempdir cleaned"
+      - name: Cache HF embedding model (BAAI/bge-small-en-v1.5)
+        # #4387: the carve-out job runs test_longmem_runner.py, which exercises
+        # the dense leg — so it provisions the embedder OFFLINE, exactly like
+        # the `test`, `test-slow` and `test-concurrency-falkor` jobs. Without
+        # the cache AND the offline pair on the pytest step, the suite-wide
+        # egress guard turns an uncached load into 22 blocked requests to
+        # huggingface.co over ~70s of retry backoff (measured), which is what
+        # killed this shard on the 15m watchdog; and a load that merely FAILS
+        # instead skips the dense assertion and trips the skip-guard's
+        # embedder-unavailable family (#2573). Same v2 key as the other jobs,
+        # so the cache is shared and a warm restore is a no-op.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-embedding-cache-v2-${{ runner.os }}
+          restore-keys: |
+            hf-embedding-cache-v2-${{ runner.os }}-
+      - name: Embedding model REQUIRED (BAAI/bge-small-en-v1.5) — dense retrieval leg
+        # #4387: hoisted from the `test`/`test-slow`/`test-concurrency-falkor`
+        # jobs for the same reason as the cache above — the carve-out lane runs
+        # the dense leg, so the model must be PRESENT before the offline pytest
+        # step, otherwise those assertions skip and the skip-guard reds.
+        timeout-minutes: 6
+        run: |
+          python3 tools/embedder_provision.py --attempts 5 --backoff 10
       - name: Generate coverage manifest (carve-out — expected nodeids, epic #1647 Task 9)
         run: |
           FILES=""
@@ -2045,6 +2070,18 @@ jobs:
         # reaper, backup-restore) must run against FalkorDBLite. junitxml +
         # -r fEs (the manifest's observed-set source); pytest-rc for the
         # guard/orphan gates.
+        env:
+          # #4387: the same deterministic-embeddings pair every other pytest
+          # step carries (see the `test` job's step env). This job was the one
+          # lane WITHOUT it, and that gap is why its shards hit the 15m
+          # watchdog: with the suite-wide egress guard installed, an uncached
+          # embedder load no longer fails fast on DNS — it makes 22 blocked
+          # requests to huggingface.co over ~70s of retry backoff (measured),
+          # and test_longmem_runner.py re-attempts the load per test, so ~11
+          # tests burn ~770s and the shard is killed with 0 failures (rc=124),
+          # leaving the merge rail no failure identity to read.
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
         run: |
           set +e
           FILES=""
