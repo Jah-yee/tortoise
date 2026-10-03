@@ -614,3 +614,116 @@ def test_searchresult_to_dict_additive(sdk):
     assert d2["subject"]["name"] == "Team"
     # legacy keys still present
     assert d2["id"] == "p2" and d2["similarity"] == 0.01
+
+
+# ── #6976: the id predicate must survive a following clause ──────────────
+#
+# Measured on the canonical instance (FalkorDB 6.0.0): `MATCH (n:Point) WHERE
+# n.id IN $ids` followed by another MATCH / OPTIONAL MATCH / CALL is planned as
+# a WHOLE-GRAPH read — the rows come back carrying OTHER points' ids (30 rows,
+# 30 distinct foreign ids in a minimal probe). Every reader here builds its
+# result dict from the REQUESTED ids, so those rows were silently discarded and
+# a point with live relationships read as having none — `expand_relationships`
+# returned `[]` for a point that had two
+# (`sdk.py: expand_relationships` → `get_relationships(...).get(point_id, [])`).
+#
+# The fix is a load-bearing `WITH <var>` between the predicate and the next
+# clause (or folding the predicate into the same MATCH as the expansion).
+#
+# WHICH TEST ACTUALLY GUARDS THIS — measured by mutating the fix and re-running:
+#   * ``test_no_query_loses_its_id_predicate`` FAILS without the ``WITH``. It is
+#     the regression guard — for every site, once the CALL-body import is
+#     excluded (a `WITH` inside `CALL { … }` is not a barrier; see the test).
+#   * the two behavioural tests below PASS either way: ``get_relationships``
+#     pre-seeds its result dict from the requested ids and DROPS any row whose
+#     pid is unknown, so the leak is invisible to those assertions *by
+#     construction*. Do not "enlarge the fixture" hoping they will catch it.
+#   * the unit lane cannot reproduce the defect at all — the 4.20.4 test engine
+#     BINDS this shape while the 6.0.0 canonical instance drops it (see the
+#     module comment in tortoise/search_engine.py), which is exactly why the
+#     static guard is the rail.
+
+
+def test_point_with_relationships_does_not_read_as_empty(sdk):
+    a = _point(sdk, content="claim A content for 6976")
+    b = _point(sdk, content="claim B content for 6976")
+    sdk.create_operator("IMPL", a["id"], [b["id"]])
+
+    out = get_relationships(_graph(sdk), [a["id"]])
+    assert set(out) == {a["id"]}, "keys must be exactly the requested ids"
+    assert out[a["id"]], (
+        "a point with an operator edge read as having none — the id predicate "
+        "did not bind (#6976)"
+    )
+    assert b["id"] in {e["related_id"] for e in out[a["id"]]}
+
+
+def test_id_predicate_does_not_leak_other_points(sdk):
+    """Two independent pairs: asking about one must not return the other's."""
+    a = _point(sdk, content="claim A content for 6976")
+    b = _point(sdk, content="claim B content for 6976")
+    c = _point(sdk, content="claim C content for 6976")
+    d = _point(sdk, content="claim D content for 6976")
+    sdk.create_operator("IMPL", a["id"], [b["id"]])
+    sdk.create_operator("IMPL", c["id"], [d["id"]])
+
+    out = get_relationships(_graph(sdk), [a["id"]])
+    assert set(out) == {a["id"]}
+    related = {e["related_id"] for e in out[a["id"]]}
+    assert d["id"] not in related, (
+        "a relationship belonging to an unrequested point leaked into the "
+        "result — the id predicate did not bind (#6976)"
+    )
+
+
+def test_no_query_loses_its_id_predicate():
+    """#6976 — forbid the shape outright so a silent wrong read cannot return.
+
+    Only string-literal lines are considered (a comment that *mentions* the
+    shape is not a query), and the look-ahead stops at the first non-string
+    line — so this asserts about real query text, not prose.
+
+    Two deliberate boundaries:
+      * a `WITH` INSIDE a `CALL { … }` body is the subquery's ARGUMENT IMPORT,
+        not a barrier for the outer predicate — it must not count as protection
+        (measured: without this, removing the outer `WITH` at one site left the
+        guard reporting 0 offenders while the site was unprotected).
+      * the predicate regex covers `WHERE|AND|OR <v>.id IN|= $<p>`; it does NOT
+        see dynamically-assembled fragments (e.g. a variable holding
+        "AND t.id IN $ids ") — those were checked by hand and are all either
+        already barred or have no following clause, but the coverage is bounded,
+        not total.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "tortoise"
+    pred = re.compile(r"(?:WHERE|AND|OR)\s+([a-z_]+)\.id\s+(?:IN|=)\s+\$")
+    clause = re.compile(r"\b(OPTIONAL\s+MATCH|MATCH|CALL)\b")
+    with_any = re.compile(r"\bWITH\b")
+    strline = re.compile(r'^\s*[frbu]{0,2}["\']')
+
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for i, line in enumerate(lines):
+            if not strline.match(line):
+                continue
+            m = pred.search(line)
+            if not m:
+                continue
+            for j in range(i + 1, min(i + 5, len(lines))):
+                if not strline.match(lines[j]):
+                    break  # query text ended (comment, code, or new statement)
+                # A WITH inside a CALL body is the subquery's import — not a
+                # barrier. Only a WITH before `CALL {` protects the predicate.
+                if with_any.search(lines[j].split("CALL {", 1)[0]):
+                    break  # a WITH materialises the filtered rows
+                if clause.search(lines[j]):
+                    offenders.append(f"{path.name}:{i + 1} ({m.group(1)})")
+                    break
+    assert not offenders, (
+        "these queries lose their id predicate when a following clause expands "
+        "the match (#6976) — add a load-bearing `WITH <var>` between the "
+        "predicate and the next clause: " + ", ".join(offenders)
+    )
