@@ -7300,9 +7300,18 @@ class FalkorProjection(
                 f"index (searches degrade to `index_missing`). The migration "
                 f"marker was NOT set, so this retries on the next boot"
             )
+        # `dropped=False` licenses ONLY "no drop succeeded" -- it does not
+        # say WHICH index is present. The same arm is reached when the
+        # failure preceded the drop loop (a marker-read or data-fixup error),
+        # and there an earlier boot may have completed the recreate and lost
+        # only the marker, leaving the CORRECT two-field index in place. So
+        # the message reports the incompleteness that WAS observed and names
+        # the error; it does not assert what remains.
         return logging.WARNING, (
-            f"fulltext index MIGRATION could not run for {label}, so the legacy "
-            f"content-only index REMAINS (its sparse path covers retrieval): {exc}"
+            f"fulltext index MIGRATION could not run for {label}: it did NOT "
+            f"complete -- this run dropped nothing and created nothing, so "
+            f"WHICH index is now present was not observed (an earlier boot may "
+            f"have recreated it and lost only the marker). Stopped by: {exc}"
         )
 
     def _ensure_indexes(self) -> None:

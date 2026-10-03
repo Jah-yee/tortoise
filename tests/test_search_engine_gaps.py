@@ -2247,6 +2247,48 @@ class TestFulltextIndexCreationForm:
             (r.levelno, r.getMessage()) for r in skipped
         ]
 
+    def test_event_migration_drops_with_the_registered_procedure(self):
+        """#H05 review: the second half of the fix, and it had NO coverage.
+
+        The Event migration must drop the legacy index with the procedure
+        the supported images actually REGISTER. Probed live on 4.16.7 /
+        4.20.6 / 6.0.1: ``db.idx.fulltext.drop`` answers OK on all three,
+        while ``db.idx.fulltext.dropIndex`` is NOT registered on ANY of
+        them. Reverting the Event drop loop to ``dropIndex`` alone therefore
+        leaves the legacy subject-only index in place on every supported
+        image, and the migration silently becomes a no-op apart from the
+        recreate's "already" error.
+
+        Drives the real ``_ensure_indexes`` into the Event branch (the DDL
+        re-raises 'already') with the unregistered form modelled the way the
+        engines answer it, and pins the recorded Event drop to the
+        REGISTERED procedure. Under the ``dropIndex``-only mutation the
+        recorded call becomes ``CALL db.idx.fulltext.dropIndex('Event')``
+        and this reds.
+        """
+        from tortoise.projection import FalkorProjection
+        already = RuntimeError("Attribute 'subject' is already indexed")
+        graph = StrategyControlledGraph({
+            # List the unregistered form BEFORE the registered one:
+            # "db.idx.fulltext.drop" is a prefix of
+            # "db.idx.fulltext.dropIndex", so first-match-wins would let the
+            # registered entry swallow the dropIndex query.
+            "CALL db.idx.fulltext.dropIndex('Event')": (
+                [], RuntimeError(
+                    "Procedure `db.idx.fulltext.dropIndex` is not registered")),
+            "CALL db.idx.fulltext.drop('Event')": ([], None),
+            # routes the label into its one-time migration branch
+            "CREATE FULLTEXT INDEX": ([], already),
+        })
+        proj = object.__new__(FalkorProjection)
+        proj.g = graph
+        proj._falkordb_version = (6, 0, 0)
+        proj._is_embedded = False
+        proj._ensure_indexes()
+        event_drops = [q for q, _p, _t in graph.query_calls
+                       if "db.idx.fulltext.drop" in q and "'Event'" in q]
+        assert event_drops == ["CALL db.idx.fulltext.drop('Event')"], event_drops
+
     @pytest.mark.parametrize(
         "created,dropped,exc,level,fragment",
         [
@@ -2269,12 +2311,15 @@ class TestFulltextIndexCreationForm:
                 False, True, RuntimeError("boom"),
                 logging.ERROR, "now has NO full-text index",
             ),
-            # The drop never ran at all -> the legacy index REMAINS. Note
-            # the cause here is a marker-read failure, NOT a missing drop
-            # procedure, so the message must not blame the drop procedure.
+            # The failure preceded the drop loop (marker read), so WHICH
+            # index is present is unobserved -- an earlier boot may have
+            # recreated the two-field index and lost only the marker, so the
+            # message must not claim the legacy index remains. Note too that
+            # the cause is a marker-read failure, NOT a missing drop
+            # procedure, so it must not blame the drop procedure either.
             (
                 False, False, RuntimeError("marker read failed"),
-                logging.WARNING, "legacy content-only index REMAINS",
+                logging.WARNING, "did NOT complete",
             ),
         ],
     )
@@ -2296,3 +2341,8 @@ class TestFulltextIndexCreationForm:
         )
         assert got_level == level, (got_level, msg)
         assert fragment in msg, msg
+        # #H05 4th review: `dropped=False` is "no drop succeeded", not
+        # "the legacy index remains" -- the failure may precede the drop
+        # loop, and then the correct index can be present. No arm may
+        # assert what remains.
+        assert "REMAINS" not in msg, msg
