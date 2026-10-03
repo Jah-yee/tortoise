@@ -7576,8 +7576,25 @@ class FalkorProjection(
                                     self.g.query(
                                         "MERGE (m:Meta {key:'point_fts_v2'}) SET m.v = true"
                                     )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                # #H05 review: the helper's docstring promises the
+                                # caller surfaces failures, but THIS migration
+                                # path swallowed them (bare `pass`) while the
+                                # drop above has already run -- so an error here
+                                # can leave Point with NO full-text index and no
+                                # signal at all, which is the exact silent
+                                # degradation this PR exists to end. Reported,
+                                # never fatal: an engine that cannot hold FTS
+                                # must still open.
+                                import logging
+                                logging.getLogger(__name__).error(
+                                    "fulltext index MIGRATION failed on Point: %s -- if the "
+                                    "drop above succeeded, Point may now have NO full-text "
+                                    "index (searches degrade to `index_missing`). The "
+                                    "point_fts_v2 marker was NOT set, so this retries on "
+                                    "the next boot",
+                                    e,
+                                )
                         elif label == "Event":
                             # #244: legacy subject-only Event FTS index —
                             # migrate to include name ONCE (persisted DB
@@ -7616,8 +7633,19 @@ class FalkorProjection(
                                     self.g.query(
                                         "MERGE (m:Meta {key:'event_fts_v2'}) SET m.v = true"
                                     )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                # #H05 review: same silent-swallow defect as the
+                                # Point branch above, and the drop has already
+                                # run -- report it rather than `pass`.
+                                import logging
+                                logging.getLogger(__name__).error(
+                                    "fulltext index MIGRATION failed on Event: %s -- if the "
+                                    "drop above succeeded, Event may now have NO full-text "
+                                    "index (searches degrade to `index_missing`). The "
+                                    "event_fts_v2 marker was NOT set, so this retries on "
+                                    "the next boot",
+                                    e,
+                                )
                     else:
                         self._report_fulltext_index_failure(label, fields, e)
 

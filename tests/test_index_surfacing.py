@@ -256,12 +256,30 @@ def test_e2e6_server_mode_fts_text_disambiguation(tmp_path):
         # #3518: the index is already created at boot. Tolerate that (the
         # pre-#3518 shape) and only skip when the engine cannot hold a
         # fulltext index at all. #H05: the Cypher-native DDL form — FalkorDB
-        # 6.0.0 rejects the historical multi-field procedure.
-        try:
-            g.query("CREATE FULLTEXT INDEX FOR (n:Source) ON (n._searchText)")
-        except Exception as e:
-            if "already" not in str(e).lower():
-                pytest.skip(f"Source FTS index creation unsupported: {e}")
+        # 6.0.0 rejects the historical multi-field procedure, so the DDL is
+        # tried first.
+        # #H05 review: probe the SAME two forms PRODUCTION uses. Probing the
+        # DDL alone skipped engines that register the procedure but not the
+        # DDL — which is exactly the class the production fallback exists
+        # for — so the test skipped while production had created the index
+        # via the fallback. Skip only when BOTH forms are genuinely
+        # unsupported.
+        unsupported = None
+        for probe in (
+            "CREATE FULLTEXT INDEX FOR (n:Source) ON (n._searchText)",
+            "CALL db.idx.fulltext.createNodeIndex('Source', '_searchText')",
+        ):
+            try:
+                g.query(probe)
+                unsupported = None
+                break
+            except Exception as e:  # noqa: PERF203
+                if "already" in str(e).lower():
+                    unsupported = None
+                    break
+                unsupported = e
+        if unsupported is not None:
+            pytest.skip(f"Source FTS index creation unsupported: {unsupported}")
 
         r = sdk.index_directory(str(c), extract_metadata=False)
         assert r["indexed"] == 4

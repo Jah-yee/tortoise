@@ -2169,3 +2169,34 @@ class TestFulltextIndexCreationForm:
         assert records, caplog.records
         message = records[0].getMessage()
         assert "Source" in message and "DEGRADED" in message
+
+    def test_ensure_indexes_reports_at_the_call_site(self, caplog):
+        """#H05 review: exercising the helper directly is NOT proof that the
+        CALL SITE reports.
+
+        Regression guard for the gap the reviewer found: revert
+        ``_ensure_indexes``'s non-`already` branch to the old WARNING and THIS
+        test reds, while every other test in this class stays green (they only
+        ever call ``_create_fulltext_index`` / ``_report_...`` directly). Drives
+        the real ``_ensure_indexes`` with a graph whose BOTH creation forms fail
+        for the Source label, i.e. the branch that decides whether a missing
+        index is visible at the point of failure.
+        """
+        from tortoise.projection import FalkorProjection
+        graph = StrategyControlledGraph({
+            # first matching substring wins, so the DDL is tried first and the
+            # procedure is the fallback -- exactly the production order.
+            "CREATE FULLTEXT INDEX": (
+                [], RuntimeError("Invalid input 'CREATE FULLTEXT'")),
+            "db.idx.fulltext.createNodeIndex": (
+                [], RuntimeError("Unknown function 'db.idx.fulltext.createNodeIndex'")),
+        })
+        proj = object.__new__(FalkorProjection)
+        proj.g = graph
+        proj._falkordb_version = (6, 0, 0)
+        proj._is_embedded = False
+        with caplog.at_level(logging.ERROR, logger="tortoise.projection"):
+            proj._ensure_indexes()
+        messages = [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.ERROR]
+        assert any("Source" in m and "DEGRADED" in m for m in messages), messages
