@@ -976,8 +976,9 @@ class TestTheDeclaredCeilingMustBeUsable:
     """D14: `--load-ceiling` must be numeric and `> 0`; else a usage error, exit 2.
 
     argparse rejects a non-numeric string, but `0`, a negative, `nan` and `inf` all
-    arrive as floats and each disables the gate in its own way: `before > nan` and
-    `before > inf` are False for EVERY sample, so no run is ever refused.
+    arrive as floats, and they fail in two DIFFERENT directions: `nan`/`inf` fail OPEN
+    (`before > nan` and `before > inf` are False for EVERY sample, so no run is ever
+    refused), while `0`/negative fail SHUT (every real run is refused).
     """
 
     @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
@@ -990,11 +991,23 @@ class TestTheDeclaredCeilingMustBeUsable:
         # the test above and prove nothing.
         assert ee._validated_ceiling(60.0) == 60.0
 
-    def test_build_record_validates_the_ceiling_before_acquiring_anything(self):
-        # The helper-level tests above cannot see whether `_build_record` still CALLS
-        # the helper: replacing that call with `ceiling = args.load_ceiling` (the
-        # pre-fix line) leaves every one of them green while an unusable ceiling again
-        # yields a gate that refuses nothing. This drives the producer.
+    def test_build_record_calls_the_ceiling_validator_before_acquiring_anything(
+        self, monkeypatch
+    ):
+        # Two distinct claims, both pinned here. (a) The helper-level tests above
+        # cannot see whether `_build_record` still CALLS the helper: replacing that
+        # call with `ceiling = args.load_ceiling` (the pre-fix line) leaves every one
+        # of them green while an unusable ceiling again yields a gate that refuses
+        # nothing. (b) "Before acquiring anything" is asserted, not merely named:
+        # `mkdtemp` is a sentinel that fails the test if the validation has not
+        # already run, so moving the call below the run-root creation reddens it.
+        monkeypatch.setattr(
+            ee.tempfile,
+            "mkdtemp",
+            lambda *a, **k: pytest.fail(
+                "the run root was acquired before the ceiling was validated"
+            ),
+        )
         args = TestRecordConstructionReadsTheCanonicalConstants._args(load_ceiling=0.0)
         with pytest.raises(ee.UsageError):
             ee._build_record(args)
@@ -1005,9 +1018,12 @@ class TestTheDeclaredCeilingMustBeUsable:
         # worktree into `git worktree list`, which `tools/collision_preflight.py`
         # scans untruncated — so a typo'd ceiling would poison a dispatch surface.
         # `_worktree_at` is replaced with a sentinel that fails the test if the
-        # validation has not already run.
+        # validation has not already run. The ref is a real commit that is NOT HEAD,
+        # so `_worktree_at` in the unmutated code would create a genuine detached
+        # worktree — with `ref="HEAD"` it returns the invoking checkout and creates
+        # nothing, and the leak this test is about could not occur at all.
         args = TestRecordConstructionReadsTheCanonicalConstants._args(
-            load_ceiling=0.0, ref="HEAD"
+            load_ceiling=0.0, ref="HEAD~1"
         )
         monkeypatch.setattr(
             ee,
@@ -1018,6 +1034,49 @@ class TestTheDeclaredCeilingMustBeUsable:
         )
         with pytest.raises(ee.UsageError):
             ee._build_record(args)
+
+    def test_a_refusal_after_the_worktree_exists_still_removes_it(
+        self, monkeypatch, tmp_path
+    ):
+        # The measured-root `--record-out` refusal CANNOT be hoisted the way the
+        # ceiling check was: by definition it has to see the tree the `--ref` created,
+        # so the only thing that can protect it is the `finally`. Before the fix it sat
+        # between `_worktree_at` and the `try`, so a raise there skipped the `finally`
+        # and leaked the detached worktree into `git worktree list` — the surface
+        # `tools/collision_preflight.py` scans untruncated.
+        args = TestRecordConstructionReadsTheCanonicalConstants._args(
+            load_ceiling=60.0, ref="HEAD~1", record_out="/tmp/unused/record.json"
+        )
+        monkeypatch.setattr(ee, "_worktree_at", lambda *a, **k: (tmp_path, True))
+        # Patch `subprocess.run` ONLY for the cleanup command: the manifest
+        # collect-only leg calls the same function and needs its real result object.
+        real_run = ee.subprocess.run
+        removed: list[list[str]] = []
+
+        def _run(cmd, **k):
+            if list(cmd)[:3] == ["git", "worktree", "remove"]:
+                removed.append(list(cmd))
+                return None
+            return real_run(cmd, **k)
+
+        monkeypatch.setattr(ee.subprocess, "run", _run)
+
+        def _refuse(out, root):
+            # The FIRST call is against `REPO_ROOT` and must pass; only the second —
+            # against the just-created worktree — refuses.
+            if root == tmp_path:
+                raise ee.UsageError("the record is inside the measured tree")
+
+        monkeypatch.setattr(ee, "_refuse_in_tree_record_out", _refuse)
+
+        with pytest.raises(ee.UsageError):
+            ee._build_record(args)
+        assert removed, (
+            "the worktree must be removed even when the refusal is the measured-root "
+            "one, which cannot be validated before the worktree exists"
+        )
+        assert removed[0][:3] == ["git", "worktree", "remove"]
+        assert str(tmp_path) in removed[0]
 
 
 class TestRunOnceWiresTheIndependentFileList:

@@ -189,11 +189,13 @@ def _validated_ceiling(value: float) -> float:
     """D14: the ceiling must be a finite number `> 0`; anything else is a usage error.
 
     argparse already rejects a non-numeric string, but `0`, a negative, `nan` and
-    `inf` all arrive as floats and each disables the gate in its own way: `before >
-    nan` and `before > inf` are False for EVERY sample, so a ceiling that is not a
-    usable threshold refuses nothing — the gate reads as present while supplying no
-    protection. The record would also carry `"ceiling": NaN`, which `json.dump`
-    writes as a bare `NaN` token no strict JSON reader accepts.
+    `inf` all arrive as floats, and they fail in two DIFFERENT directions. `nan` and
+    `inf` fail OPEN: `before > nan` and `before > inf` are False for EVERY sample, so
+    a ceiling that is not a usable threshold refuses nothing — the gate reads as
+    present while supplying no protection. `0` and a negative fail SHUT: they refuse
+    every real run, turning the whole measurement into a refusal dressed as an
+    environment error. The record would also carry `"ceiling": NaN`, which
+    `json.dump` writes as a bare `NaN` token no strict JSON reader accepts.
     """
     if not math.isfinite(value) or value <= 0.0:
         raise UsageError(
@@ -1565,28 +1567,35 @@ def _build_record(args: argparse.Namespace) -> dict:
     measured_root = REPO_ROOT
     worktree_added = False
     # #4203 owner ruling (option (a), #4572): the record must not live inside the
-    # measured tree. Refuse it BEFORE any measurement — and before the `--ref`
-    # worktree exists — so a usage error costs no measurement and leaves no
-    # worktree behind. `REPO_ROOT` is checked first because `post_review_dirty` is
-    # measured on the invoking checkout even when `--ref` measures elsewhere.
+    # measured tree. The `REPO_ROOT` half is refused FIRST, before anything is
+    # created — `post_review_dirty` is measured on the invoking checkout even when
+    # `--ref` measures elsewhere — so that refusal costs nothing at all. The
+    # measured-root half cannot run until the `--ref` worktree EXISTS, so it lives
+    # inside the `try` below, whose `finally` removes what it had to refuse.
     if args.record_out is not None:
         _refuse_in_tree_record_out(args.record_out, REPO_ROOT)
     if args.ref:
         requested_ref = _git("rev-parse", f"{args.ref}^{{commit}}")
         measured_root, worktree_added = _worktree_at(requested_ref, run_root, "worktree")
-        if args.record_out is not None:
-            _refuse_in_tree_record_out(args.record_out, measured_root)
-    commit = _git("rev-parse", "HEAD", cwd=measured_root)
-    tree = _git("rev-parse", "HEAD^{tree}", cwd=measured_root)
-
-    if args.environment_error:
-        raise RuntimeError(args.environment_error)
 
     runs: list[dict] = []
     tree_states: list[tuple[str, bool]] = []
     porcelain = ""
     dirty = False
+    # Everything that can raise AFTER the `--ref` worktree exists lives INSIDE this
+    # `try`, so the `finally` below removes it. Three statements used to sit between
+    # `_worktree_at` and the `try` — the measured-root `--record-out` refusal, the two
+    # `_git rev-parse` reads, and the `--environment-error` injection — and a raise
+    # from any of them skipped the `finally`, leaking the detached worktree into
+    # `git worktree list`, the surface `tools/collision_preflight.py` scans
+    # untruncated. The #4203 invariant above is what this makes hold.
     try:
+        if args.ref and args.record_out is not None:
+            _refuse_in_tree_record_out(args.record_out, measured_root)
+        commit = _git("rev-parse", "HEAD", cwd=measured_root)
+        tree = _git("rev-parse", "HEAD^{tree}", cwd=measured_root)
+        if args.environment_error:
+            raise RuntimeError(args.environment_error)
         # The load ceiling is enforced PER RUN inside `_run_once` (see the gate there),
         # so every run — and the pairing baseline — is admitted on the same rule. It
         # used to be sampled and checked once here, before run 1.
