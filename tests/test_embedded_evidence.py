@@ -815,7 +815,8 @@ class TestBothJunitReadersTolerateATruncatedFile:
                 pass
 
         monkeypatch.setattr(ee.subprocess, "Popen", lambda *a, **k: TimeoutProc())
-        rec = ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 1, 1e9)
+        rec = ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 1, 1e9,
+                           "measured")
         assert rec["bucket"] == "timeout-red"
         assert rec["junit_parse_error"]
 
@@ -848,11 +849,14 @@ class TestTheLoadCeilingIsPerRun:
         monkeypatch.setattr(ee.subprocess, "Popen", self._never_started)
 
         with pytest.raises(RuntimeError) as exc:
-            ee._run_once(["tests/a.py"], tmp_path, tmp_path, 2, "m", 60, 60.0)
+            ee._run_once(["tests/a.py"], tmp_path, tmp_path, 2, "m", 60, 60.0,
+                         "measured")
         # The RUN INDEX must be in the message. "before run 1" would be a
         # per-measurement rule — the defect this replaces — and would also be a lie
-        # about which run was refused.
+        # about which run was refused. The SEQUENCE is named too: the pairing
+        # baseline is also run 1, so a bare index cannot say which run it was.
         assert "exceeds ceiling 60.0 before run 2" in str(exc.value)
+        assert "(measured)" in str(exc.value)
 
     def test_a_run_below_the_ceiling_still_proceeds(
         self, tmp_path: Path, monkeypatch
@@ -874,7 +878,8 @@ class TestTheLoadCeilingIsPerRun:
                 pass
 
         monkeypatch.setattr(ee.subprocess, "Popen", lambda *a, **k: Proc())
-        rec = ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 60, 60.0)
+        rec = ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 60, 60.0,
+                           "measured")
         # The admitted run reports the very load it was gated on.
         assert rec["load"]["before"] == 59.0
 
@@ -888,7 +893,11 @@ class TestTheLoadCeilingIsPerRun:
         monkeypatch.setattr(ee, "_child_env", lambda rr: {})
         monkeypatch.setattr(ee, "_snapshot_redis_logs", lambda rr: [])
         calls: list[float] = []
-        values = iter([50.0, 50.0])   # before, then after
+        # DISTINCT samples, not two copies of one. With `[50.0, 50.0]` every
+        # assertion here AND in the positive control was satisfied by a mutation that
+        # recorded the `after` sample as `load.before` — the test could not fail for
+        # the defect it names.
+        values = iter([55.0, 5.0])   # before, then after
 
         def _load1() -> float:
             v = next(values)
@@ -907,9 +916,54 @@ class TestTheLoadCeilingIsPerRun:
                 pass
 
         monkeypatch.setattr(ee.subprocess, "Popen", lambda *a, **k: Proc())
-        rec = ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 60, 60.0)
-        assert calls == [50.0, 50.0], "exactly one before + one after sample per run"
-        assert rec["load"]["before"] == 50.0
+        rec = ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 60, 60.0,
+                           "measured")
+        assert calls == [55.0, 5.0], "exactly one before + one after sample per run"
+        # The GATED value is the RECORDED value — the whole reason there is one sample.
+        assert rec["load"]["before"] == 55.0
+        assert rec["load"]["after"] == 5.0
+
+    @pytest.mark.parametrize("sample", [ee.LOAD_UNMEASURED, float("nan")])
+    def test_an_unmeasurable_sample_is_refused_not_admitted(
+        self, tmp_path: Path, monkeypatch, sample
+    ):
+        # `load1()` returns the `LOAD_UNMEASURED` sentinel (-1.0) when the host cannot
+        # be read, and `-1.0 > ceiling` is False — so a bare `before > ceiling`
+        # comparison ADMITS the run. The verdict does not rescue it either:
+        # `load.band` is derived from the run's own `after` sample, so a `before` that
+        # failed to read while `after` succeeded still lands the run in a real band
+        # and the record can close on a run whose admissibility was never established.
+        monkeypatch.setattr(ee, "_child_env", lambda rr: {})
+        monkeypatch.setattr(ee, "_snapshot_redis_logs", lambda rr: [])
+        monkeypatch.setattr(ee, "load1", lambda: sample)
+        monkeypatch.setattr(ee.subprocess, "Popen", self._never_started)
+
+        with pytest.raises(RuntimeError) as exc:
+            ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 60, 60.0,
+                         "pairing baseline")
+        assert "unmeasurable" in str(exc.value)
+        # The SEQUENCE is named: the baseline is run 1 of its own sequence, so a bare
+        # run index cannot say which run was refused.
+        assert "pairing baseline" in str(exc.value)
+
+
+class TestTheDeclaredCeilingMustBeUsable:
+    """D14: `--load-ceiling` must be numeric and `> 0`; else a usage error, exit 2.
+
+    argparse rejects a non-numeric string, but `0`, a negative, `nan` and `inf` all
+    arrive as floats and each disables the gate in its own way: `before > nan` and
+    `before > inf` are False for EVERY sample, so no run is ever refused.
+    """
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    def test_an_unusable_ceiling_is_a_usage_error(self, bad):
+        with pytest.raises(ee.UsageError):
+            ee._validated_ceiling(bad)
+
+    def test_a_usable_ceiling_passes_through(self):
+        # The positive control: a predicate that refused every ceiling would satisfy
+        # the test above and prove nothing.
+        assert ee._validated_ceiling(60.0) == 60.0
 
 
 class TestRunOnceWiresTheIndependentFileList:
@@ -943,7 +997,7 @@ class TestRunOnceWiresTheIndependentFileList:
         monkeypatch.setattr(ee.subprocess, "Popen", lambda *a, **k: Proc())
         return ee._run_once(
             ["tests/selection_x.py", "tests/selection_y.py"],
-            tmp_path, tmp_path, 1, "m", 60, 1e9,
+            tmp_path, tmp_path, 1, "m", 60, 1e9, "measured",
         )
 
     def test_a_red_that_ran_the_selection_is_certified_from_its_own_junit(
@@ -1060,7 +1114,8 @@ class TestRecordConstructionReadsTheCanonicalConstants:
         monkeypatch.setattr(
             ee,
             "_run_once",
-            lambda files, measured_root, run_root, run_id, marker, timeout, ceiling: (
+            lambda files, measured_root, run_root, run_id, marker, timeout, ceiling,
+            label: (
                 runs[run_id - 1]
             ),
         )
@@ -1984,7 +2039,7 @@ class TestConjunctFalsifiability:
             },
         )
 
-        def _run_once(files, root, run_root, run_id, marker, timeout, ceiling):
+        def _run_once(files, root, run_root, run_id, marker, timeout, ceiling, label):
             if Path(root) == pair_path:
                 assert baseline is not None, "pairing ref declared without a baseline run"
                 return baseline

@@ -185,6 +185,23 @@ def load1() -> float:
         return LOAD_UNMEASURED
 
 
+def _validated_ceiling(value: float) -> float:
+    """D14: the ceiling must be a finite number `> 0`; anything else is a usage error.
+
+    argparse already rejects a non-numeric string, but `0`, a negative, `nan` and
+    `inf` all arrive as floats and each disables the gate in its own way: `before >
+    nan` and `before > inf` are False for EVERY sample, so a ceiling that is not a
+    usable threshold refuses nothing — the gate reads as present while supplying no
+    protection. The record would also carry `"ceiling": NaN`, which `json.dump`
+    writes as a bare `NaN` token no strict JSON reader accepts.
+    """
+    if not math.isfinite(value) or value <= 0.0:
+        raise UsageError(
+            f"--load-ceiling must be a finite number > 0, not {value!r}"
+        )
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Cause classes for the red (D10 / F15(i)).
 #
@@ -1034,6 +1051,7 @@ def _run_once(
     marker: str,
     timeout: int,
     ceiling: float,
+    label: str,
 ) -> dict:
     junit = run_root / f"junit-{run_id}.xml"
     cmd = _pytest_cmd(files, junit, marker, timeout)
@@ -1050,9 +1068,23 @@ def _run_once(
     # did: the #3882 closing record declares `load.ceiling` 60.0 while run 1 ends at
     # 68.0, run 2 BEGINS at 68.0, and run 2 is the only red. Its per-run
     # `load.before` was recorded and never asserted.
+    # A sample that could not be read is NOT "below the ceiling". `load1()` returns
+    # the `LOAD_UNMEASURED` sentinel (-1.0) when the host is unreadable, and
+    # `-1.0 > ceiling` is False, so comparing the sentinel would ADMIT the run — the
+    # gate fails open in exactly the case it cannot decide. The verdict does not
+    # rescue that: `load.band` is derived from the run's own `after` sample, so a
+    # `before` that failed to read while `after` succeeded still lands the run in a
+    # real band and the record can close on a run whose admissibility was never
+    # established. D14 calls this ceiling fail-closed, so an unusable sample is a
+    # refusal.
+    if not math.isfinite(before) or before < 0.0:
+        raise RuntimeError(
+            f"load is unmeasurable ({before}) before run {run_id} ({label}): the "
+            f"ceiling {ceiling} cannot be enforced on a sample that could not be read"
+        )
     if before > ceiling:
         raise RuntimeError(
-            f"load {before} exceeds ceiling {ceiling} before run {run_id}"
+            f"load {before} exceeds ceiling {ceiling} before run {run_id} ({label})"
         )
     started = time.time()
     timed_out = False
@@ -1540,7 +1572,7 @@ def _build_record(args: argparse.Namespace) -> dict:
     commit = _git("rev-parse", "HEAD", cwd=measured_root)
     tree = _git("rev-parse", "HEAD^{tree}", cwd=measured_root)
 
-    ceiling = args.load_ceiling
+    ceiling = _validated_ceiling(args.load_ceiling)
     if args.environment_error:
         raise RuntimeError(args.environment_error)
 
@@ -1560,7 +1592,7 @@ def _build_record(args: argparse.Namespace) -> dict:
         base_digest, _base_dirty = _porcelain_digest(measured_root)
         for i in range(1, args.n + 1):
             runs.append(_run_once(files, measured_root, run_root, i, args.marker,
-                                  args.run_timeout, ceiling))
+                                  args.run_timeout, ceiling, "measured"))
             # The per-run tree state. The cleanliness digest MUST be taken while the
             # measured tree still EXISTS (see below) — and it is taken once per run so
             # `tree_moved` is MEASURED: a run whose tree digest differs from the
@@ -1622,7 +1654,7 @@ def _build_record(args: argparse.Namespace) -> dict:
         try:
             pair_base_digest, _pbd = _porcelain_digest(pair_measured)
             baseline_run = _run_once(files, pair_measured, pair_root, 1, args.marker,
-                                     args.run_timeout, ceiling)
+                                     args.run_timeout, ceiling, "pairing baseline")
             pair_post_digest, _ppd = _porcelain_digest(pair_measured)
             # The baseline is a RUN too: persist its own tree state so `pin-not-airtight`
             # and a re-evaluating verifier can see whether the pairing worktree moved.
