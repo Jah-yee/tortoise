@@ -1452,6 +1452,29 @@ class TestRecordConstructionReadsTheCanonicalConstants:
             _, reasons = ee.closes_issue(rec)          # must NOT raise
             assert "load-ceiling-unusable" in reasons, bad
 
+    def test_a_zero_load_sample_is_admitted_by_the_consumer(self, monkeypatch):
+        # The producer admits `before == 0.0` — its rule is `not isfinite or
+        # before < 0.0` — and an idle host really does report 0.0. So the
+        # consumer's lower bound must be `>= 0.0`, not `> 0.0`.
+        #
+        # This pin did not exist: mutating the consumer to `b > 0.0` passed the
+        # entire suite. The CEILING boundary (`before == ceiling`) already had
+        # such a test, for exactly the same reason — a consumer stricter than the
+        # producer refuses records the tool itself produces — but the SAMPLE
+        # boundary did not, which left half the rule unpinned.
+        files = list(ee.FAMILY_REPRODUCERS)
+        runs = [
+            self._run(files, 1, "unexpected-divergence"),
+            self._run(files, 2, "unexpected-divergence"),
+        ]
+        for r in runs:
+            r["load"]["before"] = 0.0
+        rec = self._record(monkeypatch, runs)
+        rec["load"]["ceiling"] = 60.0
+        _, reasons = ee.closes_issue(rec)
+        assert "load-sample-unusable" not in reasons
+        assert "load-above-ceiling" not in reasons
+
     def test_record_rejects_a_red_that_observed_a_different_file_list(self, monkeypatch):
         files = list(ee.FAMILY_REPRODUCERS)
         runs = [

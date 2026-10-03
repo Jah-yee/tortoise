@@ -1263,10 +1263,17 @@ def closes_issue(rec: dict) -> tuple[bool, list[str]]:
     # job is to re-read a record — so the same admissibility rule is applied
     # here, at BOTH bounds.
     #
-    # Every read goes through `_load_number`, because a persisted record is
-    # untrusted JSON: a missing key, a null, a string or a 401-digit int literal
-    # all reach this function. `closes_issue` is a VERDICT — it returns a reason,
-    # never raises — and a traceback is not a fail-closed refusal.
+    # Every read OF THESE FIELDS goes through `_load_number`, because a record
+    # re-read from disk is untrusted JSON: a missing key, a null, a string or a
+    # 401-digit int literal all reach here, and a traceback is not a fail-closed
+    # refusal — the function must return a reason.
+    #
+    # SCOPE, stated so this comment does not overclaim: this makes the LOAD reads
+    # total, not the whole function. The other conjuncts above still subscript
+    # `rec` directly (e.g. `rec["load"]["overlap"]`, `rec["red"]`, `rec["runs"]`),
+    # so a structurally malformed record still raises there. That is PRE-EXISTING
+    # and deliberately unchanged here: making the entire function total is a
+    # bigger change than this PR's subject and is tracked separately.
     def _load_number(value: object) -> float | None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
