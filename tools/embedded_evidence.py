@@ -1543,6 +1543,13 @@ def _build_record(args: argparse.Namespace) -> dict:
     # fall through to exit 3 and still write a record).
     if args.record_role == "closing" and not args.pairing_ref:
         raise UsageError("--record-role closing requires --pairing-ref")
+    # D14: the ceiling must be a usable threshold, and it is validated HERE — with the
+    # other pre-measurement usage checks, before ANY resource is acquired. Raised
+    # later it would run after `_worktree_at` created the `--ref` worktree but before
+    # the `try/finally` that removes it, so a typo'd ceiling would leak a worktree
+    # into `git worktree list` — the surface `tools/collision_preflight.py` scans
+    # untruncated — and exit 2 while appearing to cost nothing.
+    ceiling = _validated_ceiling(args.load_ceiling)
     from tools.ci_selection import load_manifest
 
     run_root = Path(tempfile.mkdtemp(prefix="pi-embedded-evidence-"))
@@ -1572,7 +1579,6 @@ def _build_record(args: argparse.Namespace) -> dict:
     commit = _git("rev-parse", "HEAD", cwd=measured_root)
     tree = _git("rev-parse", "HEAD^{tree}", cwd=measured_root)
 
-    ceiling = _validated_ceiling(args.load_ceiling)
     if args.environment_error:
         raise RuntimeError(args.environment_error)
 

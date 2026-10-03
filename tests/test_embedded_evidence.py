@@ -946,6 +946,31 @@ class TestTheLoadCeilingIsPerRun:
         # run index cannot say which run was refused.
         assert "pairing baseline" in str(exc.value)
 
+    def test_a_run_exactly_at_the_ceiling_is_admitted(
+        self, tmp_path: Path, monkeypatch
+    ):
+        # The rule is "EXCEEDS" — `before > ceiling`, not `>=`. A regression that
+        # tightened it to `>=` would silently refuse a run sitting exactly on the
+        # declared ceiling, and nothing else fires at the boundary: the refusal test
+        # uses 68.0 and the positive control 59.0, both against a ceiling of 60.0.
+        monkeypatch.setattr(ee, "_child_env", lambda rr: {})
+        monkeypatch.setattr(ee, "_snapshot_redis_logs", lambda rr: [])
+        monkeypatch.setattr(ee, "load1", lambda: 60.0)
+
+        class Proc:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return ("", None)
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(ee.subprocess, "Popen", lambda *a, **k: Proc())
+        rec = ee._run_once(["tests/a.py"], tmp_path, tmp_path, 1, "m", 60, 60.0,
+                           "measured")
+        assert rec["load"]["before"] == 60.0
+
 
 class TestTheDeclaredCeilingMustBeUsable:
     """D14: `--load-ceiling` must be numeric and `> 0`; else a usage error, exit 2.
@@ -964,6 +989,35 @@ class TestTheDeclaredCeilingMustBeUsable:
         # The positive control: a predicate that refused every ceiling would satisfy
         # the test above and prove nothing.
         assert ee._validated_ceiling(60.0) == 60.0
+
+    def test_build_record_validates_the_ceiling_before_acquiring_anything(self):
+        # The helper-level tests above cannot see whether `_build_record` still CALLS
+        # the helper: replacing that call with `ceiling = args.load_ceiling` (the
+        # pre-fix line) leaves every one of them green while an unusable ceiling again
+        # yields a gate that refuses nothing. This drives the producer.
+        args = TestRecordConstructionReadsTheCanonicalConstants._args(load_ceiling=0.0)
+        with pytest.raises(ee.UsageError):
+            ee._build_record(args)
+
+    def test_the_ceiling_is_validated_before_the_ref_worktree_exists(self, monkeypatch):
+        # Ordering, not just occurrence. A refusal raised after `_worktree_at` created
+        # the `--ref` worktree but before the `try/finally` that removes it leaks that
+        # worktree into `git worktree list`, which `tools/collision_preflight.py`
+        # scans untruncated — so a typo'd ceiling would poison a dispatch surface.
+        # `_worktree_at` is replaced with a sentinel that fails the test if the
+        # validation has not already run.
+        args = TestRecordConstructionReadsTheCanonicalConstants._args(
+            load_ceiling=0.0, ref="HEAD"
+        )
+        monkeypatch.setattr(
+            ee,
+            "_worktree_at",
+            lambda *a, **k: pytest.fail(
+                "the worktree was created before the ceiling was validated"
+            ),
+        )
+        with pytest.raises(ee.UsageError):
+            ee._build_record(args)
 
 
 class TestRunOnceWiresTheIndependentFileList:
