@@ -276,11 +276,14 @@ _TOKEN_LESS_BY_DESIGN = {
 def test_test_call_sites_are_token_threaded_or_allowlisted():
     """(f) The pin above stops at the production boundary.
 
-    Main added a test that drives the wipe lane without the token (#4503) after
-    this branch's call-site sweep ran, so the production-only pin walked past it
-    and CI would have gone red on a file nobody had looked at. Same AST rule,
-    applied across tests/: every call site passes the token, or is listed above
-    with the reason it must not."""
+    Main added ``tests/test_4503_edge_relationship_accounting.py`` (2c7646abe,
+    issue #4503) after this branch's call-site sweep ran. Its
+    ``rebuild_all`` call is on a graph-backed projection, so the
+    production-only pin walked past it and CI would have gone red on a file
+    nobody had looked at. This is the same AST rule applied across tests/,
+    with one difference: a test may pass the literal ``False`` to assert the
+    refusal, so what is required here is a literal boolean token — not merely
+    the presence of an argument (a variable could be truthy at runtime)."""
     counts, unexplained = {}, []
     for path in sorted((REPO_ROOT / "tests").rglob("*.py")):
         rel = path.relative_to(REPO_ROOT).as_posix()
@@ -288,7 +291,11 @@ def test_test_call_sites_are_token_threaded_or_allowlisted():
         parents = {child: node for node in ast.walk(tree)
                    for child in ast.iter_child_nodes(node)}
         for call in _rebuild_call_nodes(tree):
-            if any(kw.arg == "confirm_destructive" for kw in call.keywords):
+            token = next((kw for kw in call.keywords
+                          if kw.arg == "confirm_destructive"), None)
+            if (token is not None
+                    and isinstance(token.value, ast.Constant)
+                    and isinstance(token.value.value, bool)):
                 continue
             name, node = "<module>", call
             while node is not None:
@@ -302,9 +309,11 @@ def test_test_call_sites_are_token_threaded_or_allowlisted():
             else:
                 unexplained.append(f"{rel}:{call.lineno}")
     assert not unexplained, (
-        "these test call sites reach the wipe without confirm_destructive and "
-        "are not allowlisted: " + ", ".join(unexplained) + " — either thread "
-        "the token or add them to _TOKEN_LESS_BY_DESIGN with the reason")
+        "these call sites are matched by name (rebuild/rebuild_all) and carry "
+        "no literal boolean confirm_destructive token, and are not "
+        "allowlisted: " + ", ".join(unexplained) + " — thread a literal "
+        "True/False, or add them to _TOKEN_LESS_BY_DESIGN with the reason "
+        "(including when the call is not a projection wipe at all)")
     wrong = [
         f"{rel}:{fn} expected {want} token-less call(s), found "
         f"{counts.get((rel, fn), 0)}"
