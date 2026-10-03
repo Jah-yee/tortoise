@@ -620,7 +620,7 @@ def test_inmemory_rebuild_refuses_a_torn_removal_tail():
 
     proj = InMemoryProjection()
     with pytest.raises(RuntimeError, match="resurrect"):
-        proj.rebuild(EventLog(journal), confirm_destructive=True)
+        proj.rebuild(EventLog(journal))
     assert proj.points == {}, "the fold ran despite the refusal"
 
     # No over-correction on THIS engine: the guard the other four paths carry.
