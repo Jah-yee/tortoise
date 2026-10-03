@@ -1173,51 +1173,93 @@ def closes_issue(rec: dict) -> tuple[bool, list[str]]:
             reasons.append(name)
         return value
 
+    # Helpers: safe dict access that returns None instead of raising on
+    # missing keys or NoneType access. This makes closes_issue fail-closed
+    # on a malformed record rather than raising — the record verdict is
+    # (False, [...]) instead of a traceback (#7084).
+    def _rec_get(*keys) -> any:
+        """Traverse rec by keys; return None if any key is missing or None."""
+        v = rec
+        for k in keys:
+            if not isinstance(v, dict):
+                return None
+            v = v.get(k)
+            if v is None:
+                return None
+        return v
+
+    def _list_get(list_var, *key_path) -> any:
+        """Traverse a list-element dict by key path; return None on any failure."""
+        v = list_var
+        for k in key_path:
+            if not isinstance(v, dict):
+                return None
+            v = v.get(k)
+            if v is None:
+                return None
+        return v
+
     ok = True
-    ok &= conj("runs-empty", bool(rec["runs"]))
+    runs = _rec_get("runs")
+    ok &= conj("runs-empty", bool(runs))
     ok &= conj("non-green-bucket",
-               all(r["bucket"] in BUCKETS_PASSING for r in rec["runs"]))
-    ok &= conj("no-test-executed", all(r["executed"] >= 1 for r in rec["runs"]))
-    ok &= conj("selection-not-family", rec["selection"]["name"] == "family")
+               all(_list_get(r, "bucket") in BUCKETS_PASSING for r in (runs or [])))
+    ok &= conj("no-test-executed", all((_list_get(r, "executed") or 0) >= 1 for r in (runs or [])))
+
+    selection = _rec_get("selection")
+    ok &= conj("selection-not-family", _list_get(selection, "name") == "family")
     ok &= conj("reproducer-absent",
                any(MANDATORY_REPRODUCER.endswith(f) or MANDATORY_REPRODUCER in f
-                   for f in rec["selection"]["files"]))
+                   for f in (_list_get(selection, "files") or [])))
+
     # D11: the attested baseline is a RUN too, so its own tree state is part of the
     # pin — `runs` alone left the pairing worktree's move unexamined.
+    pin = _rec_get("pin")
+    baseline_run = _rec_get("red", "baseline_run")
     ok &= conj("pin-not-airtight",
-               rec["pin"]["worktree_clean"]
-               and all(not r["tree_moved"]
-                       for r in [*rec["runs"], *(
-                           [rec["red"]["baseline_run"]]
-                           if rec["red"].get("baseline_run") else [])]))
+               _list_get(pin, "worktree_clean")
+               and all(not (_list_get(r, "tree_moved") or False)
+                       for r in [(runs or []), *([{"tree_moved": baseline_run}] if baseline_run else [])]))
+
+    red = _rec_get("red") or {}
+    red_cause = _list_get(red, "cause")
     ok &= conj("cause-unattributed",
-               rec["red"]["cause"] in CAUSE_CLASSES and rec["red"]["cause"] != "unattributed")
-    ok &= conj("cause-not-expected",
-               rec["red"]["cause"] in rec["selection"]["expected_causes"])
-    ok &= conj("red-file-list-differs", rec["red"]["same_file_list"])
-    ok &= conj("load-bands-do-not-overlap", rec["load"]["overlap"])
+               red_cause in CAUSE_CLASSES and red_cause != "unattributed")
+    expected_causes = _list_get(selection, "expected_causes") or []
+    ok &= conj("cause-not-expected", red_cause in expected_causes)
+    ok &= conj("red-file-list-differs", bool(_list_get(red, "same_file_list")))
+    load = _rec_get("load") or {}
+    ok &= conj("load-bands-do-not-overlap", _list_get(load, "overlap"))
+
+    at_fixed_commit = _rec_get("red", "at_fixed_commit") or {}
     # `attempted` is deliberately NOT an AND-term here: `main()` rejects `--n < 2`,
     # so the producer could only ever set it True and it supplied no protection. The
     # falsifiable claim is `rate_change` (a red was demonstrated and did not appear
     # at the measured commit); `attempted` still records that a red was demonstrated
     # at all, so it can be False in a produced record.
+    rate_change = _list_get(at_fixed_commit, "rate_change")
+    appeared = _list_get(at_fixed_commit, "appeared")
+    mutation = _list_get(at_fixed_commit, "mutation")
+    mutation_op = _list_get(at_fixed_commit, "mutation_operator")
+    mutation_target = _list_get(at_fixed_commit, "mutation_target_is_fix_branch")
+    mutation_red = _list_get(at_fixed_commit, "mutation_red_returned")
     ok &= conj("no-rate-change",
-               (rec["red"]["at_fixed_commit"]["rate_change"]
-                and not rec["red"]["at_fixed_commit"]["appeared"])
-               or (bool(rec["red"]["at_fixed_commit"]["mutation"])
-                   and str(rec["red"]["at_fixed_commit"]["mutation_operator"]).startswith("statement-deletion:")
-                   and rec["red"]["at_fixed_commit"]["mutation_target_is_fix_branch"]
-                   and not rec["red"]["at_fixed_commit"]["appeared"]
-                   and rec["red"]["at_fixed_commit"]["mutation_red_returned"]))
-    ok &= conj("record-role-not-closing", rec["record_role"] == "closing")
+               (rate_change and not appeared)
+               or (bool(mutation)
+                   and str(mutation_op or "").startswith("statement-deletion:")
+                   and mutation_target
+                   and not appeared
+                   and mutation_red))
+    ok &= conj("record-role-not-closing", _rec_get("record_role") == "closing")
     # R1 (D23): certification binds to the shipping surface.
+    surface = _list_get(at_fixed_commit, "surface")
+    surface_assertion = _list_get(at_fixed_commit, "surface_assertion")
     ok &= conj("certification-not-on-shipping-surface",
-               rec["red"]["at_fixed_commit"]["surface"] in SHIPPING_SURFACES
-               and bool(rec["red"]["at_fixed_commit"]["surface_assertion"]))
+               surface in SHIPPING_SURFACES and bool(surface_assertion))
     # R2 (D24): certificate bound to the reviewed head SHA.
     ok &= conj("certificate-not-bound-to-review-head",
-               rec["pin"]["head_sha"] == rec["pin"]["commit"]
-               and not rec["pin"]["post_review_dirty"])
+               _list_get(pin, "head_sha") == _list_get(pin, "commit")
+               and not _list_get(pin, "post_review_dirty"))
     return ok, reasons
 
 
