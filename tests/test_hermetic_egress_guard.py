@@ -8,7 +8,7 @@ Pins BOTH directions of the guard installed by
   * loopback and the in-process TestClient transport are NOT blocked.
 
 The guard is a test-suite fixture, so these tests exercise it exactly as the
-~45 SUPABASE_URL-setting files do — through the real product call sites
+SUPABASE_URL-setting files do — through the real product call sites
 (``hosted_api._track_analytics_event``, ``session_auth._fetch_jwks``).
 """
 from __future__ import annotations
@@ -122,6 +122,26 @@ def test_lookalike_loopback_hostname_is_blocked_not_delegated(hermetic_egress):
     live request escaping the suite.
     """
     host = "127.evil.example"
+    with pytest.raises(httpx.ConnectError) as ei:
+        httpx.Client(timeout=2, trust_env=False).get(f"https://{host}/probe")
+    assert "#4387" in str(ei.value), str(ei.value)
+    assert [c.host for c in hermetic_egress.blocked] == [host]
+    assert hermetic_egress.loopback == []
+
+
+def test_localhost_suffix_lookalike_is_blocked_not_delegated(hermetic_egress):
+    """#4387 review: a STRING suffix is not a loopback classification either.
+
+    `host.endswith(".localhost")` delegated every `*.localhost` name to the real
+    transport, so whether the request left the process depended on the OS
+    resolver — the accident-of-DNS this guard exists to remove. RFC 6761 does
+    reserve the whole `.localhost` namespace for loopback, but that is a
+    requirement on resolvers, not something the guard can rely on. Blocked
+    fail-closed; `evil.localhost` resolves to 127.0.0.1/::1 on a conforming
+    resolver, so if the guard fails open again this test fails on the assertion
+    below (nothing listening on :443) rather than on live egress.
+    """
+    host = "evil.localhost"
     with pytest.raises(httpx.ConnectError) as ei:
         httpx.Client(timeout=2, trust_env=False).get(f"https://{host}/probe")
     assert "#4387" in str(ei.value), str(ei.value)

@@ -1340,15 +1340,33 @@ def _disable_embedder_autowarmup(monkeypatch):
 # tests/_github_mock.py:MockGitHubTransport) are different classes and are
 # never touched — they are already hermetic.
 #
+# SCOPE: the httpx transports only. Product egress that goes through
+# `requests` or `urllib.request` (tortoise/session_indexer.py,
+# tortoise/model_adapters.py, tortoise/github_issue.py, tortoise/models.py,
+# tortoise/connectors/linear.py) is NOT intercepted, so for those callers the
+# suite is still hermetic by accident of DNS. Extending the guard to them is a
+# scope decision recorded on #4387, not part of this change.
+#
 # Policy, in order:
 #   1. @pytest.mark.live / @pytest.mark.integration items reach the real
 #      network by design (the #1787 probes, the Resend integration test);
 #      `_hermetic_egress_live_bypass` flips `allow_live` for them.
-#   2. loopback (127.0.0.0/8, ::1, localhost) is delegated to the real
-#      transport — the suite boots local HTTP servers (e.g.
+#   2. loopback is delegated to the real transport — the suite boots local HTTP
+#      servers (e.g.
 #      tests/test_supabase_control.py::test_real_client_survives_multiple_queries)
-#      and the hosted e2e suite serves JWKS from 127.0.0.1.
+#      and the hosted e2e suite serves JWKS from 127.0.0.1. Loopback is decided
+#      by ADDRESS (127.0.0.0/8, ::1) plus the one exact name `localhost` — never
+#      by a host STRING suffix. `*.localhost` is reserved for loopback by RFC
+#      6761, but honouring it would hand the classification to the OS resolver,
+#      which is the accident-of-DNS this guard exists to remove, so it is
+#      blocked (fail-closed) like any other unknown name. `127.evil.example`
+#      is the same class of slip and gets the same answer.
 #   3. the two known test endpoints are served from memory and recorded. The
+#      match is method + path on ANY host — deliberately, so a fixture's
+#      made-up host is served (test_analytics_post_is_served_by_the_stub_and_
+#      recorded pins host=hermetic-guard.invalid). It is a WIRE stub, not a
+#      host allow-list: the product's request-building still runs in full, and
+#      the call is recorded under its kind so a test can assert the payload. The
 #      JWKS stub answers the 503 a missing upstream produces — deliberately
 #      NOT a healthy 200: a canned 200 would flip the process-global
 #      `session_auth._jwks` cache from cold to warm and change every
@@ -1433,12 +1451,14 @@ _ORIGINAL_ASYNC_HANDLE_ASYNC_REQUEST = httpx.AsyncHTTPTransport.handle_async_req
 def _hermetic_is_loopback(host):
     if not host:
         return False
-    if host in _HERMETIC_LOOPBACK_HOSTS or host.endswith(".localhost"):
+    if host in _HERMETIC_LOOPBACK_HOSTS:
         return True
-    # Parse, do not prefix-match (#4387 review). `host.startswith("127.")` is a
-    # STRING test, so `127.evil.example` (a real, resolvable name) was classified
-    # loopback and delegated to the real transport — a hermeticity guard failing
-    # OPEN on exactly the shape it exists to catch. ip_address() is the range test.
+    # Parse, do not pattern-match (#4387 review). A STRING test fails OPEN on
+    # exactly the shapes this guard exists to catch: `host.startswith("127.")`
+    # delegated `127.evil.example`, and `host.endswith(".localhost")` delegated
+    # every `*.localhost` name — each handing the classification to the OS
+    # resolver. `ipaddress.ip_address()` is the actual range test; the exact
+    # name `localhost` is the only non-address spelling honoured (policy 2).
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
