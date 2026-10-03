@@ -460,6 +460,7 @@ class GraphRanker:
     def _fetch_event_signals(self, ids: list[str]) -> dict[str, dict]:
         cypher = (
             "MATCH (e:Event) WHERE e.eventId IN $ids "
+            "WITH e "  # #6976 — load-bearing: keeps the eventId predicate bound
             "OPTIONAL MATCH (e)-[:aboutObject]->(o:Object) "
             "WITH e, count(o) AS about_objects "
             "OPTIONAL MATCH (e)-[:PRODUCES]->(p:Point) "

@@ -1753,8 +1753,10 @@ CONTESTED_VARIANCE_THRESHOLD = 0.04
 # kill per query bounds a hung FalkorDB's impact on search latency (#1353 review).
 _DECORATION_TIMEOUT_MS = 200
 
-#: ⛔ #6976 — FalkorDB 6.0.0 DROPS `MATCH (n:L) WHERE n.id IN $ids` when another
-#: MATCH / OPTIONAL MATCH / CALL follows it in the same query. The plan then
+#: ⛔ #6976 — FalkorDB 6.0.0 DROPS `MATCH (n:L) WHERE <predicate>` when another
+#: MATCH / OPTIONAL MATCH / CALL follows it in the same query. The predicate is
+#: property-GENERAL and not `.id`-specific — measured dropped for `.id`,
+#: `.pointKind` and `.status`. The plan then
 #: returns rows for OTHER points entirely (measured on the canonical instance —
 #: the 6.0.0 one on port 16379: with one requested id, 30 rows carrying 30
 #: distinct FOREIGN ids; a correctly-bound point with no neighbours returns 0

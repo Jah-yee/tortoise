@@ -679,28 +679,37 @@ def test_id_predicate_does_not_leak_other_points(sdk):
 def test_no_query_loses_its_id_predicate():
     """#6976 — forbid the shape outright so a silent wrong read cannot return.
 
-    Only string-literal lines are considered (a comment that *mentions* the
-    shape is not a query), and the look-ahead stops at the first non-string
-    line — so this asserts about real query text, not prose.
+    The scan is parser-based: it walks every string constant (implicit
+    concatenation is already folded into one), the string fragments inside a
+    list/tuple/set/dict literal, and `+`-joined expressions. What it cannot see
+    is what the parser cannot see — a query assembled at runtime from a
+    variable, or from pieces joined by a call whose arguments are not literals.
+    Prose in a docstring IS scanned (it is a string constant), so quoting the
+    bad shape in prose will be flagged; that is a false positive to fix at the
+    prose, not a hole.
 
     Two deliberate boundaries:
-      * a `WITH` INSIDE a `CALL { … }` body is the subquery's ARGUMENT IMPORT,
-        not a barrier for the outer predicate — it must not count as protection
-        (measured: without this, removing the outer `WITH` at one site left the
-        guard reporting 0 offenders while the site was unprotected).
-      * a query ASSEMBLED at runtime (joined from separate string expressions
-        with `+`, or held in a variable and passed to `graph.query`) is not
-        scanned — the parser sees the pieces, not the query. Those were checked
-        by hand; the coverage is bounded, not total.
+      * a `WITH` INSIDE a `CALL { … }` body is that subquery's ARGUMENT IMPORT,
+        not a barrier for the outer predicate. That falls out of the window
+        itself — the window ends at the `CALL` keyword — and a pinned case
+        holds it down.
+      * the predicate regex is property-GENERAL (`<var>.<prop> IN|= $<param>`),
+        case-insensitive, and tolerant of parentheses and backtick quoting —
+        because the engine drops the predicate for ANY property, not only `id`
+        (measured on 6.0.0 for `.pointKind` and `.status` as well).
     """
     import ast
     import pathlib
     import re
 
     root = pathlib.Path(__file__).resolve().parent.parent / "tortoise"
-    pred = re.compile(r"(?:WHERE|AND|OR)\s+([a-z_]+)\.id\s+(?:IN|=)\s+\$")
-    clause = re.compile(r"\b(OPTIONAL\s+MATCH|MATCH|CALL)\b")
-    with_any = re.compile(r"\bWITH\b")
+    pred = re.compile(
+        r"(?:WHERE|AND|OR)\s+\(?\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*[A-Za-z_]"
+        r"[A-Za-z0-9_]*`?\s*(?:IN|=)\s*\$",
+        re.IGNORECASE,
+    )
+    clause = re.compile(r"\b(OPTIONAL\s+MATCH|MATCH|CALL)\b", re.IGNORECASE)
+    with_any = re.compile(r"\bWITH\b", re.IGNORECASE)
 
     def _strings(node):
         """The query text a node contributes, or None if it contributes none.
@@ -725,6 +734,12 @@ def test_no_query_loses_its_id_predicate():
             left, right = _strings(node.left), _strings(node.right)
             if left is not None or right is not None:
                 return (left or " \x00 ") + (right or " \x00 ")
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            parts = [p for p in (_strings(e) for e in node.elts) if p is not None]
+            return " \x00 ".join(parts) if parts else None
+        if isinstance(node, ast.Dict):
+            parts = [p for p in (_strings(v) for v in node.values) if p is not None]
+            return " \x00 ".join(parts) if parts else None
         if isinstance(node, (ast.Name, ast.Call, ast.Attribute, ast.Subscript)):
             return " \x00 "  # a fragment only known at runtime
         return None
@@ -741,9 +756,12 @@ def test_no_query_loses_its_id_predicate():
                 nxt = clause.search(after)
                 if not nxt:
                     continue
-                # A WITH inside a `CALL { … }` body is that subquery's ARGUMENT
-                # IMPORT, not a barrier for the outer predicate.
-                if with_any.search(after[: nxt.start()].split("CALL {", 1)[0]):
+                # Everything between the predicate and the NEXT clause is the
+                # window. A `WITH` inside a `CALL { … }` body is that
+                # subquery's ARGUMENT IMPORT, not a barrier for the outer
+                # predicate — and it is already outside this window, because
+                # the window stops at the `CALL` keyword itself.
+                if with_any.search(after[: nxt.start()]):
                     continue
                 found.add(f"{node.lineno} ({m.group(1)})")
         return sorted(found)
@@ -764,6 +782,20 @@ def test_no_query_loses_its_id_predicate():
     assert unbarred(mixed) == ["1 (n)"], mixed
     call_body = 'Q = ("MATCH (n:Point) WHERE n.id IN $ids " "CALL { WITH n MATCH (n)-[r]-(o) } RETURN n")'
     assert unbarred(call_body) == ["1 (n)"], call_body
+    # Coverage the AST rewrite initially LOST against the line-scan it replaced
+    # (review P2): a query assembled from string fragments in a list/tuple/dict.
+    joined = 'Q = "\\n".join(["MATCH (n:Point) WHERE n.id IN $ids ", "MATCH (n)-[r]-(o) RETURN n"])'
+    assert unbarred(joined) == ["1 (n)"], joined
+    # The defect is property-GENERAL, not `.id`-only (measured on 6.0.0 for
+    # `.pointKind` and `.status` too) — so the rail must not be either.
+    other_prop = 'Q = ("MATCH (n:Point) WHERE n.pointKind IN $k " "MATCH (n)-[r]-(o) RETURN n")'
+    assert unbarred(other_prop) == ["1 (n)"], other_prop
+    # Tolerances: parentheses, uppercase variable, lowercase keyword.
+    tolerant = 'Q = ("MATCH (N:Point) WHERE (N.id IN $ids) match (N)-[r]-(o) RETURN N")'
+    assert unbarred(tolerant) == ["1 (N)"], tolerant
+    # Backtick-quoted variable.
+    backtick = 'Q = ("MATCH (`n`:Point) WHERE `n`.id IN $ids MATCH (`n`)-[r]-(o) RETURN `n`")'
+    assert unbarred(backtick) == ["1 (n)"], backtick
 
     offenders: list[str] = []
     for path in sorted(root.rglob("*.py")):
