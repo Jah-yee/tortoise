@@ -1421,7 +1421,7 @@ def test_rebuild_all_preserves_onboarding_state(graph):
     assert before["org-b"][1] == ["harness-connected", "team-named"]
     assert _onboards_targets(sdk, "org-a") == [anchor["id"]]
 
-    result = sdk._get_proj().rebuild_all(str(events))
+    result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     after = {oid: _read_onboarding(sdk, oid) for oid in ("org-a", "org-b")}
     assert after["org-a"][0] == before["org-a"][0], (
@@ -1457,7 +1457,7 @@ def test_rebuild_all_restores_onboarding_from_pending_sidecar(graph):
         onboarding_step_links=[["org-r", "harness-connected"],
                                ["org-r", "first-points-filed"]]))
 
-    sdk._get_proj().rebuild_all(str(events))
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     node, steps = _read_onboarding(sdk, "org-r")
     assert node is not None, "the recovered onboarding node is missing"
@@ -1487,7 +1487,7 @@ def test_pending_onboarding_sidecar_beats_a_self_healed_default(graph):
     # The self-healed default: active, fork build, not compact.
     _write_onboarding_state(sdk, "org-r", fork="build")
 
-    sdk._get_proj().rebuild_all(str(events))
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     node, steps = _read_onboarding(sdk, "org-r")
     assert node["status"] == "complete", (
@@ -1513,7 +1513,7 @@ def test_onboarding_capture_failure_aborts_before_wipe(graph):
         sdk, lambda c: "MATCH (n:OnboardingState)" in c
         and "properties(n)" in c)
     with patcher, pytest.raises(RuntimeError) as exc:
-        sdk._get_proj().rebuild_all(str(events))
+        sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert injected, "the capture failure was never injected"
     assert "aborted BEFORE the graph wipe" in str(exc.value)
@@ -1588,7 +1588,7 @@ def test_foreign_step_edge_survives_and_pins_the_forgery_path(graph):
                                    [s for s in before
                                     if s != "made-up-step"]) is True
 
-    sdk._get_proj().rebuild_all(str(events))
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     after = _read_onboarding(sdk, "org-f")[1]
     assert after == before, (
@@ -1623,7 +1623,7 @@ def test_post_restore_verification_failure_says_unverified(graph, caplog):
 
     patcher, injected = _inject_query_failure(sdk, _fail_on_second_capture)
     with patcher, caplog.at_level(logging.ERROR, logger="tortoise.projection"):
-        result = sdk._get_proj().rebuild_all(str(events))
+        result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert injected, "the verification-read failure was never injected"
     assert result["onboarding_verified"] is False
@@ -1657,7 +1657,7 @@ def test_unverified_restore_is_a_gap_even_with_nothing_expected(graph):
 
     patcher, injected = _inject_query_failure(sdk, _fail_on_second_capture)
     with patcher:
-        result = sdk._get_proj().rebuild_all(str(events))
+        result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert injected, "the verification-read failure was never injected"
     assert result["onboarding_verified"] is False
@@ -1687,7 +1687,7 @@ def test_onboarding_capture_refuses_a_non_str_step_id(graph):
         "MERGE (n)-[:COMPLETED_STEP]->(s)")
 
     with pytest.raises(RuntimeError) as exc:
-        sdk._get_proj().rebuild_all(str(events))
+        sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert "aborted BEFORE the graph wipe" in str(exc.value)
     assert "step_id" in str(exc.value)
@@ -1764,7 +1764,7 @@ def test_cmd_rebuild_reports_unverified_not_gone(tmp_path, capsys,
               "onboarding_gap": 1, "onboarding_missing_total": 0,
               "onboarding_state_unknown": False}
     monkeypatch.setattr(FalkorProjection, "rebuild_all",
-                        lambda self, _dir: dict(counts))
+                        lambda self, _dir, **kw: dict(counts))
     sdk, events = _mk_sdk(tmp_path)
     sdk.close()
     _write_journal(events, [])
@@ -1815,7 +1815,7 @@ def test_cmd_rebuild_reports_a_confirmed_loss_as_gone(tmp_path, capsys,
               "onboarding_gap": 1, "onboarding_missing_total": 1,
               "onboarding_state_unknown": False}
     monkeypatch.setattr(FalkorProjection, "rebuild_all",
-                        lambda self, _dir: dict(counts))
+                        lambda self, _dir, **kw: dict(counts))
     sdk, events = _mk_sdk(tmp_path)
     sdk.close()
     _write_journal(events, [])
@@ -1858,7 +1858,7 @@ def test_cmd_rebuild_reports_unverified_and_unknown_together(
               "onboarding_gap": 1, "onboarding_missing_total": 0,
               "onboarding_state_unknown": True}
     monkeypatch.setattr(FalkorProjection, "rebuild_all",
-                        lambda self, _dir: dict(counts))
+                        lambda self, _dir, **kw: dict(counts))
     sdk, events = _mk_sdk(tmp_path)
     sdk.close()
     _write_journal(events, [])
@@ -1971,7 +1971,7 @@ def test_leftover_sidecar_does_not_destroy_a_live_anchor(graph):
         onboarding_snapshot=[{"org_id": "org-lo", "status": "complete"}],
         onboarding_step_links=[]))
 
-    result = sdk._get_proj().rebuild_all(str(events))
+    result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert _onboards_targets(sdk, "org-lo") == [anchor["id"]], (
         "the live anchor edge must not be dropped by the verbatim node rule")
@@ -1996,7 +1996,7 @@ def test_onboarding_capture_refuses_an_unloadable_node(graph):
                   "SET n.status = 'active'")
 
     with pytest.raises(RuntimeError) as exc:
-        sdk._get_proj().rebuild_all(str(events))
+        sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert "aborted BEFORE the graph wipe" in str(exc.value)
     assert "org_id" in str(exc.value)
@@ -2019,7 +2019,7 @@ def test_rebuild_all_reports_onboarding_restore_counts(graph):
         onboarding_snapshot=[{"org_id": "org-r", "status": "complete"}],
         onboarding_step_links=[["org-r", "harness-connected"]]))
 
-    result = sdk._get_proj().rebuild_all(str(events))
+    result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert result["onboarding_expected"] == 1
     assert result["onboarding_restored"] == 1
@@ -2051,7 +2051,7 @@ def test_onboarding_onboards_edge_gap_is_reported_not_silent(graph):
         "MATCH (s:Subject {id:'raw-anchor-minted-by-the-writer'}) "
         "RETURN count(s)").result_set[0][0] == 1
 
-    result = sdk._get_proj().rebuild_all(str(events))
+    result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     # The node rode the sidecar, but its anchor edge could not be rebuilt: the
     # caller-visible signal must say so, not silently report a full pass.
@@ -2212,7 +2212,7 @@ def test_same_version_sibling_section_survives_a_real_rebuild(graph):
         event_meta=[{"last_seq": 7}], batch_snapshot=[{"id": "b1"}]))
 
     with pytest.raises(RuntimeError) as exc:
-        sdk._get_proj().rebuild_all(str(events))
+        sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
     assert "event_meta" in str(exc.value), exc.value
     after = _g(sdk).query("MATCH (n) RETURN count(n)").result_set[0][0]
     assert after == before, "the graph must be untouched by a refused rebuild"
@@ -2236,7 +2236,7 @@ def test_pre_onboarding_leftover_reports_state_unknown(graph, caplog):
     _g(sdk).query("MATCH (n) DETACH DELETE n")
 
     with caplog.at_level(logging.ERROR, logger="tortoise.projection"):
-        result = sdk._get_proj().rebuild_all(str(events))
+        result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert result["onboarding_state_unknown"] is True
     assert result["onboarding_gap"] >= 1, (
@@ -2271,7 +2271,7 @@ def test_leftover_with_only_one_onboarding_key_is_unknown(graph, caplog):
     _g(sdk).query("MATCH (n) DETACH DELETE n")
 
     with caplog.at_level(logging.ERROR, logger="tortoise.projection"):
-        result = sdk._get_proj().rebuild_all(str(events))
+        result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
     assert result["onboarding_state_unknown"] is True
     assert any("predates onboarding preservation" in r.getMessage()
                for r in caplog.records)
@@ -2290,7 +2290,7 @@ def test_unknown_flag_is_carried_into_the_written_sidecar(graph, monkeypatch):
     _plant(Path(_sidecar_path(events)), _legacy_pre_onboarding_sidecar())
     written = _capture_writes(monkeypatch)
 
-    sdk._get_proj().rebuild_all(str(events))
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert written, "no sidecar was written"
     assert written[0].get("onboarding_unknown") is True, (
@@ -2320,7 +2320,7 @@ def test_unknown_is_reported_even_when_fresh_state_exists(graph, caplog):
     _plant(Path(_sidecar_path(events)), half)
 
     with caplog.at_level(logging.ERROR, logger="tortoise.projection"):
-        result = sdk._get_proj().rebuild_all(str(events))
+        result = sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
     assert result["onboarding_expected"] >= 1, (
         "the live graph's onboarding state must be captured")
@@ -2349,7 +2349,7 @@ def test_onboards_edge_symbol_is_bound_before_the_wipe(graph, monkeypatch):
 
     monkeypatch.delattr(os_state, "ONBOARDS_EDGE")
     with pytest.raises(RuntimeError) as exc:
-        sdk._get_proj().rebuild_all(str(events))
+        sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
     assert "BEFORE the graph wipe" in str(exc.value), exc.value
     after = _g(sdk).query("MATCH (n) RETURN count(n)").result_set[0][0]
     assert after == before, (
@@ -2381,7 +2381,7 @@ def test_transient_restore_failure_is_not_reported_as_gone(tmp_path, capsys,
               "onboarding_gap": 0, "onboarding_missing_total": 0,
               "onboarding_state_unknown": False}
     monkeypatch.setattr(FalkorProjection, "rebuild_all",
-                        lambda self, _dir: dict(counts))
+                        lambda self, _dir, **kw: dict(counts))
     sdk, events = _mk_sdk(tmp_path)
     sdk.close()
     _write_journal(events, [])
@@ -2501,7 +2501,7 @@ def _interrupt_graph_a(tmp_path, monkeypatch):
 
     with mock.patch.object(FalkorProjection, "_upsert_point_props", _boom), \
             pytest.raises(RuntimeError, match="injected mid-replay"):
-        sdk_a._get_proj().rebuild_all(str(events))
+        sdk_a._get_proj().rebuild_all(str(events), confirm_destructive=True)
     return sdk_a, events, events / ".tortoise-prewipe-snapshot.json", a_only
 
 
@@ -2536,7 +2536,7 @@ def test_foreign_sidecar_is_neither_merged_nor_retired_3049(tmp_path, monkeypatc
         try:
             # The rebuild REFUSES before the wipe, naming the foreign graph.
             with pytest.raises(RuntimeError, match="refusing to wipe the graph"):
-                sdk_b._get_proj().rebuild_all(str(events))
+                sdk_b._get_proj().rebuild_all(str(events), confirm_destructive=True)
 
             # (i) B did NOT absorb A's payload ...
             assert _point_count(sdk_b, a_only) == 0, (
@@ -2557,7 +2557,7 @@ def test_foreign_sidecar_is_neither_merged_nor_retired_3049(tmp_path, monkeypatc
             sdk_b.close()
 
         # A's own retry (identity matches) still recovers its Point.
-        sdk_a._get_proj().rebuild_all(str(events))
+        sdk_a._get_proj().rebuild_all(str(events), confirm_destructive=True)
         rows = sdk_a._get_proj().g.query(
             "MATCH (n:Point {id:$id}) RETURN n.content",
             params={"id": a_only}).result_set
@@ -2599,7 +2599,7 @@ def test_legacy_sidecar_without_identity_still_merges_3049(tmp_path):
         db_path=str(tmp_path / "c.db"), graph_name="tortoise",
         event_log_path=str(events / "events.jsonl"))
     try:
-        sdk._get_proj().rebuild_all(str(events))
+        sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
         assert _point_count(sdk, legacy_only) == 1, (
             "an identity-unknown legacy sidecar must still merge (#3049)")
         assert not sidecar.exists(), "the completed rebuild retires it"

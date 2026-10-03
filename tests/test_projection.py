@@ -311,7 +311,7 @@ def test_inmemory_rebuild():
     api = EventAPI(log, initiated_by="extractor", agent_id="test")
     a, b, op = _build(api)
     proj = InMemoryProjection()
-    proj.rebuild(log)  # in-memory: no graph to wipe, no destructive-op token
+    proj.rebuild(log, confirm_destructive=True)  # in-memory: no graph to wipe, no destructive-op token
     assert a in proj.points
     assert b in proj.points
     assert op in proj.points

@@ -232,7 +232,7 @@ class TestProjectionFold:
                 "RETURN o.supersededBy").result_set[0][0]
             assert live == long_name, len(live)
 
-            sdk._get_proj().rebuild_all(str(events))
+            sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
             status, replayed = sdk._get_proj().g.query(
                 "MATCH (o:Object {name:'replay-src'}) "
                 "RETURN o.status, o.supersededBy").result_set[0]
@@ -286,7 +286,7 @@ class TestProjectionFold:
                 "RETURN o.supersededBy").result_set[0][0]
             assert live == legacy_prefix, len(live)
 
-            sdk._get_proj().rebuild_all(str(events))
+            sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
             _status, replayed = sdk._get_proj().g.query(
                 "MATCH (o:Object {name:'legacy-src'}) "
                 "RETURN o.status, o.supersededBy").result_set[0]
