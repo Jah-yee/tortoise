@@ -1222,29 +1222,54 @@ def closes_issue(rec: dict) -> tuple[bool, list[str]]:
             reasons.append(name)
         return value
 
+    # Helpers: safe dict access that returns None instead of raising on
+    # missing keys or NoneType access. This makes closes_issue fail-closed
+    # on a malformed record rather than raising (#7084).
+    def _rec_get(*keys):
+        """Traverse rec by keys; return None if any key is missing or None."""
+        v = rec
+        for k in keys:
+            if not isinstance(v, dict):
+                return None
+            v = v.get(k)
+            if v is None:
+                return None
+        return v
+
+    def _list_get(list_var, *key_path):
+        """Traverse a list-element dict by key path; return None on any failure."""
+        v = list_var
+        for k in key_path:
+            if not isinstance(v, dict):
+                return None
+            v = v.get(k)
+            if v is None:
+                return None
+        return v
+
     ok = True
-    ok &= conj("runs-empty", bool(rec["runs"]))
+    ok &= conj("runs-empty", bool(_rec_get("runs")))
     ok &= conj("non-green-bucket",
-               all(r["bucket"] in BUCKETS_PASSING for r in rec["runs"]))
-    ok &= conj("no-test-executed", all(r["executed"] >= 1 for r in rec["runs"]))
-    ok &= conj("selection-not-family", rec["selection"]["name"] == "family")
+               all(_list_get(r, "bucket") in BUCKETS_PASSING for r in (_rec_get("runs") or [])))
+    ok &= conj("no-test-executed", all((_list_get(r, "executed") or 0) >= 1 for r in (_rec_get("runs") or [])))
+    ok &= conj("selection-not-family", _list_get(_rec_get("selection"), "name") == "family")
     ok &= conj("reproducer-absent",
                any(MANDATORY_REPRODUCER.endswith(f) or MANDATORY_REPRODUCER in f
-                   for f in rec["selection"]["files"]))
+                   for f in (_list_get(_rec_get("selection"), "files") or [])))
     # D11: the attested baseline is a RUN too, so its own tree state is part of the
     # pin — `runs` alone left the pairing worktree's move unexamined.
     ok &= conj("pin-not-airtight",
-               rec["pin"]["worktree_clean"]
-               and all(not r["tree_moved"]
-                       for r in [*rec["runs"], *(
-                           [rec["red"]["baseline_run"]]
-                           if rec["red"].get("baseline_run") else [])]))
+               _list_get(_rec_get("pin"), "worktree_clean")
+               and all(not _list_get(r, "tree_moved")
+                       for r in [*( _rec_get("runs") or []), *(
+                           [_list_get(_rec_get("red"), "baseline_run")]
+                           if _list_get(_rec_get("red"), "baseline_run") else [])]))
     ok &= conj("cause-unattributed",
-               rec["red"]["cause"] in CAUSE_CLASSES and rec["red"]["cause"] != "unattributed")
+               _list_get(_rec_get("red"), "cause") in CAUSE_CLASSES and _list_get(_rec_get("red"), "cause") != "unattributed")
     ok &= conj("cause-not-expected",
-               rec["red"]["cause"] in rec["selection"]["expected_causes"])
-    ok &= conj("red-file-list-differs", rec["red"]["same_file_list"])
-    ok &= conj("load-bands-do-not-overlap", rec["load"]["overlap"])
+               _list_get(_rec_get("red"), "cause") in (_list_get(_rec_get("selection"), "expected_causes") or []))
+    ok &= conj("red-file-list-differs", _list_get(_rec_get("red"), "same_file_list"))
+    ok &= conj("load-bands-do-not-overlap", _list_get(_rec_get("load"), "overlap"))
     # The ceiling is enforced as a PRODUCER gate in `_run_once`, but this function
     # is also the RE-EVALUATION surface for a persisted record, and `load.ceiling`
     # was persisted for exactly this comparison. Without the conjunct below the
@@ -1298,7 +1323,7 @@ def closes_issue(rec: dict) -> tuple[bool, list[str]]:
     _ceiling_usable = _ceiling is not None and _ceiling > 0
     _red = rec.get("red") if isinstance(rec.get("red"), dict) else {}
     _baseline = _red.get("baseline_run")
-    _load_runs = [*rec["runs"], *([_baseline] if _baseline else [])]
+    _load_runs = [*( _rec_get("runs") or []), *([_baseline] if _baseline else [])]
     _befores = [_run_number(r) for r in _load_runs]
     ok &= conj("load-ceiling-unusable", _ceiling_usable)
     # A run whose load could not be read is inadmissible, exactly as at the
@@ -1330,23 +1355,24 @@ def closes_issue(rec: dict) -> tuple[bool, list[str]]:
     # falsifiable claim is `rate_change` (a red was demonstrated and did not appear
     # at the measured commit); `attempted` still records that a red was demonstrated
     # at all, so it can be False in a produced record.
+    _at_fixed = _rec_get("red", "at_fixed_commit") or {}
     ok &= conj("no-rate-change",
-               (rec["red"]["at_fixed_commit"]["rate_change"]
-                and not rec["red"]["at_fixed_commit"]["appeared"])
-               or (bool(rec["red"]["at_fixed_commit"]["mutation"])
-                   and str(rec["red"]["at_fixed_commit"]["mutation_operator"]).startswith("statement-deletion:")
-                   and rec["red"]["at_fixed_commit"]["mutation_target_is_fix_branch"]
-                   and not rec["red"]["at_fixed_commit"]["appeared"]
-                   and rec["red"]["at_fixed_commit"]["mutation_red_returned"]))
-    ok &= conj("record-role-not-closing", rec["record_role"] == "closing")
+               (_list_get(_at_fixed, "rate_change")
+                and not _list_get(_at_fixed, "appeared"))
+               or (bool(_list_get(_at_fixed, "mutation"))
+                   and str(_list_get(_at_fixed, "mutation_operator")).startswith("statement-deletion:")
+                   and _list_get(_at_fixed, "mutation_target_is_fix_branch")
+                   and not _list_get(_at_fixed, "appeared")
+                   and _list_get(_at_fixed, "mutation_red_returned")))
+    ok &= conj("record-role-not-closing", _rec_get("record_role") == "closing")
     # R1 (D23): certification binds to the shipping surface.
     ok &= conj("certification-not-on-shipping-surface",
-               rec["red"]["at_fixed_commit"]["surface"] in SHIPPING_SURFACES
-               and bool(rec["red"]["at_fixed_commit"]["surface_assertion"]))
+               _list_get(_at_fixed, "surface") in SHIPPING_SURFACES
+               and bool(_list_get(_at_fixed, "surface_assertion")))
     # R2 (D24): certificate bound to the reviewed head SHA.
     ok &= conj("certificate-not-bound-to-review-head",
-               rec["pin"]["head_sha"] == rec["pin"]["commit"]
-               and not rec["pin"]["post_review_dirty"])
+               _list_get(_rec_get("pin"), "head_sha") == _list_get(_rec_get("pin"), "commit")
+               and not _list_get(_rec_get("pin"), "post_review_dirty"))
     return ok, reasons
 
 
@@ -1359,7 +1385,7 @@ def exit_code(rec: dict) -> int:
     # in `runs`. D14/threat row 10 requires a non-overlapping load band to be exit 1
     # ("a red measured at load 80 and a green at load 3"); without the baseline in
     # this test a closing-shaped record that failed only on load returned a clean 3.
-    red_runs = list(rec["runs"])
+    red_runs = list(_rec_get("runs") or [])
     baseline = rec.get("red", {}).get("baseline_run")
     if baseline:
         red_runs.append(baseline)
