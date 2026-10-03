@@ -2270,9 +2270,8 @@ class TestFulltextIndexCreationForm:
         already = RuntimeError("Attribute 'subject' is already indexed")
         graph = StrategyControlledGraph({
             # Keys are FULL query strings, including the ('Event') suffix, so
-            # neither is a prefix of the other and the dict order is NOT
-            # load-bearing. The unregistered form is listed first only to
-            # mirror the production loop's order.
+            # neither is a prefix of the other. The dict order is therefore
+            # irrelevant to lookup and is not load-bearing.
             "CALL db.idx.fulltext.dropIndex('Event')": (
                 [], RuntimeError(
                     "Procedure `db.idx.fulltext.dropIndex` is not registered")),
